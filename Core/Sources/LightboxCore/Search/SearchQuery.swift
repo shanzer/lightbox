@@ -15,11 +15,11 @@ public struct DateRange: Sendable, Codable, Hashable {
 
 /// A search as a value: composable, comparable, and encodable, so that a saved
 /// search is literally the same thing the search bar produces.
-public indirect enum Predicate: Sendable, Codable, Hashable {
+public indirect enum SearchPredicate: Sendable, Codable, Hashable {
     case all
-    case and([Predicate])
-    case or([Predicate])
-    case not(Predicate)
+    case and([SearchPredicate])
+    case or([SearchPredicate])
+    case not(SearchPredicate)
 
     case width(NumericConstraint)
     case height(NumericConstraint)
@@ -55,12 +55,12 @@ public struct SearchQuery: Sendable, Codable, Hashable {
     }
 
     public var scope: Scope
-    public var predicate: Predicate
+    public var predicate: SearchPredicate
     public var sort: Sort
     public var limit: Int?
     public var offset: Int?
 
-    public init(scope: Scope, predicate: Predicate = .all,
+    public init(scope: Scope, predicate: SearchPredicate = .all,
                 sort: Sort = Sort(), limit: Int? = nil, offset: Int? = nil) {
         self.scope = scope; self.predicate = predicate
         self.sort = sort; self.limit = limit; self.offset = offset

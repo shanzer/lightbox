@@ -21,7 +21,7 @@ struct SearchQueryTests {
     }
 
     /// The first round-trip exercises recursion; this one covers every
-    /// remaining Predicate case and the `.everywhere` scope, so a saved
+    /// remaining SearchPredicate case and the `.everywhere` scope, so a saved
     /// search can never hit an unencodable case.
     @Test func everyRemainingPredicateCaseRoundTrips() throws {
         let query = SearchQuery(

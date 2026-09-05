@@ -8,13 +8,29 @@ import Foundation
 /// changes what the user asked for. Reducing input to alphanumeric tokens and
 /// quoting each one means user text can only ever be terms.
 public enum FTS5Query {
-    public static func sanitize(_ raw: String) -> String? {
+    /// The three things user text can turn out to be. `noInput` and
+    /// `noSearchableTerms` are deliberately distinct cases rather than a
+    /// shared nil: an empty search field means "no filename filter" (show
+    /// everything), but typed text that survives as no terms — `***`, an
+    /// emoji — means the user asked for something and it matches nothing.
+    /// Collapsing the two would make hostile-looking input show all files.
+    public enum Outcome: Sendable, Equatable {
+        case noInput                 // the user has typed nothing
+        case noSearchableTerms       // they typed something, but none of it survives tokenization
+        case pattern(String)
+    }
+
+    public static func sanitize(_ raw: String) -> Outcome {
+        guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .noInput
+        }
+
         let tokens = raw
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .map(String.init)
             .filter { !$0.isEmpty }
 
-        guard !tokens.isEmpty else { return nil }
+        guard !tokens.isEmpty else { return .noSearchableTerms }
 
         // Quotes are doubled defensively. Tokenization already removed them,
         // but this must stay correct if the token rule is ever loosened.
@@ -23,6 +39,6 @@ public enum FTS5Query {
         // Only the last token is a prefix match: the user is still typing it.
         var terms = quoted
         terms[terms.count - 1] += "*"
-        return terms.joined(separator: " AND ")
+        return .pattern(terms.joined(separator: " AND "))
     }
 }
