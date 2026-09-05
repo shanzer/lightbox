@@ -17,6 +17,8 @@ EXIF in place.
    subject labels, and free-text semantic queries.
 4. Select many images and move, copy, or delete them, recoverably.
 5. Read and write EXIF, including capture time, for one image or a selection.
+6. Identify duplicates — byte-identical files, the same image carrying different
+   metadata, and visually near-identical photos.
 
 ### Non-goals
 
@@ -36,6 +38,8 @@ spec supports it.
 | Delete | Trash by default, permanent behind explicit confirmation | Recoverable by default on 50k-file batches |
 | Sandbox | None; local unsigned development build | Security-scoped bookmarks for arbitrary browsing is disproportionate machinery for a personal tool |
 | "Meme" detection | A user-editable saved search over Vision signals, plus a CLIP semantic query | Explainable and tunable, rather than an opaque classifier |
+| Hash function | SHA-256 via CryptoKit | Hardware-accelerated on Apple Silicon; collision resistance removes the need for a byte-for-byte confirmation |
+| Duplicate detection | Three hashes at different levels: whole file, image data, perceptual | Metadata edits must not destroy duplicate groupings |
 
 Development happens on the M4 Mac mini. The Intel machine is being retired
 within three weeks and is not a support target.
@@ -52,6 +56,7 @@ so the whole system is testable without launching the app.
 | `MetadataReader` | Read EXIF/TIFF/GPS dictionaries | ImageIO |
 | `MetadataWriter` | Apply EXIF edits with backup and verification | exiftool |
 | `ThumbnailCache` | Generate and cache thumbnails, evict by LRU | QuickLookThumbnailing |
+| `Hasher` | Whole-file, image-data, and perceptual hashes | CryptoKit |
 | `VisionAnalyzer` | OCR, classification labels, feature print, face rectangles | Vision |
 | `EmbeddingAnalyzer` | CLIP image and text embeddings | Core ML |
 | `QueryCompiler` | `SearchQuery` value type to SQL, FTS5, and vector scan | IndexStore |
@@ -78,7 +83,8 @@ Database at `~/Library/Application Support/Lightbox/index.sqlite`.
 
 **`files`** — `id`, `path` (unique), `parent_dir`, `name`, `ext`, `size`,
 `mtime`, `inode`, `width`, `height`, `capture_time`, `capture_offset`,
-`camera_make`, `camera_model`, `orientation`, `indexed_at`.
+`camera_make`, `camera_model`, `orientation`, `content_hash`, `image_hash`,
+`image_hash_kind`, `phash`, `hashed_at`, `indexed_at`.
 
 **`files_fts`** — FTS5 external-content table over `name` and `ocr_text`.
 
@@ -107,9 +113,87 @@ a full cosine scan is one `cblas_sgemv` call and completes in single-digit
 milliseconds. An approximate-nearest-neighbour index would be complexity without
 a problem to solve at this scale.
 
-## 5. Indexing pipeline
+## 5. Hashing and duplicate detection
 
-    walk -> stat/diff -> ImageIO metadata -> thumbnail -> Vision -> CLIP
+Three hashes, because there are three different questions.
+
+| Field | What it covers | Answers |
+|---|---|---|
+| `content_hash` | SHA-256 of the whole file | Are these the same file? |
+| `image_hash` | SHA-256 of the format-stripped image data | Are these the same image carrying different metadata? |
+| `phash` | 64-bit DCT perceptual hash of the cached thumbnail | Are these the same photo, re-encoded or resized? |
+
+`image_hash` is the one that survives Lightbox's own EXIF edits. Without it,
+setting a capture time across 500 files silently destroys 500 duplicate
+groupings. `phash` is nearly free, because the thumbnail it reads already exists
+from tier 0, and it catches what neither exact hash can: the same photo at a
+different JPEG quality, or a HEIC converted to JPEG.
+
+SHA-256 rather than `photolib`'s MD5. `photolib` follows its MD5 with a
+byte-for-byte confirmation precisely because MD5 is collision-broken; with
+SHA-256 that confirmation is unnecessary and is not carried over.
+
+### Computing `image_hash`
+
+There is no generic way to skip a header, so each container gets its own rule.
+The rule is a denylist of purely-metadata segments rather than an allowlist of
+image data, because several segments that look like metadata determine how
+pixels decode.
+
+**JPEG** — exclude APP0 (JFIF), APP1 (EXIF and XMP), APP13 (Photoshop and
+IPTC), and COM. Retain APP2 and APP14: APP2 carries the ICC profile, and APP14
+carries Adobe's colour transform marker, which determines whether the data is
+YCbCr or YCCK. Dropping APP14 would make two genuinely different images hash
+identically. Everything from SOF, DQT, DHT, and DRI through the entropy-coded
+scan to EOI is hashed.
+
+**PNG** — exclude `tEXt`, `zTXt`, `iTXt`, `eXIf`, `tIME`, and `pHYs`. Retain
+IHDR, PLTE, tRNS, IDAT, and the colour chunks `gAMA`, `cHRM`, `iCCP`, `sRGB`.
+
+**WebP and GIF** — the equivalent rules over RIFF chunks and GIF blocks.
+
+**RAW, HEIC, TIFF, PSD** — `image_hash` is NULL in version 1. TIFF and RAW are
+IFD-based with byte offsets that shift when metadata is written, so a stable
+hash means a parser per vendor container. HEIC is more tractable, since the
+image data lives in the `mdat` box, but that must be verified empirically
+against exiftool round-trips before it is trusted. For these formats duplicate
+detection falls back to `content_hash` and `phash`.
+
+`image_hash_kind` records which rule produced the value — `jpeg-scan-v1`,
+`png-idat-v1`, `webp-chunk-v1`, `gif-blocks-v1`, or NULL — so a rule can be
+revised and only the affected rows recomputed.
+
+### Two consequences
+
+**An orientation-only difference hashes as identical.** Two files that display
+rotated ninety degrees apart but share scan data receive the same `image_hash`.
+This is correct — the image data is the same — but the duplicate view must
+surface orientation so the right-side-up copy is not the one discarded.
+
+**The size-bucket optimization does not transfer.** `photolib` skips most I/O by
+hashing only files whose size is shared by two or more, which works because
+exact duplicates have identical sizes. Files holding the same image with
+different metadata have different sizes, so `image_hash` requires reading every
+file in full.
+
+### Perceptual hash
+
+`photolib`'s DCT perceptual hash is ported directly, retaining its
+`phash-dct-64-nodc` identifier, so that Lightbox and `photolib` agree on what
+similarity means and their outputs remain comparable.
+
+### Duplicate view
+
+A view that groups the current scope by `image_hash`, then by `content_hash`
+within each group, then offers `phash` neighbours within a Hamming threshold as
+a separate, clearly-labelled tier of confidence. Each group shows every copy
+with its path, size, dimensions, orientation, and capture time, and supports
+keeping one and acting on the rest through the ordinary `FileOperator` path, so
+duplicate removal is journalled and undoable like any other operation.
+
+## 6. Indexing pipeline
+
+    walk -> stat/diff -> ImageIO metadata -> thumbnail -> hashes -> Vision -> CLIP
 
 A bounded structured-concurrency pipeline inside an actor. Three required
 properties:
@@ -118,15 +202,19 @@ properties:
 is the difference between an app that feels like Bridge and one that feels like
 a batch job.
 
-**Tiered commitment.** Tier 0 — stat, ImageIO metadata, thumbnail — runs on
-folder open and is fast. Tier 1 (Vision) and Tier 2 (CLIP) run as an explicitly
-started background pass with visible progress and a pause control. The user is
-never surprised by an hour of CPU.
+**Tiered commitment.** Tier 0 — stat, ImageIO metadata, thumbnail, and the
+perceptual hash computed from that thumbnail — runs on folder open and is fast.
+Tier 1 (`content_hash` and `image_hash`) requires reading every byte of every
+file and is therefore an explicitly started, resumable background pass; both
+hashes are computed in a single pass per file. Tier 2 (Vision) and tier 3 (CLIP)
+are likewise explicitly started, with visible progress and a pause control. The
+user is never surprised by an hour of CPU or by tens of minutes of reads from an
+external drive.
 
 **Resumability.** Pipeline progress is database state, not memory. Quitting
 mid-pass loses nothing.
 
-## 6. Search
+## 7. Search
 
 One `SearchQuery` value type, compiled by `QueryCompiler` into SQL, an optional
 FTS5 match, and an optional vector scan.
@@ -137,6 +225,9 @@ FTS5 match, and an optional vector scan.
 - **Text** — FTS5 over filename and OCR text.
 - **Semantic** — free-text CLIP query, ranked by cosine similarity with an
   adjustable threshold.
+- **Duplicate** — `has_duplicates` (shares an `image_hash` or `content_hash`
+  with at least one other indexed file), and `is_duplicate_of` for a specific
+  file.
 - **Derived** — `has_text` (OCR returned any string above the confidence
   floor), `has_faces` (Vision returned at least one face rectangle), label
   match, `is_screenshot` (no camera make/model in EXIF and dimensions match a
@@ -161,7 +252,7 @@ is tokenized and re-quoted before reaching SQLite. Every SQL statement is
 parameterized; no query is assembled by string interpolation. This path has its
 own test file with hostile fixtures.
 
-## 7. File operations
+## 8. File operations
 
 Move, copy, and delete over a multi-selection, each a single cancellable job
 with progress.
@@ -194,7 +285,7 @@ the last of which matters because libraries live on external drives. Batch jobs
 return a per-item result list; a summary sheet lists failures with reasons and
 offers retry-failed.
 
-## 8. EXIF editing
+## 9. EXIF editing
 
 Single-file and batch editing from the inspector. Supported fields: capture time
 (with `SubSec` and `OffsetTime` variants), Artist, Copyright, Description,
@@ -228,7 +319,7 @@ Four deliberate constraints:
 
 Optionally, the file's modification time is preserved across a metadata edit.
 
-## 9. User interface
+## 10. User interface
 
 Three panes. Left: folder tree, saved searches, and faceted filters with counts.
 Centre: thumbnail grid. Right: metadata inspector.
@@ -250,7 +341,7 @@ disappoint. The grid is therefore built behind a `PhotoGrid` view protocol and
 `NSCollectionView` is contained to one file by construction. The complexity
 budget is spent after a measurement, not before one.
 
-## 10. Failure behaviour
+## 11. Failure behaviour
 
 No optional dependency renders the app unusable.
 
@@ -260,12 +351,13 @@ No optional dependency renders the app unusable.
 | CLIP model absent | Semantic search offers to download the model; everything else works |
 | Index corrupt | Integrity check at launch, offer to rebuild |
 | Volume unmounted | Scanning pauses, resumes on remount |
-| Analysis pass interrupted | Resumes from database state |
+| Analysis or hashing pass interrupted | Resumes from database state |
+| Unsupported format for `image_hash` | Row stores NULL; duplicate detection falls back to `content_hash` and `phash` |
 
 Batch operations never fail as a unit. They return per-item results, and the
 summary sheet reports what failed and why.
 
-## 11. Testing
+## 12. Testing
 
 The `Core` framework is tested headless with swift-testing.
 
@@ -279,6 +371,12 @@ The `Core` framework is tested headless with swift-testing.
   byte-identical before and after a tag edit, which is what catches an
   accidental re-encode; backup restoration on simulated failure; hostile
   filenames.
+- **Hashers** — the warranty test, once per format: take a fixture, change
+  `DateTimeOriginal` with exiftool, then assert `image_hash` is unchanged and
+  `content_hash` changed. Additionally: truncated and malformed files must fail
+  cleanly rather than hash garbage; a JPEG differing only in APP14 must hash
+  differently; a JPEG differing only in APP1 must hash identically; `phash`
+  output must match `photolib`'s for shared fixtures.
 - **FileOperator** — every collision policy, cross-volume moves, source vanished
   mid-operation, undo correctness, companion-file handling.
 - **Analyzers** — fixture images with known text; assertions on recognized
@@ -287,21 +385,22 @@ The `Core` framework is tested headless with swift-testing.
 Tests make no network calls. Tests requiring exiftool skip cleanly when it is
 absent.
 
-## 12. Implementation phases
+## 13. Implementation phases
 
 This is more than one implementation plan's worth of work. It decomposes into
 four phases, each independently useful and independently shippable:
 
 **Phase 1 — browse and structural search.** `Walker`, `IndexStore`,
-`MetadataReader`, `ThumbnailCache`, `IndexCoordinator` tiers 0, the grid, the
-folder tree, include-subfolders, and structural predicates. At the end of this
+`MetadataReader`, `ThumbnailCache`, the hashers, `IndexCoordinator` tiers 0 and
+1, the grid, the folder tree, include-subfolders, and structural predicates. At the end of this
 phase the app replaces Bridge for browsing and dimension search. This phase also
 carries the `PhotoGrid` performance measurement, because the answer changes what
 the remaining phases are built on.
 
 **Phase 2 — acting on selections.** `FileOperator`, the undo journal,
-collision pre-flight, companion files, and `MetadataWriter` with the EXIF
-inspector. Depends on phase 1's selection model.
+collision pre-flight, companion files, `MetadataWriter` with the EXIF inspector,
+and the duplicate view built on phase 1's hashes. Depends on phase 1's selection
+model.
 
 **Phase 3 — Vision analysis.** `VisionAnalyzer`, the `analysis` table, FTS5 over
 OCR text, `has_text` / `has_faces` / label predicates, `is_screenshot` and
@@ -314,7 +413,7 @@ below, and is the phase most likely to change shape before it is built.
 Each phase gets its own implementation plan. This document is the spec for all
 four; only phase 1 should be planned in detail now.
 
-## 13. Open items for implementation planning
+## 14. Open items for implementation planning
 
 - The exact CLIP model and its Core ML packaging must be confirmed against what
   Apple currently publishes before Tier 2 is built. If no suitable Core ML
@@ -322,6 +421,9 @@ four; only phase 1 should be planned in detail now.
   checkpoints, and that conversion step belongs in the plan.
 - The `is_meme` threshold values in this document are a starting point, to be
   calibrated against a sample of the real library.
+- Whether HEIC `mdat` survives an exiftool metadata round-trip unchanged
+  decides whether HEIC gains an `image_hash` in version 1. This is an
+  experiment, not a judgement call, and it is cheap to run.
 - The `PhotoGrid` performance measurement needs a 50k-item fixture. Generating
   synthetic images is cheap; deciding whether to measure against synthetic or
   against the real library belongs in the plan.
