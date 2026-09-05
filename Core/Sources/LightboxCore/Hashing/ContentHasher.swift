@@ -30,9 +30,13 @@ public struct ContentHasher: Sendable {
         // a genuine mid-stream I/O error on a flaky external volume) are
         // distinguishable, and the latter is exactly what `read` below must
         // not silently treat as a clean end-of-file.
+        // O_CLOEXEC: now that this hasher owns the raw open flags, closing the
+        // descriptor across exec is free — and it stops in-flight descriptors
+        // (up to tens of thousands, one per file the indexer is concurrently
+        // hashing) from leaking into any child process the app spawns.
         let fd = url.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
-            return open(path, O_RDONLY)
+            return open(path, O_RDONLY | O_CLOEXEC)
         }
         guard fd >= 0 else {
             throw HashError.unreadable

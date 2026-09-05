@@ -51,14 +51,16 @@ struct ContentHasherTests {
         #expect(hex.allSatisfy { $0.isHexDigit })
     }
 
-    /// `FileHandle(forReadingFrom:)` succeeds for a directory on macOS, but the
-    /// subsequent `read` throws `EISDIR`. That is a real, reachable stand-in
-    /// for a mid-read I/O failure on a flaky external volume: a naive `try?`
-    /// around the read collapses this into a clean end-of-file and silently
-    /// returns the empty-file hash, which is precisely the bug this test
-    /// exists to catch. The fixed implementation must propagate it as a
-    /// `HashError` instead of hashing whatever partial (here: zero-byte) read
-    /// it got.
+    /// `FileHandle(forReadingFrom:)` rejects a directory at open time on this
+    /// toolchain, so it can never reach this test's scenario. Raw POSIX
+    /// `open` does not: it succeeds on a directory, and the subsequent
+    /// `read` throws `EISDIR`. That is what `ContentHasher.hash` opens with,
+    /// and it makes a real, reachable stand-in for a mid-read I/O failure on
+    /// a flaky external volume: a naive `try?` around the read collapses
+    /// this into a clean end-of-file and silently returns the empty-file
+    /// hash, which is precisely the bug this test exists to catch. The
+    /// fixed implementation must propagate it as a `HashError` instead of
+    /// hashing whatever partial (here: zero-byte) read it got.
     @Test func throwsOnAReadFailureInsteadOfHashingAPartialRead() throws {
         let dir = try tree.directory("adir")
         #expect(throws: HashError.truncated) {
