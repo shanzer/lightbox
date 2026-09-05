@@ -68,6 +68,23 @@ public actor IndexCoordinator {
     ///   and no reconcile at all.
     /// - A subtree or an individual entry could not be looked at → its rows are
     ///   protected from the delete, and the pass finishes normally.
+    ///
+    /// A fourth guard is not about completeness but about identity: the volume
+    /// answering at `root` must be the volume the rows were indexed from, or
+    /// the walk is evidence about a different filesystem. See the device check
+    /// below.
+    ///
+    /// **The invariant has one deliberate exception.** Three structural changes
+    /// make the walker stop producing a subtree while emitting no skip at all,
+    /// so the reconcile does delete those rows: a directory replaced by a
+    /// symlink (not followed, by default), a directory renamed into one of the
+    /// opaque bundle extensions (`.photoslibrary`, `.app`, …), and a directory
+    /// renamed to start with a dot. These are ruled correct rather than fixed:
+    /// in each case the walker will never index those files again, so keeping
+    /// the rows would leave the index describing files the app cannot see. The
+    /// consequence is worth knowing before it surprises someone — renaming a
+    /// folder to `.Archive` drops its rows, and renaming it back and rescanning
+    /// restores them.
     @discardableResult
     public func indexTier0(root: URL, recursive: Bool,
                            onProgress: (@Sendable (IndexProgress) -> Void)? = nil)
@@ -151,19 +168,45 @@ public actor IndexCoordinator {
         // Anything the walk could not look at keeps its rows. Protecting them
         // by name rather than narrowing the delete's scope keeps that scope a
         // single byte range and makes the protection exact: a skipped entry
-        // may be a file or a directory, and `paths(under:)` covers both.
-        for url in unseen {
-            livePaths.insert(url.path)
-            livePaths.formUnion(try store.paths(under: url.path))
+        // may be a file or a directory, and both are covered by "at or under".
+        //
+        // One query for the whole scope, then a parent-chain lookup per row.
+        // Querying per skipped entry is the obvious shape and the wrong one: a
+        // permission change landing between a directory's listing and its
+        // per-entry `lstat` skips every entry in it, which on a large folder
+        // is tens of thousands of separate read transactions in one pass.
+        if !unseen.isEmpty {
+            let unseenPaths = Set(unseen.map(\.path))
+            livePaths.formUnion(unseenPaths)
+            for path in try store.paths(under: root.path)
+            where Self.isAtOrUnder(path, anyOf: unseenPaths) {
+                livePaths.insert(path)
+            }
+        }
+
+        // Completeness is not enough on its own: a root can enumerate perfectly
+        // and still be the wrong filesystem. A stale mount point left behind, a
+        // network share that mounts empty, a drive that comes back with a fresh
+        // filesystem — each reads as "every file here was deleted" while the
+        // walk reports a clean, complete, zero-entry pass. `files.device`
+        // exists precisely because an inode is unique only within a volume, so
+        // the index already knows which volume each row came from.
+        //
+        // Re-stat here rather than before the walk: on a long pass the volume
+        // can go away while it runs, and the value that must be trusted is the
+        // one current at the moment of the delete.
+        guard let rootDevice = Self.device(ofDirectory: root) else {
+            throw IndexCoordinatorError.rootUnreadable(root.path)
         }
 
         // Reconcile: rows for files that are no longer on disk. Scoped to what
         // this scan actually looked at — a non-recursive scan never saw the
-        // subdirectories, so it must not be allowed to judge their rows.
+        // subdirectories, so it must not be allowed to judge their rows — and
+        // to rows recorded on the volume that answered this walk.
         if recursive {
-            try store.deleteRows(under: root.path, keeping: livePaths)
+            try store.deleteRows(under: root.path, keeping: livePaths, onDevice: rootDevice)
         } else {
-            try store.deleteRows(inFolder: root.path, keeping: livePaths)
+            try store.deleteRows(inFolder: root.path, keeping: livePaths, onDevice: rootDevice)
         }
 
         progress.phase = .finished
@@ -177,6 +220,29 @@ public actor IndexCoordinator {
     /// the check that guards the whole index.
     private static func isSamePath(_ a: URL, _ b: URL) -> Bool {
         a.standardizedFileURL.path == b.standardizedFileURL.path
+    }
+
+    /// The device of the volume currently answering at `url`, or nil if it is
+    /// gone or is no longer a directory.
+    private static func device(ofDirectory url: URL) -> Int64? {
+        var st = stat()
+        guard stat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR else { return nil }
+        return Int64(st.st_dev)
+    }
+
+    /// Whether `path` is one of `roots` or lives beneath one of them.
+    ///
+    /// Compares whole path components by walking up the parent chain, so
+    /// `/a/bc` is not treated as living under `/a/b` the way a plain prefix
+    /// test would have it.
+    private static func isAtOrUnder(_ path: String, anyOf roots: Set<String>) -> Bool {
+        var current = path
+        while true {
+            if roots.contains(current) { return true }
+            guard let slash = current.lastIndex(of: "/") else { return false }
+            current = String(current[current.startIndex..<slash])
+            if current.isEmpty { return roots.contains("/") }
+        }
     }
 
     /// Reporting every file would push more updates than a display can show;

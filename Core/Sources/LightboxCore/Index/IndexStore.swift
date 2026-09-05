@@ -218,12 +218,21 @@ public final class IndexStore: Sendable {
     /// Removes rows under `prefix` whose paths are not in `keeping`.
     /// FTS and `analysis` rows follow via the `files_ad` trigger and the
     /// `ON DELETE CASCADE` foreign key.
+    ///
+    /// `onDevice` restricts the delete to rows recorded on one volume. A row
+    /// carrying a different `device` was indexed from a filesystem that is not
+    /// the one currently answering at this path, so a walk of that path is no
+    /// evidence about it. Nil means every device, which is only right when the
+    /// caller has no volume to compare against.
     @discardableResult
-    public func deleteRows(under prefix: String, keeping: Set<String>) throws -> Int {
+    public func deleteRows(under prefix: String, keeping: Set<String>,
+                           onDevice device: Int64? = nil) throws -> Int {
         let scope = try Self.pathScope(prefix)
+        var args: [any DatabaseValueConvertible] = [scope.exact, scope.lower, scope.upper]
         return try dbq.write { db in
-            let stale = try String.fetchAll(db, sql: Self.pathsInScopeSQL,
-                                            arguments: [scope.exact, scope.lower, scope.upper])
+            let stale = try String.fetchAll(db, sql: Self.scopedSQL(Self.pathsInScopeSQL,
+                                                                    device: device, into: &args),
+                                            arguments: StatementArguments(args))
                 .filter { !keeping.contains($0) }
             for path in stale {
                 try db.execute(sql: "DELETE FROM files WHERE path = ?", arguments: [path])
@@ -238,13 +247,17 @@ public final class IndexStore: Sendable {
     ///
     /// `folder` is validated and normalized exactly as a recursive scope is, so
     /// a trailing slash matches the stored `parent_dir` and a relative or empty
-    /// setting throws rather than matching nothing.
+    /// setting throws rather than matching nothing. `onDevice` restricts the
+    /// delete to one volume, as in `deleteRows(under:keeping:onDevice:)`.
     @discardableResult
-    public func deleteRows(inFolder folder: String, keeping: Set<String>) throws -> Int {
+    public func deleteRows(inFolder folder: String, keeping: Set<String>,
+                           onDevice device: Int64? = nil) throws -> Int {
         let normalized = try Self.pathScope(folder).exact
+        var args: [any DatabaseValueConvertible] = [normalized]
         return try dbq.write { db in
-            let stale = try String.fetchAll(db, sql: Self.staleInFolderSQL,
-                                            arguments: [normalized])
+            let stale = try String.fetchAll(db, sql: Self.scopedSQL(Self.staleInFolderSQL,
+                                                                    device: device, into: &args),
+                                            arguments: StatementArguments(args))
                 .filter { !keeping.contains($0) }
             for path in stale {
                 try db.execute(sql: "DELETE FROM files WHERE path = ?", arguments: [path])
@@ -315,6 +328,17 @@ public final class IndexStore: Sendable {
         WHERE hashed_at IS NULL AND \(scopePredicateSQL)
         ORDER BY id LIMIT ?
         """
+
+    /// Appends the optional device restriction to a scope query, keeping the
+    /// bind order in step with the SQL. One copy, so the two delete paths
+    /// cannot drift apart on the check that guards against reconciling
+    /// against the wrong volume.
+    private static func scopedSQL(_ sql: String, device: Int64?,
+                                  into args: inout [any DatabaseValueConvertible]) -> String {
+        guard let device else { return sql }
+        args.append(device)
+        return sql + " AND device = ?"
+    }
 
     /// Bounds for "every path at or under `prefix`" as byte comparisons.
     ///

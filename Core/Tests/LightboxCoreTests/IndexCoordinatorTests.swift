@@ -47,6 +47,24 @@ private func makeCoordinator(_ store: IndexStore,
                      hasher: StubHasher(), grayscale: StubGrayscale(), concurrency: 4)
 }
 
+/// A row for a file the coordinator never walked, so a test can plant an index
+/// that predates the current mount. `device` is the point of it.
+private func plantedRecord(path: String, device: Int64) -> FileRecord {
+    FileRecord(id: nil, path: path,
+               parentDir: (path as NSString).deletingLastPathComponent,
+               name: (path as NSString).lastPathComponent,
+               ext: (path as NSString).pathExtension.lowercased(),
+               size: 8, mtime: 1_700_000_000, device: device, inode: 1,
+               width: 640, height: 480, captureTime: nil, captureOffset: nil,
+               cameraMake: nil, cameraModel: nil, orientation: 1,
+               contentHash: nil, imageHash: nil, imageHashKind: nil,
+               phash: nil, hashedAt: nil, indexedAt: 1_700_000_000)
+}
+
+/// No real volume gets this device id, so a row carrying it can only have come
+/// from a filesystem that is not the one the test is walking.
+private let foreignDevice: Int64 = 999_999_999
+
 /// A `struct` suite so swift-testing builds a fresh instance per test and
 /// releases it afterwards: teardown of `tree` is then the framework's
 /// contract rather than an ARC ordering inferred from where it was last used.
@@ -309,6 +327,85 @@ struct IndexCoordinatorTests {
             try await coordinator.indexTier0(root: scanRoot, recursive: false, onProgress: nil)
         }
         #expect(try store.count() == 1)
+    }
+
+    // MARK: - Wrong volume
+
+    /// The hole the completeness checks do not cover: a root that enumerates
+    /// perfectly and yields nothing. A stale mount point, a share that mounts
+    /// empty, a drive back with a fresh filesystem — each reads as "every file
+    /// here was deleted" from a clean, complete, zero-entry pass. The rows say
+    /// which volume they came from; this one is not it.
+    @Test func anEmptyRootWhoseRowsAreOnAnotherVolumeDeletesNothing() async throws {
+        let scanRoot = try tree.directory("photos")
+        let store = try IndexStore.inMemory()
+        for i in 0..<7 {
+            try store.upsert(plantedRecord(path: scanRoot.appendingPathComponent("img\(i).jpg").path,
+                                           device: foreignDevice))
+        }
+        #expect(try store.count() == 7)
+
+        let progress = try await makeCoordinator(store)
+            .indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        #expect(progress.total == 0)          // the walk really did see an empty folder
+        #expect(progress.phase == .finished)
+        #expect(try store.count() == 7)
+    }
+
+    /// The converse, or the fix above would just be "never reconcile an empty
+    /// folder": when the rows are on the volume that answered, an emptied
+    /// folder does reconcile to nothing.
+    @Test func anEmptyRootOnTheSameVolumeStillReconciles() async throws {
+        let scanRoot = try tree.directory("photos")
+        for i in 0..<3 { try tree.file("photos/img\(i).jpg") }
+        let store = try IndexStore.inMemory()
+        let coordinator = makeCoordinator(store)
+        _ = try await coordinator.indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        #expect(try store.count() == 3)
+
+        for i in 0..<3 {
+            try FileManager.default.removeItem(at: scanRoot.appendingPathComponent("img\(i).jpg"))
+        }
+        _ = try await coordinator.indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        #expect(try store.count() == 0)
+    }
+
+    /// The check is per row, not per pass: a scan that legitimately reconciles
+    /// its own volume's rows must not be disabled by the presence of rows from
+    /// another one, and must not judge them either.
+    @Test func rowsFromAnotherVolumeSurviveAScanThatReconcilesItsOwn() async throws {
+        let scanRoot = try tree.directory("photos")
+        let doomed = try tree.file("photos/gone.jpg")
+        try tree.file("photos/stays.jpg")
+        let store = try IndexStore.inMemory()
+        let coordinator = makeCoordinator(store)
+        _ = try await coordinator.indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        for i in 0..<4 {
+            try store.upsert(plantedRecord(path: scanRoot.appendingPathComponent("old\(i).jpg").path,
+                                           device: foreignDevice))
+        }
+        #expect(try store.count() == 6)
+
+        try FileManager.default.removeItem(at: doomed)
+        _ = try await coordinator.indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        #expect(try store.record(atPath: doomed.path) == nil)       // its own volume, reconciled
+        #expect(try store.record(atPath: path("photos/stays.jpg")) != nil)
+        for i in 0..<4 {                                            // the other volume, untouched
+            #expect(try store.record(atPath: path("photos/old\(i).jpg")) != nil)
+        }
+        #expect(try store.count() == 5)
+    }
+
+    @Test func theVolumeCheckAppliesToANonRecursiveScanToo() async throws {
+        let scanRoot = try tree.directory("photos")
+        let store = try IndexStore.inMemory()
+        for i in 0..<7 {
+            try store.upsert(plantedRecord(path: scanRoot.appendingPathComponent("img\(i).jpg").path,
+                                           device: foreignDevice))
+        }
+        _ = try await makeCoordinator(store)
+            .indexTier0(root: scanRoot, recursive: false, onProgress: nil)
+        #expect(try store.count() == 7)
     }
 
     // MARK: - Progress

@@ -205,6 +205,34 @@ struct IndexStoreTests {
         #expect(try store.ftsRowCount() == 3)    // the trigger cleaned up with it
     }
 
+    /// A row recorded on another volume is not this walk's to judge, whichever
+    /// scope the reconcile uses.
+    @Test func deleteRowsRestrictedToADeviceLeavesOtherVolumesAlone() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", device: 1))
+        _ = try store.upsert(sampleRecord(path: "/lib/b.jpg", device: 2))
+        _ = try store.upsert(sampleRecord(path: "/lib/sub/c.jpg", device: 2))
+
+        #expect(try store.deleteRows(under: "/lib", keeping: [], onDevice: 2) == 2)
+        #expect(try store.record(atPath: "/lib/a.jpg") != nil)
+        #expect(try store.count() == 1)
+        #expect(try store.ftsRowCount() == 1)
+
+        _ = try store.upsert(sampleRecord(path: "/lib/d.jpg", device: 2))
+        #expect(try store.deleteRows(inFolder: "/lib", keeping: [], onDevice: 2) == 1)
+        #expect(try store.record(atPath: "/lib/a.jpg") != nil)     // device 1, still untouched
+        #expect(try store.count() == 1)
+    }
+
+    /// Omitting the device keeps the old meaning: every row in scope.
+    @Test func deleteRowsWithoutADeviceStillCoversEveryVolume() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", device: 1))
+        _ = try store.upsert(sampleRecord(path: "/lib/b.jpg", device: 2))
+        #expect(try store.deleteRows(under: "/lib", keeping: []) == 2)
+        #expect(try store.count() == 0)
+    }
+
     @Test func deleteRowsInFolderNormalizesATrailingSlash() throws {
         let store = try IndexStore.inMemory()
         _ = try store.upsert(sampleRecord(path: "/lib/a.jpg"))
