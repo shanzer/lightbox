@@ -24,6 +24,17 @@ private func rampGrid() -> [UInt8] {
 
 private let sipsAvailable = FileManager.default.isExecutableFile(atPath: "/usr/bin/sips")
 
+/// 90 degrees clockwise: dst(r, c) = src(n-1-c, r).
+private func rotated90CW(_ grid: [UInt8], n: Int) -> [UInt8] {
+    var out = [UInt8](repeating: 0, count: n * n)
+    for r in 0..<n {
+        for c in 0..<n {
+            out[r * n + c] = grid[(n - 1 - c) * n + r]
+        }
+    }
+    return out
+}
+
 /// A `struct` suite so swift-testing builds a fresh instance per test and
 /// releases it afterwards: teardown of `tree` is then the framework's
 /// contract rather than an ARC ordering inferred from where it was last used.
@@ -104,6 +115,40 @@ struct PerceptualHashTests {
         let url = tree.root.appendingPathComponent("junk.jpg")
         try Data("not an image".utf8).write(to: url)
         #expect(throws: MetadataError.notAnImage) { try GrayscaleRenderer().gray32(from: url) }
+    }
+
+    @Test func rendererAppliesTheEXIFOrientationTransform() throws {
+        // Identical stored pixels, differing only in the orientation flag.
+        // EXIF orientation 6 displays as the stored image rotated 90 CW, so
+        // the flagged grid must match the upright grid under that rotation.
+        // Not bit-exact: ImageIO's rotated thumbnail path rounds a fraction of
+        // samples off by one (measured: 177 of 1024 samples differ by exactly
+        // 1, hash distance 0), so the assertion is a +-1 tolerance plus an
+        // identical hash. Dropping the transform fails this by a mile: the
+        // unrotated grid differs by ~15-18 mean absolute luminance, and every
+        // orientation-flagged photo in the library would silently change hash.
+        let upright = try Fixtures.writeImage(to: tree.root.appendingPathComponent("o1.jpg"),
+                                              orientation: 1)
+        let flagged = try Fixtures.writeImage(to: tree.root.appendingPathComponent("o6.jpg"),
+                                              orientation: 6)
+        let g1 = try GrayscaleRenderer().gray32(from: upright)
+        let g6 = try GrayscaleRenderer().gray32(from: flagged)
+        let expected = rotated90CW(g1, n: 32)
+        let maxDiff = zip(g6, expected).map { abs(Int($0.0) - Int($0.1)) }.max() ?? 0
+        #expect(maxDiff <= 1)
+        #expect(try PerceptualHash(gray: g6).distance(to: PerceptualHash(gray: expected)) == 0)
+    }
+
+    @Test func rendererSquashesRatherThanLetterboxes() throws {
+        // An aspect-preserving fit of a 40x400 image would leave most of the
+        // 32 columns unpainted (all zero); the squash must populate every one.
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("tall.jpg"),
+                                          width: 40, height: 400)
+        let gray = try GrayscaleRenderer().gray32(from: url)
+        for c in 0..<32 {
+            let column = (0..<32).map { gray[$0 * 32 + c] }
+            #expect(column.contains { $0 != 0 }, "column \(c) is all zero: letterboxed fit?")
+        }
     }
 
     @Test func differentImagesProduceDistantHashes() throws {

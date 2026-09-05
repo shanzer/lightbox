@@ -12,12 +12,23 @@ public protocol GrayscaleRendering: Sendable {
 /// pad, and for RAW it can return the camera's embedded preview rather than a
 /// render of the image data. Either would make the hash describe QuickLook's
 /// behaviour instead of the image.
+///
+/// This pipeline is where lightbox and photolib diverge: the hash function is
+/// bit-exact between the tools, the file-to-grid reduction is not. See the
+/// `PerceptualHash` doc comment for the measured cross-tool spread.
 public struct GrayscaleRenderer: GrayscaleRendering {
     public static let size = 32
 
-    /// An intermediate downsample. Going straight from a 48-megapixel original
-    /// to 32x32 in one step is both slow and aliased; ImageIO produces this
-    /// step cheaply from the embedded preview when one exists.
+    /// Part of the hash definition, not a speed knob: these resampled pixels
+    /// feed the DCT directly, so changing this changes hashes. Measured over
+    /// 36 real photos, moving from 256 to a full-size intermediate changed 20
+    /// of 36 hashes (exact matches against photolib 16/36 vs 26/36, mean
+    /// divergence 1.22 vs 0.67 bits -- both far under the matching threshold
+    /// of 12). 256 is kept because full-decoding a 48-megapixel RAW on the
+    /// first pass over a 50,000-image library is a real cost for a fraction
+    /// of a bit. Do not tune: bumping it "for quality" silently invalidates
+    /// every cached hash. (`ThumbnailFromImageAlways` below forces a full
+    /// decode at this size -- embedded previews are deliberately not used.)
     private static let intermediateMaxPixels = 256
 
     public init() {}
@@ -48,6 +59,10 @@ public struct GrayscaleRenderer: GrayscaleRendering {
                 bitsPerComponent: 8, bytesPerRow: bytesPerRow,
                 space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+            // A CGContext allocation failure is an internal/OOM condition, not
+            // malformed input; .notAnImage is reused anyway to keep the error
+            // surface small, since callers treat both the same way: no hash
+            // can be produced for this file.
             else { throw MetadataError.notAnImage }
             context.interpolationQuality = .high
             // Squashed to a square, aspect deliberately not preserved: this
