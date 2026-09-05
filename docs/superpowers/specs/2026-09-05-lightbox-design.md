@@ -208,10 +208,22 @@ The two tools will not produce bit-identical hashes, and the spec does not claim
 they will. `photolib` resamples with `sips` and Lightbox resamples with
 CoreGraphics; different kernels yield slightly different luminance grids and
 therefore a few differing bits. What is guaranteed is that the hashes occupy the
-same space and that Hamming distances between them are meaningful. The
-acceptance criterion is that the cross-tool distance for an identical source
-image is far below the threshold at which two images are called similar, and the
-implementation measures that distribution rather than assuming it.
+same space and that Hamming distances between them are meaningful.
+
+That distribution has now been measured rather than assumed. Across 36 real
+photographs spanning HEIC, JPEG and PNG at orientations 1, 3 and 6, the
+cross-tool distance was 0 on 16 files, 2 on 18, and 4 on 2 — mean 1.22, maximum
+4, against `photolib`'s similarity threshold of 12. The hash function itself is
+bit-exact with the original; the divergence comes entirely from the file-to-grid
+stage, where `sips` and ImageIO resample differently.
+
+Two consequences follow. Comparing a Lightbox hash against a `photolib` hash for
+the same pair of images spends up to 8 of the 12-bit budget on pipeline
+disagreement alone, so cross-tool comparison is meaningful but not free. And the
+intermediate downsample size is part of the hash definition, not a performance
+knob: at 256 pixels the mean divergence is 1.22, at full image size 0.67, and at
+a single step straight to 32 it is 2.94 — so changing it silently invalidates
+every stored hash. It is fixed at 256 and commented accordingly.
 
 ### Duplicate view
 
