@@ -44,18 +44,29 @@ public struct MetadataReader: MetadataReading {
             orientation: raw[kCGImagePropertyOrientation] as? Int ?? 1)
     }
 
+    /// The zone assumed for a capture timestamp when EXIF supplies no
+    /// `OffsetTimeOriginal`. Always UTC, never `TimeZone.current`: the local
+    /// zone would make the same file sort differently depending on where it
+    /// was indexed, which is a silent, invisible bug. Phase 2's editor makes
+    /// the zone explicit.
+    ///
+    /// Extracted to a named constant, rather than inlined at the fallback
+    /// site, specifically so `MetadataReaderTests` can assert on it directly.
+    /// A regression to `TimeZone.current` here is otherwise undetectable by
+    /// any test built from `read(_:)`'s output on a runner whose local zone
+    /// happens to already be UTC (a common CI default) -- see the comment on
+    /// `treatsCaptureTimeAsUTCWhenNoOffsetIsPresent`.
+    static let defaultCaptureZone = TimeZone(secondsFromGMT: 0)!
+
     /// Parses EXIF's `yyyy:MM:dd HH:mm:ss`.
     ///
     /// The format carries no zone. When `OffsetTimeOriginal` is present it is
-    /// authoritative; otherwise the timestamp is interpreted as UTC. UTC rather
-    /// than the machine's local zone deliberately: the local zone would make
-    /// the same file sort differently depending on where it was indexed, which
-    /// is a silent, invisible bug. Phase 2's editor makes the zone explicit.
+    /// authoritative; otherwise `defaultCaptureZone` (UTC) is assumed.
     static func parseEXIFDate(_ text: String, offset: String?) -> Date? {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
-        formatter.timeZone = offset.flatMap(Self.timeZone(fromOffset:)) ?? TimeZone(secondsFromGMT: 0)
+        formatter.timeZone = offset.flatMap(Self.timeZone(fromOffset:)) ?? Self.defaultCaptureZone
         return formatter.date(from: text)
     }
 

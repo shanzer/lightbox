@@ -31,18 +31,25 @@ struct MetadataReaderTests {
         #expect(md.captureTime == calendar.date(from: components))
     }
 
-    // Deliberately does not rely on a plain `== ` against a value computed
-    // with an explicit UTC `Calendar` alone: that equality holds today, but a
-    // regression to `TimeZone.current` in `parseEXIFDate` would only be
-    // *caught* by such a check on a runner whose local zone happens to
-    // differ from UTC. On a CI runner provisioned with TZ=UTC (a common
-    // Docker default) local and UTC coincide, the regressed implementation
-    // would produce the same value as the correct one, and this test would
-    // pass despite the bug. Pinning to an absolute epoch and additionally
-    // asserting inequality against two independent non-UTC interpretations
-    // makes the check meaningful regardless of the runner's zone. Do not
-    // simplify this back to a single equality against a locally-built
-    // Calendar.
+    // What this test does and does not cover, honestly:
+    //
+    // It pins the parsed time to an absolute epoch value and additionally
+    // asserts inequality against two independent non-UTC interpretations
+    // (US Eastern, JST). That is real signal: it *does* catch a zone-
+    // confusion bug whose result differs from UTC on this input -- for
+    // example accidentally applying an offset, or misreading month/day.
+    //
+    // It does *not* reliably catch a regression to `TimeZone.current` in
+    // `parseEXIFDate`. On a runner whose local zone happens to already be
+    // UTC (a common CI default, e.g. TZ=UTC), the regressed implementation
+    // and the correct one produce a bit-identical `Date`, so no assertion
+    // built from `read(_:)`'s *output* can tell them apart -- this was
+    // confirmed experimentally by injecting that exact regression and
+    // running this test under TZ=UTC, where it passed despite the bug.
+    // `MetadataReader.defaultCaptureZone` and
+    // `defaultCaptureZoneIsUTCRegardlessOfTheRunnersLocalZone` below are
+    // what actually cover that case, by asserting on the fallback constant
+    // directly rather than routing through date arithmetic.
     @Test func treatsCaptureTimeAsUTCWhenNoOffsetIsPresent() throws {
         let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("b.jpg"), offset: nil)
         let md = try MetadataReader().read(url)
@@ -65,6 +72,17 @@ struct MetadataReaderTests {
         #expect(md.captureTime != date(zoneOffsetSeconds: -5 * 3600)) // US Eastern
         #expect(md.captureTime != date(zoneOffsetSeconds: 9 * 3600))  // JST
         #expect(md.captureOffset == nil)
+    }
+
+    /// The genuinely zone-independent half of the UTC-fallback coverage.
+    /// Asserts on the fallback constant directly rather than on any value
+    /// produced by parsing a date, so it cannot coincidentally pass on a
+    /// runner whose local zone happens to already be UTC: a regression to
+    /// `TimeZone.current` at the fallback site changes this constant's
+    /// value (or removes it) regardless of what zone the test happens to
+    /// run in. See the comment on `treatsCaptureTimeAsUTCWhenNoOffsetIsPresent`.
+    @Test func defaultCaptureZoneIsUTCRegardlessOfTheRunnersLocalZone() {
+        #expect(MetadataReader.defaultCaptureZone.secondsFromGMT() == 0)
     }
 
     @Test func readsPNGAndHEICAndTIFF() throws {
