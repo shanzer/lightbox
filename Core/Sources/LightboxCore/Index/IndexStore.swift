@@ -1,6 +1,14 @@
 import Foundation
 import GRDB
 
+public enum IndexStoreError: Error, Equatable, Sendable {
+    /// A scope prefix that is empty or not an absolute path. Thrown rather
+    /// than trapped: the realistic bad input is a persisted setting (an
+    /// unexpanded "~/Pictures", a stale relative preference), and a saved
+    /// setting must surface as an error, not crash the app on launch.
+    case invalidScope(String)
+}
+
 public final class IndexStore: Sendable {
     private let dbq: DatabaseQueue
 
@@ -212,11 +220,10 @@ public final class IndexStore: Sendable {
     /// `ON DELETE CASCADE` foreign key.
     @discardableResult
     public func deleteRows(under prefix: String, keeping: Set<String>) throws -> Int {
-        let scope = Self.pathScope(prefix)
+        let scope = try Self.pathScope(prefix)
         return try dbq.write { db in
-            let stale = try String.fetchAll(db, sql: """
-                SELECT path FROM files WHERE path = ? OR (path > ? AND path < ?)
-                """, arguments: [scope.exact, scope.lower, scope.upper])
+            let stale = try String.fetchAll(db, sql: Self.stalePathsSQL,
+                                            arguments: [scope.exact, scope.lower, scope.upper])
                 .filter { !keeping.contains($0) }
             for path in stale {
                 try db.execute(sql: "DELETE FROM files WHERE path = ?", arguments: [path])
@@ -239,13 +246,10 @@ public final class IndexStore: Sendable {
     }
 
     public func filesMissingHashes(under prefix: String, limit: Int) throws -> [FileRecord] {
-        let scope = Self.pathScope(prefix)
+        let scope = try Self.pathScope(prefix)
         return try dbq.read { db in
-            try FileRecord.fetchAll(db, sql: """
-                SELECT * FROM files
-                WHERE hashed_at IS NULL AND (path = ? OR (path > ? AND path < ?))
-                ORDER BY id LIMIT ?
-                """, arguments: [scope.exact, scope.lower, scope.upper, limit])
+            try FileRecord.fetchAll(db, sql: Self.missingHashesSQL,
+                                    arguments: [scope.exact, scope.lower, scope.upper, limit])
         }
     }
 
@@ -254,6 +258,18 @@ public final class IndexStore: Sendable {
     }
 
     // MARK: - Path scoping
+
+    /// The one copy of the scope predicate. Production queries and the
+    /// query-plan test both use these constants, so the test certifies the
+    /// SQL that actually runs and cannot drift from it.
+    /// Bind order: exact, lower, upper (from `pathScope`).
+    static let scopePredicateSQL = "(path = ? OR (path > ? AND path < ?))"
+    static let stalePathsSQL = "SELECT path FROM files WHERE " + scopePredicateSQL
+    static let missingHashesSQL = """
+        SELECT * FROM files
+        WHERE hashed_at IS NULL AND \(scopePredicateSQL)
+        ORDER BY id LIMIT ?
+        """
 
     /// Bounds for "every path at or under `prefix`" as byte comparisons.
     ///
@@ -265,9 +281,8 @@ public final class IndexStore: Sendable {
     /// escaping: descendants of `p` are exactly the paths strictly between
     /// `p + "/"` and `p + "0"`, because `'0'` (0x30) is the next byte after
     /// `'/'` (0x2F). Usage: `path = exact OR (path > lower AND path < upper)`.
-    static func pathScope(_ prefix: String) -> (exact: String, lower: String, upper: String) {
-        precondition(prefix.hasPrefix("/"),
-                     "scope prefix must be a non-empty absolute path; got \"\(prefix)\"")
+    static func pathScope(_ prefix: String) throws -> (exact: String, lower: String, upper: String) {
+        guard prefix.hasPrefix("/") else { throw IndexStoreError.invalidScope(prefix) }
         var p = prefix
         while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
         if p == "/" { return (exact: "/", lower: "/", upper: "0") }
@@ -297,17 +312,20 @@ public final class IndexStore: Sendable {
 
     /// Raw SQL escape hatches so tests can exercise schema-level behavior
     /// (triggers, cascades) that the public API deliberately does not expose.
+    /// Runs outside an automatic transaction so statements like
+    /// `PRAGMA foreign_keys`, which are no-ops mid-transaction, take effect.
     func testExecute(sql: String, arguments: StatementArguments = []) throws {
-        try dbq.write { db in try db.execute(sql: sql, arguments: arguments) }
+        try dbq.writeWithoutTransaction { db in try db.execute(sql: sql, arguments: arguments) }
     }
 
     func testFetchOne<T: DatabaseValueConvertible>(sql: String, arguments: StatementArguments = []) throws -> T? {
         try dbq.read { db in try T.fetchOne(db, sql: sql, arguments: arguments) }
     }
 
-    func queryPlan(sql: String) throws -> [String] {
+    func queryPlan(sql: String, arguments: StatementArguments = []) throws -> [String] {
         try dbq.read { db in
-            try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql).map { $0["detail"] as String? ?? "" }
+            try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
+                .map { $0["detail"] as String? ?? "" }
         }
     }
 }

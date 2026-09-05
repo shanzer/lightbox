@@ -202,26 +202,63 @@ struct IndexStoreTests {
         #expect(try store.record(atPath: "/Lib/c.jpg") != nil)
     }
 
-    @Test func scopeQueriesSearchThePathIndexRatherThanScanning() throws {
+    @Test func invalidScopePrefixThrowsAndDeletesNothing() throws {
         let store = try IndexStore.inMemory()
-        let scope = IndexStore.pathScope("/lib")
-        let plan = try store.queryPlan(sql: """
-            SELECT path FROM files WHERE path = '\(scope.exact)'
-                OR (path > '\(scope.lower)' AND path < '\(scope.upper)')
-            """)
-        // The OR shows up as a MULTI-INDEX OR node whose children each
-        // SEARCH the unique path index; a LIKE predicate plans as a SCAN.
-        #expect(plan.contains { $0.contains("SEARCH") })
-        #expect(!plan.contains { $0.contains("SCAN") })
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg"))
+        // An unexpanded or relative persisted root must surface as an error,
+        // not wipe the index (empty prefix scoped every absolute path).
+        #expect(throws: IndexStoreError.invalidScope("")) {
+            try store.deleteRows(under: "", keeping: [])
+        }
+        #expect(throws: IndexStoreError.invalidScope("~/Pictures")) {
+            try store.deleteRows(under: "~/Pictures", keeping: [])
+        }
+        #expect(throws: IndexStoreError.invalidScope("Pictures")) {
+            _ = try store.filesMissingHashes(under: "Pictures", limit: 10)
+        }
+        #expect(try store.count() == 1)
+        #expect(try store.ftsRowCount() == 1)
     }
 
-    @Test func deletingAFileRowRemovesItsSearchRowViaTrigger() throws {
+    @Test func scopeQueriesSearchThePathIndexRatherThanScanning() throws {
+        let store = try IndexStore.inMemory()
+        let scope = try IndexStore.pathScope("/lib")
+        let args: [any DatabaseValueConvertible] = [scope.exact, scope.lower, scope.upper]
+        // Plan the exact SQL production runs — the constants are the single
+        // copy shared with deleteRows and filesMissingHashes, so this test
+        // cannot drift from the shipped queries. A LIKE predicate plans the
+        // stale-paths query as a SCAN; the byte-range plans as a MULTI-INDEX
+        // OR whose children each SEARCH the unique path index.
+        let stalePlan = try store.queryPlan(sql: IndexStore.stalePathsSQL,
+                                            arguments: StatementArguments(args))
+        #expect(stalePlan.contains { $0.contains("SEARCH") })
+        #expect(!stalePlan.contains { $0.contains("SCAN") })
+        // The missing-hashes query is planned off files_on_hashed_at under
+        // either predicate, so SEARCH-vs-SCAN cannot certify its scope; its
+        // case-correctness is pinned behaviorally by the case-variant test.
+        // Assert it stays off a full-table SCAN, which is all the plan says.
+        let missingPlan = try store.queryPlan(sql: IndexStore.missingHashesSQL,
+                                              arguments: StatementArguments(args + [10]))
+        #expect(!missingPlan.contains { $0.contains("SCAN") })
+    }
+
+    @Test func deletingAFileRowDropsSearchAndAnalysisRowsViaTrigger() throws {
         let store = try IndexStore.inMemory()
         let id = try store.upsert(sampleRecord(path: "/a/b.jpg"))
-        // Raw DELETE bypasses deleteRows entirely: only the files_ad trigger
-        // can clean up here.
+        try store.testExecute(sql: "INSERT INTO analysis (file_id, ocr_text) VALUES (?, 'x')",
+                              arguments: [id])
+        // foreign_keys is per-connection; triggers are schema-level. Turning
+        // the pragma off isolates files_ad from the ON DELETE CASCADE, so the
+        // analysis assertion below fails if the trigger's DELETE FROM analysis
+        // line is removed — the cascade cannot mask it.
+        try store.testExecute(sql: "PRAGMA foreign_keys = OFF")
+        // Raw DELETE bypasses deleteRows entirely: only the trigger can clean
+        // up here.
         try store.testExecute(sql: "DELETE FROM files WHERE id = ?", arguments: [id])
+        try store.testExecute(sql: "PRAGMA foreign_keys = ON")
         #expect(try store.ftsRowCount() == 0)
+        let analysisCount: Int? = try store.testFetchOne(sql: "SELECT count(*) FROM analysis")
+        #expect(analysisCount == 0)
     }
 
     @Test func changingAFileDropsItsStaleAnalysisRowViaTrigger() throws {
