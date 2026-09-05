@@ -21,15 +21,37 @@ public struct ContentHasher: Sendable {
     }
 
     public func hash(_ url: URL) throws -> String {
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
+        // Opened via raw POSIX `open` rather than `FileHandle(forReadingFrom:)`:
+        // on this toolchain the latter pre-emptively rejects directories (and
+        // similar non-regular-file paths) at open time, which would make every
+        // failure look identical to a missing file. Opening at the POSIX level
+        // means "couldn't open it at all" (bad path, permissions) and
+        // "opened fine but couldn't read it as a byte stream" (a directory, or
+        // a genuine mid-stream I/O error on a flaky external volume) are
+        // distinguishable, and the latter is exactly what `read` below must
+        // not silently treat as a clean end-of-file.
+        let fd = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_RDONLY)
+        }
+        guard fd >= 0 else {
             throw HashError.unreadable
         }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
 
         var digest = SHA256()
-        while true {
-            guard let chunk = try? handle.read(upToCount: bufferSize), !chunk.isEmpty else { break }
-            digest.update(data: chunk)
+        do {
+            // `read(upToCount:)` returns nil only at a clean end-of-file; a
+            // genuine I/O error (e.g. `EIO` from a failing drive, or `EISDIR`)
+            // throws instead. `try?` here would collapse that distinction and
+            // silently hash whatever partial data was read before the error —
+            // exactly the corruption this streaming hasher must not produce.
+            while let chunk = try handle.read(upToCount: bufferSize), !chunk.isEmpty {
+                digest.update(data: chunk)
+            }
+        } catch {
+            throw HashError.truncated
         }
         return digest.finalize().hexEncoded
     }
