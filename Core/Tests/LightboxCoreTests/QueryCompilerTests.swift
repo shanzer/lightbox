@@ -110,10 +110,19 @@ struct QueryCompilerTests {
 
     @Test func hostileSearchTextDoesNotThrow() throws {
         let store = try seededStore()
-        for hostile in ["\"", "*", "NEAR", "a OR b", "-x", "^y", "c:d", "'; DROP TABLE files;--", ""] {
+        // "" is no input and must not filter. Every other string is either
+        // reduced to quoted terms that match no seeded filename, or to no
+        // terms at all — so each has a definite expected result, and the
+        // `try` proves none of them throws.
+        let expectations: [(hostile: String, matches: Int)] = [
+            ("\"", 0), ("*", 0), ("NEAR", 0), ("a OR b", 0), ("-x", 0),
+            ("^y", 0), ("c:d", 0), ("'; DROP TABLE files;--", 0), ("", 6),
+        ]
+        for (hostile, matches) in expectations {
             let found = try store.search(SearchQuery(scope: .everywhere,
                                                      predicate: .filenameText(hostile)))
-            #expect(found.count >= 0, "hostile input \(hostile) must not throw")
+            #expect(found.count == matches,
+                    "\(String(reflecting: hostile)) must match exactly \(matches) rows")
         }
         #expect(try store.count() == 6)   // nothing was dropped
     }
@@ -275,5 +284,89 @@ struct QueryCompilerTests {
         #expect(byScope.isEmpty)
 
         #expect(try store.count() == 2)   // the table survived all of it
+    }
+
+    /// SQL's three-valued logic makes `NOT (expr)` drop rows where the
+    /// attribute is NULL: `NOT UNKNOWN` is `UNKNOWN`, so a screenshot with no
+    /// camera make would vanish from both "Canon" and "not Canon". Negation
+    /// must treat an unknown attribute as "does not match".
+    @Test func negationKeepsRowsWhereTheAttributeIsUnknown() throws {
+        let store = try seededStore()
+        // beach.jpg is Canon; sunset-invoice.jpg is Nikon; the other four
+        // rows have no camera make at all and must survive the negation.
+        let notCanon = try store.search(SearchQuery(scope: .everywhere,
+                                                    predicate: .not(.cameraMake("Canon"))))
+        #expect(Set(names(notCanon)) ==
+                ["icon.png", "sunset-invoice.jpg", "dup-a.jpg", "dup-b.jpg", "other.jpg"])
+
+        _ = try store.upsert(makeRecord("/lib/no-dims.jpg"))   // width is NULL
+        let notWide = try store.search(SearchQuery(scope: .everywhere,
+                                                   predicate: .not(.width(.atLeast(1)))))
+        #expect(names(notWide) == ["no-dims.jpg"])
+
+        // Double negation must round-trip back to the plain predicate.
+        let canonAgain = try store.search(SearchQuery(scope: .everywhere,
+                                                      predicate: .not(.not(.cameraMake("Canon")))))
+        #expect(names(canonAgain) == ["beach.jpg"])
+    }
+
+    /// `saved_searches.query` is persisted JSON, so predicate depth is
+    /// attacker-influenceable the moment saved searches are imported or
+    /// synced. Uncapped recursion crashes hard (SIGBUS) around 200 levels;
+    /// the compiler must throw a catchable error well before that.
+    @Test func predicateNestingBeyondTheCapThrowsInsteadOfCrashing() throws {
+        let store = try seededStore()
+
+        var hostile = SearchPredicate.cameraMake("Canon")
+        for _ in 0..<200 { hostile = .not(hostile) }
+        #expect(throws: QueryCompilerError.predicateTooDeep(limit: 64)) {
+            try store.search(SearchQuery(scope: .everywhere, predicate: hostile))
+        }
+
+        // Depth far beyond any UI, but under the cap, still works — and an
+        // even number of NOTs lands back on the plain predicate.
+        var deep = SearchPredicate.cameraMake("Canon")
+        for _ in 0..<50 { deep = .not(deep) }
+        let found = try store.search(SearchQuery(scope: .everywhere, predicate: deep))
+        #expect(names(found) == ["beach.jpg"])
+    }
+
+    /// The `id ASC` tiebreaker exists so pagination over tied sort keys is
+    /// stable: walking the pages must visit every row exactly once, in the
+    /// same order the unpaginated query produces.
+    @Test func paginationOverTiedSortKeysIsStable() throws {
+        let store = try IndexStore.inMemory()
+        for i in 0..<7 {
+            _ = try store.upsert(makeRecord("/lib/tied-\(i).jpg", size: 100))
+        }
+        let sort = SearchQuery.Sort(field: .size, ascending: false)
+        let full = names(try store.search(SearchQuery(scope: .everywhere, sort: sort)))
+        #expect(full.count == 7)
+
+        var paged: [String] = []
+        var offset = 0
+        while true {
+            let page = try store.search(SearchQuery(scope: .everywhere, sort: sort,
+                                                    limit: 2, offset: offset))
+            if page.isEmpty { break }
+            paged += names(page)
+            offset += 2
+        }
+        #expect(paged == full)                     // same rows, same order
+        #expect(Set(paged).count == paged.count)   // each row exactly once
+    }
+
+    /// `hasDuplicates` means "this file has a twin somewhere in the library",
+    /// deliberately ignoring the folder scope for the twin: a scoped search
+    /// still surfaces a file whose only duplicate lives outside the scope.
+    @Test func hasDuplicatesLooksBeyondTheFolderScope() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(makeRecord("/in/a.jpg", image: "same"))
+        _ = try store.upsert(makeRecord("/out/b.jpg", image: "same"))
+        _ = try store.upsert(makeRecord("/in/unique.jpg", image: "solo"))
+
+        let found = try store.search(SearchQuery(scope: .folder(path: "/in", recursive: true),
+                                                 predicate: .hasDuplicates))
+        #expect(names(found) == ["a.jpg"])   // its twin is outside the scope
     }
 }

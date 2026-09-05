@@ -6,6 +6,15 @@ public struct CompiledQuery: Sendable {
     public let arguments: StatementArguments
 }
 
+public enum QueryCompilerError: Error, Equatable, Sendable {
+    /// A predicate tree nested deeper than any UI can produce. The realistic
+    /// source is `saved_searches.query` — persisted JSON, so attacker-
+    /// influenceable once saved searches are imported or synced. Uncapped,
+    /// the compiler's own recursion crashes hard (SIGBUS) around 200 levels;
+    /// this is thrown, and catchable, long before that.
+    case predicateTooDeep(limit: Int)
+}
+
 /// Turns a `SearchQuery` into parameterized SQL.
 ///
 /// Every user-supplied value is a bound parameter. Nothing from the user is
@@ -21,7 +30,7 @@ public enum QueryCompiler {
         var arguments: [DatabaseValueConvertible?] = []
 
         let scopeClause = try scope(query.scope, &arguments)
-        let predicateClause = condition(query.predicate, &arguments)
+        let predicateClause = try condition(query.predicate, depth: 0, &arguments)
 
         var sql = "SELECT * FROM files WHERE (\(scopeClause)) AND (\(predicateClause))"
         sql += " ORDER BY \(orderBy(query.sort))"
@@ -63,8 +72,18 @@ public enum QueryCompiler {
         }
     }
 
-    private static func condition(_ predicate: SearchPredicate,
-                                  _ arguments: inout [DatabaseValueConvertible?]) -> String {
+    /// Deeper than any UI can nest, shallow enough that neither this
+    /// function's recursion (SIGBUS near 200 levels) nor the system SQLite's
+    /// parser stack (measured overflowing at ~89 levels of the nesting this
+    /// compiler emits — Apple's build is far shallower than stock SQLite's
+    /// documented 1000) is ever reached.
+    private static let maxPredicateDepth = 64
+
+    private static func condition(_ predicate: SearchPredicate, depth: Int,
+                                  _ arguments: inout [DatabaseValueConvertible?]) throws -> String {
+        guard depth <= maxPredicateDepth else {
+            throw QueryCompilerError.predicateTooDeep(limit: maxPredicateDepth)
+        }
         switch predicate {
         case .all:
             return "1"
@@ -72,15 +91,29 @@ public enum QueryCompiler {
         case .and(let parts):
             // Vacuously true: an empty filter panel matches everything.
             guard !parts.isEmpty else { return "1" }
-            return parts.map { "(\(condition($0, &arguments)))" }.joined(separator: " AND ")
+            // A single-element group needs no parentheses; wrapping anyway
+            // would spend SQLite parser stack for nothing.
+            guard parts.count > 1 else { return try condition(parts[0], depth: depth + 1, &arguments) }
+            return try parts.map { "(\(try condition($0, depth: depth + 1, &arguments)))" }
+                .joined(separator: " AND ")
 
         case .or(let parts):
             // Vacuously false: "any of nothing" matches nothing.
             guard !parts.isEmpty else { return "0" }
-            return parts.map { "(\(condition($0, &arguments)))" }.joined(separator: " OR ")
+            guard parts.count > 1 else { return try condition(parts[0], depth: depth + 1, &arguments) }
+            return try parts.map { "(\(try condition($0, depth: depth + 1, &arguments)))" }
+                .joined(separator: " OR ")
 
         case .not(let inner):
-            return "NOT (\(condition(inner, &arguments)))"
+            // `IS NOT TRUE` folds SQL's three-valued logic back to two: a row
+            // whose attribute is NULL makes the inner predicate UNKNOWN, and
+            // plain `NOT UNKNOWN` is still UNKNOWN — silently dropping the
+            // row from both a filter and its negation. An unknown attribute
+            // must count as "does not match", so its negation matches.
+            // (`IS NOT TRUE`, not `NOT COALESCE(expr, 0)`: identical
+            // semantics, but COALESCE burns the system SQLite's parser stack
+            // about five times faster, overflowing at 17 nested negations.)
+            return "(\(try condition(inner, depth: depth + 1, &arguments))) IS NOT TRUE"
 
         case .width(let c):
             return numeric("width", c, &arguments)
@@ -134,6 +167,10 @@ public enum QueryCompiler {
             }
 
         case .hasDuplicates:
+            // Deliberately evaluated over the whole `files` table, not the
+            // folder scope: it means "this file has a twin somewhere in the
+            // library", so a search scoped to /in still surfaces a file whose
+            // only duplicate lives in /out.
             return """
                 (image_hash IS NOT NULL AND image_hash IN (
                     SELECT image_hash FROM files WHERE image_hash IS NOT NULL
