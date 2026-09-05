@@ -222,7 +222,7 @@ public final class IndexStore: Sendable {
     public func deleteRows(under prefix: String, keeping: Set<String>) throws -> Int {
         let scope = try Self.pathScope(prefix)
         return try dbq.write { db in
-            let stale = try String.fetchAll(db, sql: Self.stalePathsSQL,
+            let stale = try String.fetchAll(db, sql: Self.pathsInScopeSQL,
                                             arguments: [scope.exact, scope.lower, scope.upper])
                 .filter { !keeping.contains($0) }
             for path in stale {
@@ -254,6 +254,19 @@ public final class IndexStore: Sendable {
     }
 
     // MARK: - Reads
+
+    /// Every indexed path at or under `prefix`.
+    ///
+    /// Exists for the reconcile: a subtree the walk could not enter must have
+    /// its rows protected from the delete, and protecting them by name is
+    /// exact where narrowing the delete's byte-range scope would not be.
+    public func paths(under prefix: String) throws -> [String] {
+        let scope = try Self.pathScope(prefix)
+        return try dbq.read { db in
+            try String.fetchAll(db, sql: Self.pathsInScopeSQL,
+                                arguments: [scope.exact, scope.lower, scope.upper])
+        }
+    }
 
     public func record(atPath path: String) throws -> FileRecord? {
         try dbq.read { db in
@@ -292,7 +305,9 @@ public final class IndexStore: Sendable {
     /// SQL that actually runs and cannot drift from it.
     /// Bind order: exact, lower, upper (from `pathScope`).
     static let scopePredicateSQL = "(path = ? OR (path > ? AND path < ?))"
-    static let stalePathsSQL = "SELECT path FROM files WHERE " + scopePredicateSQL
+    /// Every indexed path at or under a scope. Shared by the reconcile's
+    /// delete and by the read that protects an unwalkable subtree from it.
+    static let pathsInScopeSQL = "SELECT path FROM files WHERE " + scopePredicateSQL
     /// The non-recursive counterpart, off `files_on_parent_dir`.
     static let staleInFolderSQL = "SELECT path FROM files WHERE parent_dir = ?"
     static let missingHashesSQL = """

@@ -17,7 +17,7 @@ private struct StubMetadataReader: MetadataReading {
 /// Blocks inside the first read and reports when it got there, so a test can
 /// cancel at a known point in the pass rather than racing the scheduler.
 private struct BlockingMetadataReader: MetadataReading {
-    let reads: Mutex<Int>
+    let reads: LockBox<Int>
     let release: DispatchSemaphore
 
     func read(_ url: URL) throws -> ImageMetadata {
@@ -226,13 +226,101 @@ struct IndexCoordinatorTests {
         #expect(try store.count() == 2)
     }
 
+    // MARK: - Incomplete walks
+
+    /// The invariant: a row may only be deleted on the evidence of a complete
+    /// look at the place it lives. An unreadable subdirectory is not evidence
+    /// that the files inside it were deleted — the walk never got in.
+    @Test(.enabled(if: getuid() != 0, "requires a non-root user"))
+    func anUnreadableSubdirectoryCostsNoRows() async throws {
+        try tree.file("a.jpg")
+        for i in 0..<8 { try tree.file("locked/img\(i).jpg") }
+        try tree.file("locked/deep/nested/x.jpg")
+        try tree.file("locked/deep/nested/y.jpg")
+        let store = try IndexStore.inMemory()
+        let coordinator = makeCoordinator(store)
+        _ = try await coordinator.indexTier0(root: tree.root, recursive: true, onProgress: nil)
+        #expect(try store.count() == 11)
+
+        try tree.chmod("locked", 0o000)
+        let second = try await coordinator.indexTier0(root: tree.root, recursive: true,
+                                                      onProgress: nil)
+        #expect(second.phase == .finished)
+        #expect(second.skipped == 1)          // and it says so, rather than silently
+        #expect(try store.count() == 11)
+        for i in 0..<8 {
+            #expect(try store.record(atPath: path("locked/img\(i).jpg")) != nil)
+        }
+        // The protection is the whole subtree, not just the directory's own
+        // children: the walk never learned anything about any depth below it.
+        #expect(try store.record(atPath: path("locked/deep/nested/x.jpg")) != nil)
+        #expect(try store.record(atPath: path("locked/deep/nested/y.jpg")) != nil)
+    }
+
+    /// An unreadable root must not read as "the folder is empty now".
+    @Test(.enabled(if: getuid() != 0, "requires a non-root user"))
+    func anUnreadableRootThrowsAndDeletesNothing() async throws {
+        let scanRoot = try tree.directory("photos")
+        for i in 0..<5 { try tree.file("photos/img\(i).jpg") }
+        let store = try IndexStore.inMemory()
+        let coordinator = makeCoordinator(store)
+        _ = try await coordinator.indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        #expect(try store.count() == 5)
+
+        try tree.chmod("photos", 0o000)
+        await #expect(throws: IndexCoordinatorError.rootUnreadable(scanRoot.path)) {
+            try await coordinator.indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        }
+        #expect(try store.count() == 5)
+    }
+
+    /// The one that matters on this app's own hardware: an external drive is
+    /// unplugged and the last folder is reopened. A missing root is a missing
+    /// volume far more often than it is a deleted folder, and the two are
+    /// indistinguishable from here — so neither may delete the drive's index.
+    @Test func aMissingRootThrowsAndDeletesNothing() async throws {
+        let scanRoot = try tree.directory("photos")
+        for i in 0..<6 { try tree.file("photos/img\(i).jpg") }
+        let store = try IndexStore.inMemory()
+        let coordinator = makeCoordinator(store)
+        _ = try await coordinator.indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        #expect(try store.count() == 6)
+
+        try FileManager.default.removeItem(at: scanRoot)
+        await #expect(throws: IndexCoordinatorError.rootUnreadable(scanRoot.path)) {
+            try await coordinator.indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        }
+        #expect(try store.count() == 6)
+        for i in 0..<6 {
+            #expect(try store.record(atPath: path("photos/img\(i).jpg")) != nil)
+        }
+    }
+
+    @Test func aMissingRootIsRejectedByANonRecursiveScanToo() async throws {
+        let scanRoot = try tree.directory("photos")
+        try tree.file("photos/a.jpg")
+        let store = try IndexStore.inMemory()
+        let coordinator = makeCoordinator(store)
+        _ = try await coordinator.indexTier0(root: scanRoot, recursive: false, onProgress: nil)
+        #expect(try store.count() == 1)
+
+        try FileManager.default.removeItem(at: scanRoot)
+        await #expect(throws: IndexCoordinatorError.rootUnreadable(scanRoot.path)) {
+            try await coordinator.indexTier0(root: scanRoot, recursive: false, onProgress: nil)
+        }
+        #expect(try store.count() == 1)
+    }
+
     // MARK: - Progress
 
     @Test func tier0ReportsProgressMonotonically() async throws {
-        for i in 0..<20 { try tree.file("img\(i).jpg") }
+        // Enough files that the pass must report from inside the loop and not
+        // only at the phase boundaries — the batched report is the branch the
+        // monotonicity claim is actually about.
+        for i in 0..<60 { try tree.file("img\(i).jpg") }
         let store = try IndexStore.inMemory()
 
-        let box = Mutex<[IndexProgress]>([])
+        let box = LockBox<[IndexProgress]>([])
         let final = try await makeCoordinator(store)
             .indexTier0(root: tree.root, recursive: true) { progress in
                 box.withLock { $0.append(progress) }
@@ -243,6 +331,10 @@ struct IndexCoordinatorTests {
         #expect(seen.last == final)
         #expect(zip(seen, seen.dropFirst()).allSatisfy { $0.completed <= $1.completed })
         #expect(seen.allSatisfy { $0.completed <= $0.total })
+        // At least one sample from mid-pass, or the three phase-boundary
+        // samples would satisfy every assertion above on their own.
+        #expect(seen.contains { $0.phase == .reading && $0.completed > 0
+                                && $0.completed < $0.total })
     }
 
     @Test func progressFractionIsZeroBeforeAnythingIsKnown() {
@@ -274,7 +366,7 @@ struct IndexCoordinatorTests {
         for i in 0..<10 { try tree.file("img\(i).jpg") }
         let store = try IndexStore.inMemory()
         let release = DispatchSemaphore(value: 0)
-        let reads = Mutex(0)
+        let reads = LockBox(0)
         let coordinator = makeCoordinator(store,
                                           metadata: BlockingMetadataReader(reads: reads,
                                                                            release: release))

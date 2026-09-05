@@ -226,6 +226,21 @@ struct IndexStoreTests {
         #expect(try store.count() == 1)
     }
 
+    /// What the reconcile uses to protect a subtree the walk could not enter.
+    @Test func pathsUnderReturnsTheWholeScopeAndNothingOutsideIt() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg"))
+        _ = try store.upsert(sampleRecord(path: "/lib/sub/c.jpg"))
+        _ = try store.upsert(sampleRecord(path: "/LIB/b.jpg"))
+        _ = try store.upsert(sampleRecord(path: "/library/d.jpg"))
+
+        #expect(try store.paths(under: "/lib").sorted() == ["/lib/a.jpg", "/lib/sub/c.jpg"])
+        #expect(try store.paths(under: "/lib/a.jpg") == ["/lib/a.jpg"])   // a file scopes to itself
+        #expect(throws: IndexStoreError.invalidScope("Pictures")) {
+            _ = try store.paths(under: "Pictures")
+        }
+    }
+
     /// SQLite's LIKE folds ASCII case, so a LIKE-based scope would make
     /// `deleteRows(under: "/lib")` destroy `/LIB` on a case-sensitive volume.
     /// The byte-range scope must not leak across case-variant siblings.
@@ -265,11 +280,12 @@ struct IndexStoreTests {
         let scope = try IndexStore.pathScope("/lib")
         let args: [any DatabaseValueConvertible] = [scope.exact, scope.lower, scope.upper]
         // Plan the exact SQL production runs — the constants are the single
-        // copy shared with deleteRows and filesMissingHashes, so this test
+        // copy shared with deleteRows, paths(under:) and filesMissingHashes,
+        // so this test
         // cannot drift from the shipped queries. A LIKE predicate plans the
         // stale-paths query as a SCAN; the byte-range plans as a MULTI-INDEX
         // OR whose children each SEARCH the unique path index.
-        let stalePlan = try store.queryPlan(sql: IndexStore.stalePathsSQL,
+        let stalePlan = try store.queryPlan(sql: IndexStore.pathsInScopeSQL,
                                             arguments: StatementArguments(args))
         #expect(stalePlan.contains { $0.contains("SEARCH") })
         #expect(!stalePlan.contains { $0.contains("SCAN") })

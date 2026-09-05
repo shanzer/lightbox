@@ -18,12 +18,19 @@ public struct IndexProgress: Sendable, Hashable {
     /// Files whose metadata could not be read. They are still indexed — a
     /// failure here costs dimensions and camera fields, not the row.
     public var failed: Int
+    /// Files and directories the walk could not look at. Their rows are
+    /// preserved rather than reconciled away, so this is the count of what the
+    /// pass deliberately left alone — non-zero means the index is stale by
+    /// choice rather than complete.
+    public var skipped: Int
 
-    public init(phase: Phase = .idle, completed: Int = 0, total: Int = 0, failed: Int = 0) {
+    public init(phase: Phase = .idle, completed: Int = 0, total: Int = 0, failed: Int = 0,
+                skipped: Int = 0) {
         self.phase = phase
         self.completed = completed
         self.total = total
         self.failed = failed
+        self.skipped = skipped
     }
 
     public var fraction: Double {

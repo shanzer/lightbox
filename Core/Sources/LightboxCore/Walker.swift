@@ -13,7 +13,14 @@ public struct WalkEntry: Sendable, Hashable {
 }
 
 public enum SkipReason: String, Sendable, Hashable {
-    case unreadable, symlinkLoop
+    /// A directory that could not be identified or enumerated.
+    case unreadable
+    case symlinkLoop
+    /// A directory entry whose `stat` failed for a reason other than the file
+    /// having been deleted. It is emitted so a caller can tell "this file is
+    /// gone" from "I could not look at this file": only the former is evidence
+    /// that an index row should be removed.
+    case unstatable
 }
 
 public enum WalkEvent: Sendable {
@@ -78,12 +85,27 @@ public struct Walker: Sendable {
                 let child = dir.appendingPathComponent(name)
 
                 var st = stat()
-                guard lstat(child.path, &st) == 0 else { continue }
+                if lstat(child.path, &st) != 0 {
+                    // ENOENT is the file being deleted between the listing and
+                    // this stat: genuinely gone, and an index row for it should
+                    // go too, so it is dropped silently. Any other errno — EIO
+                    // on a flaky external volume, EACCES from a permission
+                    // change mid-walk — means the file may well still be there
+                    // and we merely could not look at it. Dropping that one
+                    // silently would let a caller read it as a deletion.
+                    if errno != ENOENT { onEvent(.skipped(url: child, reason: .unstatable)) }
+                    continue
+                }
 
                 if st.st_mode & S_IFMT == S_IFLNK {
                     guard options.followSymlinks else { continue }
                     var resolved = stat()
-                    guard stat(child.path, &resolved) == 0 else { continue }
+                    if stat(child.path, &resolved) != 0 {
+                        // A dangling symlink resolves to ENOENT and is as dead
+                        // as a deleted file; anything else is a failure to look.
+                        if errno != ENOENT { onEvent(.skipped(url: child, reason: .unstatable)) }
+                        continue
+                    }
                     st = resolved
                 }
 

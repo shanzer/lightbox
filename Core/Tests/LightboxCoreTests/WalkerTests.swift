@@ -109,6 +109,43 @@ struct WalkerTests {
         #expect(result.skipped.contains(.unreadable))
     }
 
+    /// An entry that cannot be `stat`ed is a failure to look at a file, not
+    /// evidence that the file is gone, and the two must not report the same
+    /// way. A symlink into an unreadable directory is the shape that provokes
+    /// it deterministically: `EACCES` from the resolving `stat`, where a
+    /// dangling link would give `ENOENT`.
+    @Test(.enabled(if: getuid() != 0, "requires a non-root user"))
+    func reportsAnUnstattableEntrySeparatelyFromAnUnreadableDirectory() throws {
+        try tree.file("locked/target.jpg")
+        try tree.symlink("link.jpg", to: "locked/target.jpg")
+        try tree.chmod("locked", 0o000)
+        // Non-recursive, so the locked directory itself is never entered and
+        // the only event can be the symlink's.
+        let result = collect(tree.root, WalkOptions(includeSubdirectories: false,
+                                                    followSymlinks: true))
+        #expect(result.names.isEmpty)
+        #expect(result.skipped == [.unstatable])
+    }
+
+    /// A dangling symlink is `ENOENT`: genuinely dead, and it must stay
+    /// silent, or nothing would ever be reconciled away.
+    @Test func aDanglingSymlinkProducesNoSkipEvent() throws {
+        try tree.symlink("link.jpg", to: "never-existed.jpg")
+        let result = collect(tree.root, WalkOptions(includeSubdirectories: false,
+                                                    followSymlinks: true))
+        #expect(result.names.isEmpty)
+        #expect(result.skipped.isEmpty)
+    }
+
+    /// The other side of it: a file that is genuinely gone produces no skip,
+    /// or every deletion would be protected from reconciliation forever.
+    @Test func aDeletedFileProducesNoSkipEvent() throws {
+        try tree.file("a.jpg")
+        let result = collect(tree.root, WalkOptions(includeSubdirectories: true))
+        #expect(result.names == ["a.jpg"])
+        #expect(result.skipped.isEmpty)
+    }
+
     @Test func reportsSizeAndModificationTime() throws {
         try tree.file("a.jpg", bytes: 1234)
         var entries: [WalkEntry] = []
