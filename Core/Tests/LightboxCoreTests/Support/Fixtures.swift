@@ -71,3 +71,34 @@ enum Fixtures {
         return url
     }
 }
+
+enum FixtureError: Error, CustomStringConvertible {
+    case missing(String)
+
+    var description: String {
+        switch self {
+        case .missing(let name): "fixture \(name) is missing from the test bundle"
+        }
+    }
+}
+
+extension Fixtures {
+    /// A checked-in fixture file, copied into the test bundle by
+    /// `resources: [.copy("Fixtures")]`.
+    ///
+    /// Needed for formats ImageIO cannot write: `CGImageDestinationCreateWithURL`
+    /// returns nil for `org.webmproject.webp`, so a WebP cannot be generated the
+    /// way `writeImage` generates the others.
+    static func url(_ name: String) throws -> URL {
+        // `.copy` preserves the directory, so the resource is addressed by the
+        // path within it rather than by bare name; the flattened lookup is a
+        // fallback in case a future manifest switches to `.process`.
+        if let url = Bundle.module.url(forResource: "Fixtures/\(name)", withExtension: nil) {
+            return url
+        }
+        if let url = Bundle.module.url(forResource: name, withExtension: nil) {
+            return url
+        }
+        throw FixtureError.missing(name)
+    }
+}

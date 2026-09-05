@@ -39,7 +39,7 @@ public struct MediaType: Sendable, Hashable {
         switch kind {
         case .jpeg: JPEGImageHash.kind
         case .png: PNGImageHash.kind
-        case .webp: "webp-chunk-v1"
+        case .webp: WebPImageHash.kind
         case .gif, .heic, .tiff, .raw, .psd: nil
         }
     }

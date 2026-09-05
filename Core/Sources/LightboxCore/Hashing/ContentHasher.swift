@@ -21,6 +21,36 @@ public struct ContentHasher: Sendable {
     }
 
     public func hash(_ url: URL) throws -> String {
+        var digest = SHA256()
+        try stream(url) { digest.update(data: $0) }
+        return digest.finalize().hexEncoded
+    }
+
+    /// The file's entire contents, read through the same loop as `hash(_:)`.
+    ///
+    /// Exists so a caller that needs the bytes themselves — the image-data
+    /// parsers, which have to walk a file's structure — gets one read whose
+    /// every failure is a `HashError`. `Data(contentsOf:, .mappedIfSafe)` would
+    /// be the obvious alternative and is the wrong one: a mid-read `EIO` on a
+    /// failing external volume arrives as `SIGBUS` through a mapping, which
+    /// cannot be caught and cannot be turned into `.truncated`.
+    public func readWholeFile(_ url: URL) throws -> Data {
+        var out = Data()
+        if let size = try? FileManager.default
+            .attributesOfItem(atPath: url.path)[.size] as? Int, size > 0 {
+            // A hint only. The loop below is still what decides how many bytes
+            // there really are, so a stale or lying size cannot truncate it.
+            out.reserveCapacity(size)
+        }
+        try stream(url) { out.append($0) }
+        return out
+    }
+
+    /// Reads `url` in `bufferSize` chunks, handing each to `consume`.
+    ///
+    /// Shared by `hash(_:)` and `readWholeFile(_:)` so the two cannot disagree
+    /// about what counts as a clean end-of-file or an I/O error.
+    private func stream(_ url: URL, _ consume: (Data) -> Void) throws {
         // Opened via raw POSIX `open` rather than `FileHandle(forReadingFrom:)`:
         // on this toolchain the latter pre-emptively rejects directories (and
         // similar non-regular-file paths) at open time, which would make every
@@ -44,7 +74,6 @@ public struct ContentHasher: Sendable {
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
 
-        var digest = SHA256()
         do {
             // `read(upToCount:)` returns nil only at a clean end-of-file; a
             // genuine I/O error (e.g. `EIO` from a failing drive, or `EISDIR`)
@@ -52,12 +81,11 @@ public struct ContentHasher: Sendable {
             // silently hash whatever partial data was read before the error —
             // exactly the corruption this streaming hasher must not produce.
             while let chunk = try handle.read(upToCount: bufferSize), !chunk.isEmpty {
-                digest.update(data: chunk)
+                consume(chunk)
             }
         } catch {
             throw HashError.truncated
         }
-        return digest.finalize().hexEncoded
     }
 }
 
