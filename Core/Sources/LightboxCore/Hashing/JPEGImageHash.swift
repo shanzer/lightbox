@@ -50,14 +50,20 @@ enum JPEGImageHash {
 
             switch marker {
             case 0xD9:                                   // EOI
-                ranges.append(i..<min(markerIndex + 1, bytes.count))
+                // Everything from EOI to the end of the buffer is hashed:
+                // motion photos (Pixel/Samsung) append a complete MP4 after
+                // EOI and MPF multi-picture files carry a second image there.
+                // That is payload, not metadata — excluding it would call a
+                // motion photo and its stripped-still twin identical.
+                ranges.append(i..<bytes.count)
                 return ranges
 
             case 0x01, 0xD0...0xD7:                      // standalone, no payload
+                ranges.append(i..<(markerIndex + 1))
                 i = markerIndex + 1
 
             case 0xDA:                                   // SOS: header, then entropy data
-                guard markerIndex + 3 < bytes.count else { throw HashError.truncated }
+                guard markerIndex + 3 <= bytes.count else { throw HashError.truncated }
                 let headerLength = Int(bytes[markerIndex + 1]) << 8 | Int(bytes[markerIndex + 2])
                 var scan = markerIndex + 1 + headerLength
                 guard scan <= bytes.count else { throw HashError.truncated }
@@ -75,7 +81,7 @@ enum JPEGImageHash {
                 i = scan
 
             default:                                     // length-prefixed segment
-                guard markerIndex + 3 < bytes.count else { throw HashError.truncated }
+                guard markerIndex + 3 <= bytes.count else { throw HashError.truncated }
                 let length = Int(bytes[markerIndex + 1]) << 8 | Int(bytes[markerIndex + 2])
                 guard length >= 2 else { throw HashError.malformed("segment length \(length) at \(i)") }
                 let end = markerIndex + 1 + length

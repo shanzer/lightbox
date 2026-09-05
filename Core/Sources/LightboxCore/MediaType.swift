@@ -37,7 +37,7 @@ public struct MediaType: Sendable, Hashable {
     /// when this format has no stable image-data hash in version 1.
     public var imageHashKind: String? {
         switch kind {
-        case .jpeg: "jpeg-scan-v1"
+        case .jpeg: JPEGImageHash.kind
         case .png: "png-idat-v1"
         case .webp: "webp-chunk-v1"
         case .gif, .heic, .tiff, .raw, .psd: nil

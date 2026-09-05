@@ -82,4 +82,74 @@ struct JPEGImageHashTests {
             try empty.withUnsafeBytes { try JPEGImageHash.includedRanges($0) }
         }
     }
+
+    @Test func appendedTrailingDataChangesTheHash() throws {
+        // Motion photos append a complete MP4 after EOI; MPF files carry a
+        // second image there. Payload, not metadata: it must change the hash,
+        // or the duplicate view would offer to delete the file with the video.
+        let base = try Data(contentsOf: Fixtures.writeImage(
+            to: tree.root.appendingPathComponent("a.jpg")))
+        var withTrailer = base
+        withTrailer.append(contentsOf: Array("ftypmp42 fake appended video payload".utf8))
+
+        let one = try base.withUnsafeBytes { try ImageDataDigest.digest($0, ranges: JPEGImageHash.includedRanges($0)) }
+        let two = try withTrailer.withUnsafeBytes { try ImageDataDigest.digest($0, ranges: JPEGImageHash.includedRanges($0)) }
+        #expect(one != two)
+    }
+
+    @Test(.enabled(if: exiftoolAvailable, "exiftool not installed"))
+    func imageHashSurvivesAnEXIFEditOnAFileWithTrailingData() throws {
+        // The warranty must hold now that trailing bytes are hashed: exiftool
+        // rewrites the metadata segments but preserves an unknown trailer.
+        let a = tree.root.appendingPathComponent("a.jpg")
+        try Fixtures.writeImage(to: a)
+        var withTrailer = try Data(contentsOf: a)
+        withTrailer.append(contentsOf: Array("ftypmp42 fake appended video payload".utf8))
+        try withTrailer.write(to: a)
+        let b = tree.root.appendingPathComponent("b.jpg")
+        try FileManager.default.copyItem(at: a, to: b)
+        #expect(exiftool(["-q", "-overwrite_original",
+                          "-DateTimeOriginal=2021:07:08 09:10:11", b.path]))
+
+        #expect(try jpegHash(a) == jpegHash(b))
+        #expect(try ContentHasher().hash(a) != ContentHasher().hash(b))
+    }
+
+    @Test func aDifferenceInAPP2ChangesTheHash() throws {
+        // APP2 carries the ICC profile, which changes how the scan data
+        // decodes into colours: image data, not metadata. Guards the denylist
+        // against a future edit adding 0xE2.
+        let base = try Data(contentsOf: Fixtures.writeImage(
+            to: tree.root.appendingPathComponent("a.jpg")))
+        var withAPP2 = Data(base.prefix(2))                         // SOI
+        withAPP2.append(contentsOf: [0xFF, 0xE2, 0x00, 0x10])      // APP2, length 16
+        withAPP2.append(contentsOf: Array("ICC_PROFILE\u{00}".utf8))
+        withAPP2.append(contentsOf: [0x01, 0x01])
+        withAPP2.append(base.dropFirst(2))
+
+        let one = try base.withUnsafeBytes { try ImageDataDigest.digest($0, ranges: JPEGImageHash.includedRanges($0)) }
+        let two = try withAPP2.withUnsafeBytes { try ImageDataDigest.digest($0, ranges: JPEGImageHash.includedRanges($0)) }
+        #expect(one != two)
+    }
+
+    @Test func aStandaloneMarkerOutsideTheScanChangesTheHash() throws {
+        // TEM (0xFF01) is recognised and standalone; it must be hashed, not
+        // silently skipped — the one place a recognised marker was dropped.
+        let base = try Data(contentsOf: Fixtures.writeImage(
+            to: tree.root.appendingPathComponent("a.jpg")))
+        var withTEM = Data(base.prefix(2))                          // SOI
+        withTEM.append(contentsOf: [0xFF, 0x01])                    // TEM
+        withTEM.append(base.dropFirst(2))
+
+        let one = try base.withUnsafeBytes { try ImageDataDigest.digest($0, ranges: JPEGImageHash.includedRanges($0)) }
+        let two = try withTEM.withUnsafeBytes { try ImageDataDigest.digest($0, ranges: JPEGImageHash.includedRanges($0)) }
+        #expect(one != two)
+    }
+
+    @Test func kindAgreesWithTheMediaTypeColumnValue() throws {
+        // `image_hash_kind` is persisted; the recorded kind and the parser
+        // that produced it must not be able to drift apart.
+        #expect(MediaType.forExtension("jpg")?.imageHashKind == JPEGImageHash.kind)
+        #expect(JPEGImageHash.kind == "jpeg-scan-v1")
+    }
 }

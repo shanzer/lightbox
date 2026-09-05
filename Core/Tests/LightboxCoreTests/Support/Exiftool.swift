@@ -7,6 +7,8 @@ func exiftool(_ args: [String]) -> Bool {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     process.arguments = ["exiftool"] + args
+    // A prompting exiftool must fail, not hang the suite waiting on a tty.
+    process.standardInput = FileHandle.nullDevice
     process.standardOutput = FileHandle.nullDevice
     process.standardError = FileHandle.nullDevice
     do { try process.run() } catch { return false }
