@@ -243,6 +243,113 @@ struct ThumbnailCacheTests {
         try await cache.evictIfNeeded()
     }
 
+    // MARK: - Temporary files are work in progress, never cache entries
+
+    @Test func aStrayTemporaryFileIsNotCountedAsACacheEntry() async throws {
+        let cache = ThumbnailCache(directory: cacheDirectory)
+        let stray = try makeStrayTemporary()
+        #expect(try await cache.cachedCount() == 0)
+
+        let image = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.jpg"))
+        _ = try await cache.thumbnail(for: image, mtime: 1000, size: 128)
+        #expect(try await cache.cachedCount() == 1)
+        #expect(FileManager.default.fileExists(atPath: stray.path))
+    }
+
+    @Test func evictionLeavesInProgressTemporaryFilesAlone() async throws {
+        let cache = ThumbnailCache(directory: cacheDirectory, budgetBytes: 1)
+        var written: [URL] = []
+        for i in 0..<3 {
+            let image = try Fixtures.writeImage(
+                to: tree.root.appendingPathComponent("img\(i).jpg"), seed: i)
+            written.append(try await cache.thumbnail(for: image, mtime: Double(1000 + i), size: 128))
+        }
+        // Stands in for a generation that is mid-encode while eviction runs.
+        // Deleting it pulls the file out from under the encoder: that request
+        // fails, and a caller can be handed a URL to a file that no longer
+        // exists.
+        let stray = try makeStrayTemporary()
+
+        try await cache.evictIfNeeded()
+
+        #expect(FileManager.default.fileExists(atPath: stray.path))
+        // The temporary is not a candidate to be kept in a real thumbnail's
+        // place either: exactly one real entry must survive, not zero.
+        let survivors = written.filter { FileManager.default.fileExists(atPath: $0.path) }
+        #expect(survivors.count == 1)
+        #expect(try await cache.cachedCount() == 1)
+    }
+
+    @Test func theKeepOneGuardPreservesARealThumbnailRatherThanAStrayTemporary() async throws {
+        let cache = ThumbnailCache(directory: cacheDirectory, budgetBytes: 1)
+        let image = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.jpg"))
+        let thumbnail = try await cache.thumbnail(for: image, mtime: 1000, size: 128)
+        let stray = try makeStrayTemporary()
+
+        try await cache.evictIfNeeded()
+
+        // With one real entry the guard has nothing to evict. Were the temporary
+        // counted, the cache would look like two entries and the older of the
+        // two — the thumbnail the grid is showing — would be the one deleted.
+        #expect(FileManager.default.fileExists(atPath: thumbnail.path))
+        #expect(FileManager.default.fileExists(atPath: stray.path))
+        #expect(try await cache.cachedCount() == 1)
+    }
+
+    @Test func nonRegularFilesInTheCacheDirectoryAreNotCountedAsEntries() async throws {
+        let cache = ThumbnailCache(directory: cacheDirectory)
+        let image = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.jpg"))
+        let thumbnail = try await cache.thumbnail(for: image, mtime: 1000, size: 128)
+        let shard = thumbnail.deletingLastPathComponent()
+
+        // A symlink and a nested directory both enumerate as entries. Counting
+        // either inflates `cachedCount()` and gives `evictIfNeeded()` a victim it
+        // cannot reclaim any bytes by deleting, which — combined with the
+        // keep-at-least-one guard — can cost a real thumbnail its place.
+        try FileManager.default.createSymbolicLink(
+            at: shard.appendingPathComponent("link.png"), withDestinationURL: thumbnail)
+        try FileManager.default.createDirectory(
+            at: shard.appendingPathComponent("nested.png"), withIntermediateDirectories: false)
+
+        #expect(try await cache.cachedCount() == 1)
+        try await cache.evictIfNeeded()
+        #expect(FileManager.default.fileExists(atPath: thumbnail.path))
+    }
+
+    // MARK: - The atomic-rename hardening's own failure branches
+
+    @Test func generateKeepsTheWinnersEntryWhenTheMoveLosesARace() async throws {
+        let image = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.jpg"))
+        let shard = cacheDirectory.appendingPathComponent("ab", isDirectory: true)
+        try FileManager.default.createDirectory(at: shard, withIntermediateDirectories: true)
+        let destination = shard.appendingPathComponent("abcdef.png")
+        let winner = Data("written by another process holding this cache".utf8)
+        try winner.write(to: destination)
+
+        // `moveItem` onto an occupied path throws. The occupant is keyed
+        // identically, so it is an equivalent thumbnail and the request is
+        // satisfied rather than failed.
+        let result = try await ThumbnailCache.generate(from: image, to: destination, size: 128)
+        #expect(result == destination)
+        #expect(try Data(contentsOf: destination) == winner)
+        // And the losing temporary is cleaned up rather than left to accumulate.
+        #expect(try files(in: shard).map(\.lastPathComponent) == ["abcdef.png"])
+    }
+
+    @Test(.enabled(if: getuid() != 0, "root is not stopped by a read-only directory"))
+    func generateLeavesNoTemporaryFileWhenTheEncodeCannotBeWritten() async throws {
+        let image = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.jpg"))
+        let shard = cacheDirectory.appendingPathComponent("ab", isDirectory: true)
+        try FileManager.default.createDirectory(at: shard, withIntermediateDirectories: true)
+        _ = try tree.chmod("cache/ab", 0o500)
+
+        await #expect(throws: ThumbnailError.generationFailed) {
+            _ = try await ThumbnailCache.generate(
+                from: image, to: shard.appendingPathComponent("abcdef.png"), size: 128)
+        }
+        #expect(try files(in: shard).isEmpty)
+    }
+
     @Test func cacheKeysDifferOnEveryComponentAndAreUnambiguous() {
         let key = ThumbnailCache.cacheKey(path: "/a.jpg", mtime: 1000, size: 256)
         #expect(key.count == 64)
@@ -255,6 +362,32 @@ struct ThumbnailCacheTests {
         // field's digits would collide with a different path/mtime pair.
         #expect(ThumbnailCache.cacheKey(path: "/a", mtime: 12, size: 3)
                 != ThumbnailCache.cacheKey(path: "/a1", mtime: 2, size: 3))
+    }
+
+    // MARK: - Helpers
+
+    /// A file that looks exactly like a generation caught mid-encode.
+    @discardableResult
+    private func makeStrayTemporary() throws -> URL {
+        let shard = cacheDirectory.appendingPathComponent("ab", isDirectory: true)
+        try FileManager.default.createDirectory(at: shard, withIntermediateDirectories: true)
+        let url = shard.appendingPathComponent("abcdef.png.\(UUID().uuidString).tmp")
+        try Data(repeating: 0x7f, count: 4096).write(to: url)
+        return url
+    }
+
+    /// Every regular file under `directory`, temporaries included — deliberately
+    /// not the implementation's own view of what counts as an entry.
+    private func files(in directory: URL) throws -> [URL] {
+        guard let walker = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: [.isRegularFileKey]) else { return [] }
+        var found: [URL] = []
+        for case let url as URL in walker {
+            guard try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true
+            else { continue }
+            found.append(url)
+        }
+        return found.sorted { $0.path < $1.path }
     }
 }
 
