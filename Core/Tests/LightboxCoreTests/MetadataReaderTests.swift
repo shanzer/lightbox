@@ -31,15 +31,39 @@ struct MetadataReaderTests {
         #expect(md.captureTime == calendar.date(from: components))
     }
 
+    // Deliberately does not rely on a plain `== ` against a value computed
+    // with an explicit UTC `Calendar` alone: that equality holds today, but a
+    // regression to `TimeZone.current` in `parseEXIFDate` would only be
+    // *caught* by such a check on a runner whose local zone happens to
+    // differ from UTC. On a CI runner provisioned with TZ=UTC (a common
+    // Docker default) local and UTC coincide, the regressed implementation
+    // would produce the same value as the correct one, and this test would
+    // pass despite the bug. Pinning to an absolute epoch and additionally
+    // asserting inequality against two independent non-UTC interpretations
+    // makes the check meaningful regardless of the runner's zone. Do not
+    // simplify this back to a single equality against a locally-built
+    // Calendar.
     @Test func treatsCaptureTimeAsUTCWhenNoOffsetIsPresent() throws {
         let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("b.jpg"), offset: nil)
         let md = try MetadataReader().read(url)
+
         var components = DateComponents()
         components.year = 2019; components.month = 3; components.day = 4
         components.hour = 10; components.minute = 11; components.second = 12
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        #expect(md.captureTime == calendar.date(from: components))
+
+        func date(zoneOffsetSeconds seconds: Int) -> Date {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: seconds)!
+            return calendar.date(from: components)!
+        }
+
+        let utcInterpretation = date(zoneOffsetSeconds: 0)
+        // 2019-03-04T10:11:12Z, independently computed (date -u -j -f ...).
+        #expect(utcInterpretation.timeIntervalSince1970 == 1_551_694_272)
+
+        #expect(md.captureTime == utcInterpretation)
+        #expect(md.captureTime != date(zoneOffsetSeconds: -5 * 3600)) // US Eastern
+        #expect(md.captureTime != date(zoneOffsetSeconds: 9 * 3600))  // JST
         #expect(md.captureOffset == nil)
     }
 

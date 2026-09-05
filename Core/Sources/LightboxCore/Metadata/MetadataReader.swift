@@ -60,6 +60,16 @@ public struct MetadataReader: MetadataReading {
     }
 
     /// Converts an EXIF offset string such as `-05:00` into a time zone.
+    ///
+    /// Requires exactly 6 characters (`±HH:MM`), so a non-zero-padded offset
+    /// such as `+5:30` returns nil rather than being parsed leniently. That is
+    /// deliberate: the EXIF spec requires zero-padding, and every writer this
+    /// app has seen follows it. The cost of the strictness is that a
+    /// hypothetical writer emitting an unpadded offset is treated identically
+    /// to "no offset present" by the caller, i.e. `parseEXIFDate` silently
+    /// falls back to interpreting the timestamp as UTC instead of the actual
+    /// zone. Worth knowing before loosening this, but not worth guarding
+    /// against pre-emptively for a case no real device produces.
     static func timeZone(fromOffset text: String) -> TimeZone? {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
         guard trimmed.count == 6 else { return nil }
