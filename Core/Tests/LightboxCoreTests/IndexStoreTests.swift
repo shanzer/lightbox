@@ -186,6 +186,46 @@ struct IndexStoreTests {
         #expect(try store.ftsRowCount() == 2)
     }
 
+    /// The non-recursive scan's reconcile. It knows nothing about
+    /// subdirectories, so it must confine itself to its immediate children.
+    @Test func deleteRowsInFolderTouchesOnlyItsImmediateChildren() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg"))
+        _ = try store.upsert(sampleRecord(path: "/lib/b.jpg"))
+        _ = try store.upsert(sampleRecord(path: "/lib/sub/c.jpg"))
+        _ = try store.upsert(sampleRecord(path: "/other/d.jpg"))
+
+        let removed = try store.deleteRows(inFolder: "/lib", keeping: ["/lib/a.jpg"])
+        #expect(removed == 1)                    // only /lib/b.jpg
+        #expect(try store.record(atPath: "/lib/b.jpg") == nil)
+        #expect(try store.record(atPath: "/lib/a.jpg") != nil)
+        #expect(try store.record(atPath: "/lib/sub/c.jpg") != nil)
+        #expect(try store.record(atPath: "/other/d.jpg") != nil)
+        #expect(try store.count() == 3)
+        #expect(try store.ftsRowCount() == 3)    // the trigger cleaned up with it
+    }
+
+    @Test func deleteRowsInFolderNormalizesATrailingSlash() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg"))
+        // parent_dir is stored without a trailing slash; a root URL that has
+        // one must not silently match nothing and delete nothing.
+        #expect(try store.deleteRows(inFolder: "/lib/", keeping: []) == 1)
+        #expect(try store.count() == 0)
+    }
+
+    @Test func deleteRowsInFolderRejectsARelativeFolder() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg"))
+        #expect(throws: IndexStoreError.invalidScope("")) {
+            try store.deleteRows(inFolder: "", keeping: [])
+        }
+        #expect(throws: IndexStoreError.invalidScope("~/Pictures")) {
+            try store.deleteRows(inFolder: "~/Pictures", keeping: [])
+        }
+        #expect(try store.count() == 1)
+    }
+
     /// SQLite's LIKE folds ASCII case, so a LIKE-based scope would make
     /// `deleteRows(under: "/lib")` destroy `/LIB` on a case-sensitive volume.
     /// The byte-range scope must not leak across case-variant siblings.

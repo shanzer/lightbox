@@ -232,6 +232,27 @@ public final class IndexStore: Sendable {
         }
     }
 
+    /// Removes rows whose immediate parent is `folder` and whose paths are not
+    /// in `keeping`. Used after a non-recursive scan, which knows nothing about
+    /// subdirectories and must not be allowed to delete their rows.
+    ///
+    /// `folder` is validated and normalized exactly as a recursive scope is, so
+    /// a trailing slash matches the stored `parent_dir` and a relative or empty
+    /// setting throws rather than matching nothing.
+    @discardableResult
+    public func deleteRows(inFolder folder: String, keeping: Set<String>) throws -> Int {
+        let normalized = try Self.pathScope(folder).exact
+        return try dbq.write { db in
+            let stale = try String.fetchAll(db, sql: Self.staleInFolderSQL,
+                                            arguments: [normalized])
+                .filter { !keeping.contains($0) }
+            for path in stale {
+                try db.execute(sql: "DELETE FROM files WHERE path = ?", arguments: [path])
+            }
+            return stale.count
+        }
+    }
+
     // MARK: - Reads
 
     public func record(atPath path: String) throws -> FileRecord? {
@@ -272,6 +293,8 @@ public final class IndexStore: Sendable {
     /// Bind order: exact, lower, upper (from `pathScope`).
     static let scopePredicateSQL = "(path = ? OR (path > ? AND path < ?))"
     static let stalePathsSQL = "SELECT path FROM files WHERE " + scopePredicateSQL
+    /// The non-recursive counterpart, off `files_on_parent_dir`.
+    static let staleInFolderSQL = "SELECT path FROM files WHERE parent_dir = ?"
     static let missingHashesSQL = """
         SELECT * FROM files
         WHERE hashed_at IS NULL AND \(scopePredicateSQL)
