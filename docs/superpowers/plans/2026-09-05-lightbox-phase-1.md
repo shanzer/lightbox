@@ -1857,8 +1857,8 @@ private func pngHash(_ url: URL) throws -> String {
     return try data.withUnsafeBytes { try ImageDataDigest.digest($0, ranges: PNGImageHash.includedRanges($0)) }
 }
 
-@Test func pngImageHashSurvivesAnEXIFEdit() throws {
-    try #require(exiftoolAvailable, "exiftool not installed")
+@Test(.enabled(if: exiftoolAvailable, "exiftool not installed"))
+func pngImageHashSurvivesAnEXIFEdit() throws {
     let tree = try TempTree()
     let a = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.png"), format: .png)
     let b = tree.root.appendingPathComponent("b.png")
@@ -2046,8 +2046,8 @@ private func webpHash(_ url: URL) throws -> String {
     return try data.withUnsafeBytes { try ImageDataDigest.digest($0, ranges: WebPImageHash.includedRanges($0)) }
 }
 
-@Test func webpImageHashSurvivesPromotionToExtendedFormat() throws {
-    try #require(exiftoolAvailable, "exiftool not installed")
+@Test(.enabled(if: exiftoolAvailable, "exiftool not installed"))
+func webpImageHashSurvivesPromotionToExtendedFormat() throws {
     let tree = try TempTree()
     let a = tree.root.appendingPathComponent("a.webp")
     let b = tree.root.appendingPathComponent("b.webp")
