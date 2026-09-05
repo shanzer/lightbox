@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import CryptoKit
 @testable import LightboxCore
 
 /// A `struct` suite so swift-testing builds a fresh instance per test and
@@ -292,5 +293,120 @@ struct FileHasherTests {
         let type = try mediaType("jpg")
         #expect(try FileHasher().hashes(for: url, mediaType: type)
                 == FileHasher().hashes(for: url, mediaType: type))
+    }
+}
+
+/// Counts SIGUSR1 deliveries. A global because a C signal handler cannot
+/// capture context; safe because `ContentHasherSignalTests` is `.serialized`
+/// and is the only thing that installs the handler.
+nonisolated(unsafe) private var signalsDelivered = 0
+
+/// Carries a `pthread_t` and the hashing thread's result across threads.
+/// `pthread_t` is an opaque pointer and not `Sendable`; each field is written
+/// on one thread and read on another only after a semaphore orders the two.
+private final class SignalTestBox: @unchecked Sendable {
+    var thread: pthread_t?
+    var result: Result<String, any Error>?
+}
+
+/// The EINTR contract, which needs a read that actually blocks.
+///
+/// A regular file on a local disk effectively never leaves `read(2)` blocked
+/// long enough for a signal to land, so this uses a FIFO: the reader blocks
+/// inside `read` until the writer produces bytes, which is a wide and
+/// repeatable window. The hash runs on a dedicated `Thread` rather than
+/// directly in the test body because swift-testing runs the body on a Swift
+/// Concurrency executor thread, where the signal did not reach the blocked
+/// read — an earlier version of this test passed with the EINTR retry deleted,
+/// i.e. proved nothing.
+///
+/// Separated into its own suite because it installs a process-wide signal
+/// handler; `.serialized` keeps that from overlapping other tests.
+@Suite(.serialized)
+struct ContentHasherSignalTests {
+    @Test func aSignalArrivingMidReadIsRetriedRatherThanReportedAsTruncated() throws {
+        let tree = try TempTree()
+        let fifo = tree.root.appendingPathComponent("pipe")
+        #expect(mkfifo(fifo.path, 0o600) == 0)
+
+        // A handler without SA_RESTART, so a delivered signal makes the
+        // in-flight `read` return -1/EINTR instead of being restarted for us.
+        signalsDelivered = 0
+        var installed = sigaction()
+        var previous = sigaction()
+        installed.__sigaction_u.__sa_handler = { _ in signalsDelivered += 1 }
+        installed.sa_flags = 0
+        sigemptyset(&installed.sa_mask)
+        #expect(sigaction(SIGUSR1, &installed, &previous) == 0)
+        defer { sigaction(SIGUSR1, &previous, nil) }
+
+        // Larger than the buffer and written in small pieces, so the reader
+        // makes many blocking reads for the signals to land inside.
+        let payload = Data((0..<(64 << 10)).map { UInt8($0 % 251) })
+
+        let box = SignalTestBox()
+        let done = DispatchSemaphore(value: 0)
+
+        let hashing = Thread {
+            // The test host blocks SIGUSR1, and a new `Thread` inherits the
+            // creating thread's signal mask, so without this the signal stays
+            // pending, the read is never interrupted, and the test silently
+            // proves nothing.
+            var unblock = sigset_t()
+            sigemptyset(&unblock)
+            sigaddset(&unblock, SIGUSR1)
+            pthread_sigmask(SIG_UNBLOCK, &unblock, nil)
+
+            box.thread = pthread_self()
+            // Without the EINTR retry this throws `.truncated`, or — far worse
+            // — treats the interrupted read as end-of-file and returns the
+            // hash of a prefix of the payload.
+            box.result = Result { try ContentHasher(bufferSize: 4096).hash(fifo) }
+            done.signal()
+        }
+
+        nonisolated(unsafe) var signalling = true
+        let signaller = Thread {
+            while signalling {
+                if let t = box.thread { pthread_kill(t, SIGUSR1) }
+                usleep(100)
+            }
+        }
+
+        let writer = Thread {
+            let fd = open(fifo.path, O_WRONLY)
+            guard fd >= 0 else { return }
+            // If the hasher gives up early — which is exactly what a regression
+            // here looks like — the read end closes and this thread writes to a
+            // pipe with no reader. Without this the process takes SIGPIPE and
+            // the whole test run dies with signal 13 instead of reporting a
+            // failed expectation.
+            fcntl(fd, F_SETNOSIGPIPE, 1)
+            payload.withUnsafeBytes { bytes in
+                var written = 0
+                while written < bytes.count {
+                    let n = write(fd, bytes.baseAddress! + written,
+                                  min(4096, bytes.count - written))
+                    if n > 0 { written += n } else if errno != EINTR { break }
+                    usleep(300)
+                }
+            }
+            close(fd)
+        }
+
+        hashing.start()
+        signaller.start()
+        writer.start()
+        #expect(done.wait(timeout: .now() + 30) == .success)
+        signalling = false
+
+        // Without this the test could quietly go vacuous: if signals stopped
+        // reaching the hashing thread, the hash would match for the boring
+        // reason that nothing ever interrupted it.
+        #expect(signalsDelivered > 0, "no SIGUSR1 reached the hashing thread")
+
+        var expected = SHA256()
+        expected.update(data: payload)
+        #expect(try box.result?.get() == expected.finalize().hexEncoded)
     }
 }
