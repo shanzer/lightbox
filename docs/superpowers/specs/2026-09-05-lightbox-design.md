@@ -121,13 +121,20 @@ Three hashes, because there are three different questions.
 |---|---|---|
 | `content_hash` | SHA-256 of the whole file | Are these the same file? |
 | `image_hash` | SHA-256 of the format-stripped image data | Are these the same image carrying different metadata? |
-| `phash` | 64-bit DCT perceptual hash of the cached thumbnail | Are these the same photo, re-encoded or resized? |
+| `phash` | 64-bit DCT perceptual hash of a 32x32 render | Are these the same photo, re-encoded or resized? |
 
 `image_hash` is the one that survives Lightbox's own EXIF edits. Without it,
 setting a capture time across 500 files silently destroys 500 duplicate
-groupings. `phash` is nearly free, because the thumbnail it reads already exists
-from tier 0, and it catches what neither exact hash can: the same photo at a
-different JPEG quality, or a HEIC converted to JPEG.
+groupings. `phash` is cheap, because it is computed from a small ImageIO downsample rather
+than a full decode, and it catches what neither exact hash can: the same photo
+at a different JPEG quality, or a HEIC converted to JPEG.
+
+The perceptual hash is deliberately *not* computed from the cached QuickLook
+thumbnail. QuickLook fits to aspect and may pad, and for RAW it may return the
+embedded camera preview rather than a render of the image data — all of which
+would make the hash depend on QuickLook's behaviour rather than on the image.
+It is computed instead from a dedicated ImageIO downsample squashed to exactly
+32x32.
 
 SHA-256 rather than `photolib`'s MD5. `photolib` follows its MD5 with a
 byte-for-byte confirmation precisely because MD5 is collision-broken; with
@@ -136,9 +143,12 @@ SHA-256 that confirmation is unnecessary and is not carried over.
 ### Computing `image_hash`
 
 There is no generic way to skip a header, so each container gets its own rule.
-The rule is a denylist of purely-metadata segments rather than an allowlist of
-image data, because several segments that look like metadata determine how
-pixels decode.
+Where a container's metadata segments are additive, the rule is a denylist,
+because several segments that look like metadata determine how pixels decode
+and an allowlist would silently drop them. Where writing metadata restructures
+the container, a denylist cannot work and the rule is an allowlist of the
+image-bearing segments instead. Every rule below was verified empirically
+against an exiftool round-trip before being written down.
 
 **JPEG** — exclude APP0 (JFIF), APP1 (EXIF and XMP), APP13 (Photoshop and
 IPTC), and COM. Retain APP2 and APP14: APP2 carries the ICC profile, and APP14
@@ -150,7 +160,17 @@ scan to EOI is hashed.
 **PNG** — exclude `tEXt`, `zTXt`, `iTXt`, `eXIf`, `tIME`, and `pHYs`. Retain
 IHDR, PLTE, tRNS, IDAT, and the colour chunks `gAMA`, `cHRM`, `iCCP`, `sRGB`.
 
-**WebP and GIF** — the equivalent rules over RIFF chunks and GIF blocks.
+**WebP** — an allowlist, not a denylist: hash only `VP8 `, `VP8L`, `ALPH`,
+`ANIM`, `ANMF`, and `ICCP`. A denylist of `EXIF` and `XMP ` does not work,
+because writing EXIF to a simple-format WebP promotes it to extended format and
+inserts a `VP8X` header chunk that was not previously present. A denylist sees
+a new chunk and hashes differently; the allowlist ignores it.
+
+**GIF** — `image_hash` is NULL in version 1. GIF metadata lives in Comment and
+Application extension blocks, but the NETSCAPE Application extension carries the
+loop count, which affects playback — so neither a denylist nor an allowlist is
+unambiguous, and GIFs rarely carry EXIF worth editing. The cost of getting this
+wrong exceeds the value of getting it right.
 
 **RAW, HEIC, TIFF, PSD** — `image_hash` is NULL in version 1. TIFF and RAW are
 IFD-based with byte offsets that shift when metadata is written, so a stable
@@ -160,8 +180,8 @@ against exiftool round-trips before it is trusted. For these formats duplicate
 detection falls back to `content_hash` and `phash`.
 
 `image_hash_kind` records which rule produced the value — `jpeg-scan-v1`,
-`png-idat-v1`, `webp-chunk-v1`, `gif-blocks-v1`, or NULL — so a rule can be
-revised and only the affected rows recomputed.
+`png-idat-v1`, `webp-chunk-v1`, or NULL — so a rule can be revised and only the
+affected rows recomputed.
 
 ### Two consequences
 
@@ -179,8 +199,19 @@ file in full.
 ### Perceptual hash
 
 `photolib`'s DCT perceptual hash is ported directly, retaining its
-`phash-dct-64-nodc` identifier, so that Lightbox and `photolib` agree on what
-similarity means and their outputs remain comparable.
+`phash-dct-64-nodc` identifier: the same 32x32 luminance grid at Rec. 709
+weights, the same separable DCT-II, the same 8x8 coefficient block with DC
+dropped and F(0,8) substituted, the same six-decimal quantization, and the same
+bit order.
+
+The two tools will not produce bit-identical hashes, and the spec does not claim
+they will. `photolib` resamples with `sips` and Lightbox resamples with
+CoreGraphics; different kernels yield slightly different luminance grids and
+therefore a few differing bits. What is guaranteed is that the hashes occupy the
+same space and that Hamming distances between them are meaningful. The
+acceptance criterion is that the cross-tool distance for an identical source
+image is far below the threshold at which two images are called similar, and the
+implementation measures that distribution rather than assuming it.
 
 ### Duplicate view
 
@@ -203,7 +234,7 @@ is the difference between an app that feels like Bridge and one that feels like
 a batch job.
 
 **Tiered commitment.** Tier 0 — stat, ImageIO metadata, thumbnail, and the
-perceptual hash computed from that thumbnail — runs on folder open and is fast.
+perceptual hash from its own 32x32 render — runs on folder open and is fast.
 Tier 1 (`content_hash` and `image_hash`) requires reading every byte of every
 file and is therefore an explicitly started, resumable background pass; both
 hashes are computed in a single pass per file. Tier 2 (Vision) and tier 3 (CLIP)
@@ -375,8 +406,10 @@ The `Core` framework is tested headless with swift-testing.
   `DateTimeOriginal` with exiftool, then assert `image_hash` is unchanged and
   `content_hash` changed. Additionally: truncated and malformed files must fail
   cleanly rather than hash garbage; a JPEG differing only in APP14 must hash
-  differently; a JPEG differing only in APP1 must hash identically; `phash`
-  output must match `photolib`'s for shared fixtures.
+  differently; a JPEG differing only in APP1 must hash identically; a WebP that
+  exiftool has promoted from simple to extended format must hash identically to
+  the original; and `phash` output must land within a measured Hamming distance
+  of `photolib`'s for shared fixtures, not equal it.
 - **FileOperator** — every collision policy, cross-volume moves, source vanished
   mid-operation, undo correctness, companion-file handling.
 - **Analyzers** — fixture images with known text; assertions on recognized
