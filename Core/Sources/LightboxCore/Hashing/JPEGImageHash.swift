@@ -17,6 +17,28 @@ enum ImageDataDigest {
     }
 }
 
+extension Array where Element == Range<Int> {
+    /// Appends `range`, merging it into the previous element when the two are
+    /// exactly adjacent.
+    ///
+    /// The parsers walk a file segment by segment, and in a file with no
+    /// metadata every segment abuts the last, so an uncoalesced walk stores one
+    /// range per segment. A 256 MB file built from minimum-size segments then
+    /// costs gigabytes of ranges to describe a byte sequence that a handful of
+    /// them covers — and the indexer hashes several files at once, which turns
+    /// that into an out-of-memory kill rather than a slow hash. Coalescing
+    /// changes only the representation: the concatenation the digest sees is
+    /// identical, because merging two adjacent ranges yields exactly the bytes
+    /// the pair covered.
+    mutating func appendCoalescing(_ range: Range<Int>) {
+        if let last = self.last, last.upperBound == range.lowerBound {
+            self[self.count - 1] = last.lowerBound..<range.upperBound
+        } else {
+            append(range)
+        }
+    }
+}
+
 /// The byte ranges of a JPEG that constitute image data.
 ///
 /// A denylist, not an allowlist: markers this parser has never heard of are
@@ -55,11 +77,11 @@ enum JPEGImageHash {
                 // EOI and MPF multi-picture files carry a second image there.
                 // That is payload, not metadata — excluding it would call a
                 // motion photo and its stripped-still twin identical.
-                ranges.append(i..<bytes.count)
+                ranges.appendCoalescing(i..<bytes.count)
                 return ranges
 
             case 0x01, 0xD0...0xD7:                      // standalone, no payload
-                ranges.append(i..<(markerIndex + 1))
+                ranges.appendCoalescing(i..<(markerIndex + 1))
                 i = markerIndex + 1
 
             case 0xDA:                                   // SOS: header, then entropy data
@@ -77,7 +99,7 @@ enum JPEGImageHash {
                     scan += 1
                 }
                 if scan + 1 >= bytes.count { scan = bytes.count }
-                ranges.append(i..<scan)
+                ranges.appendCoalescing(i..<scan)
                 i = scan
 
             default:                                     // length-prefixed segment
@@ -86,7 +108,7 @@ enum JPEGImageHash {
                 guard length >= 2 else { throw HashError.malformed("segment length \(length) at \(i)") }
                 let end = markerIndex + 1 + length
                 guard end <= bytes.count else { throw HashError.truncated }
-                if !excludedMarkers.contains(marker) { ranges.append(i..<end) }
+                if !excludedMarkers.contains(marker) { ranges.appendCoalescing(i..<end) }
                 i = end
             }
         }

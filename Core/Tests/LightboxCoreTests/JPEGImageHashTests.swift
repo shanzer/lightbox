@@ -2,11 +2,35 @@ import Testing
 import Foundation
 @testable import LightboxCore
 
-private func jpegHash(_ url: URL) throws -> String {
-    let data = try Data(contentsOf: url)
-    return try data.withUnsafeBytes { bytes in
+private func jpegHash(_ data: Data) throws -> String {
+    try data.withUnsafeBytes { bytes in
         try ImageDataDigest.digest(bytes, ranges: JPEGImageHash.includedRanges(bytes))
     }
+}
+
+private func jpegHash(_ url: URL) throws -> String {
+    try jpegHash(Data(contentsOf: url))
+}
+
+/// Walks the header segments independently of the parser and reports, per
+/// marker, whether the returned ranges cover that segment. Every segment before
+/// SOS is length-prefixed, so this walk terminates without having to reproduce
+/// the entropy-data scan.
+///
+/// Needed because ranges are coalesced: one range no longer corresponds to one
+/// segment, so their start offsets can no longer be read as a list of included
+/// markers.
+private func jpegHeaderCoverage(_ data: Data) throws -> [UInt8: Bool] {
+    let ranges = try data.withUnsafeBytes { try JPEGImageHash.includedRanges($0) }
+    var covered: [UInt8: Bool] = [:]
+    var i = 2
+    while i + 3 < data.count, data[i] == 0xFF {
+        let marker = data[i + 1]
+        covered[marker] = ranges.contains { $0.contains(i) }
+        if marker == 0xDA { break }                 // SOS: entropy data follows
+        i += 2 + (Int(data[i + 2]) << 8 | Int(data[i + 3]))
+    }
+    return covered
 }
 
 /// A `struct` suite so swift-testing builds a fresh instance per test and
@@ -34,16 +58,52 @@ struct JPEGImageHashTests {
     @Test func excludesOnlyTheMetadataSegments() throws {
         let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.jpg"))
         let data = try Data(contentsOf: url)
-        let markers: [UInt8] = try data.withUnsafeBytes { bytes in
-            try JPEGImageHash.includedRanges(bytes).map { bytes.load(fromByteOffset: $0.lowerBound + 1, as: UInt8.self) }
-        }
-        #expect(!markers.contains(0xE0))
-        #expect(!markers.contains(0xE1))
-        #expect(!markers.contains(0xED))
-        #expect(!markers.contains(0xFE))
-        #expect(markers.contains(0xC0) || markers.contains(0xC2))   // SOF
-        #expect(markers.contains(0xDA))                             // SOS
-        #expect(markers.contains(0xD9))                             // EOI
+        let covered = try jpegHeaderCoverage(data)
+        let ranges = try data.withUnsafeBytes { try JPEGImageHash.includedRanges($0) }
+
+        // A missing key reads as nil, which fails these comparisons, so each
+        // assertion also proves the segment is present: an exclusion assertion
+        // about a segment the fixture does not contain would prove nothing.
+        #expect(covered[0xE0] == false)                             // APP0 / JFIF
+        #expect(covered[0xE1] == false)                             // APP1 / EXIF
+        #expect(covered[0xED] == false)                             // APP13 / Photoshop
+        #expect(covered[0xC0] == true)                              // SOF0
+        #expect(covered[0xC4] == true)                              // DHT
+        #expect(covered[0xDB] == true)                              // DQT
+        #expect(covered[0xDA] == true)                              // SOS
+        #expect(ranges.contains { $0.contains(data.count - 2) })    // EOI
+    }
+
+    @Test func anInjectedCommentSegmentLeavesTheHashUnchanged() throws {
+        // COM is on the denylist but ImageIO never writes one, so the exclusion
+        // test above cannot exercise it. Inject one rather than leave the
+        // denylist entry untested.
+        let base = try Data(contentsOf: Fixtures.writeImage(
+            to: tree.root.appendingPathComponent("a.jpg")))
+        let text = Array("a comment nobody should hash".utf8)
+        var withCOM = Data(base.prefix(2))                          // SOI
+        withCOM.append(contentsOf: [0xFF, 0xFE,
+                                    UInt8((text.count + 2) >> 8),
+                                    UInt8((text.count + 2) & 0xFF)])
+        withCOM.append(contentsOf: text)
+        withCOM.append(base.dropFirst(2))
+
+        #expect(withCOM.count > base.count)                         // it really landed
+        #expect(try jpegHash(base) == jpegHash(withCOM))
+    }
+
+    @Test func aSegmentFloodedFileCollapsesToOneRange() throws {
+        // RST markers are the smallest legal segment at two bytes each, so they
+        // are the worst case for one-range-per-segment: a 256 MB file of them
+        // needed 134 million ranges and 5.7 GB of RSS to describe a byte
+        // sequence that a single range covers.
+        var flood = Data([0xFF, 0xD8])                              // SOI
+        for _ in 0..<200_000 { flood.append(contentsOf: [0xFF, 0xD0]) }
+        flood.append(contentsOf: [0xFF, 0xD9])                      // EOI
+
+        let ranges = try flood.withUnsafeBytes { try JPEGImageHash.includedRanges($0) }
+        // Everything after SOI, which the parser never hashes, in one range.
+        #expect(ranges == [2..<flood.count])
     }
 
     @Test func aDifferenceInAPP14ChangesTheHash() throws {
