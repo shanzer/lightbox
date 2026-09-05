@@ -4,6 +4,10 @@ public struct WalkEntry: Sendable, Hashable {
     public let url: URL
     public let size: Int64
     public let mtime: Date
+    /// Volume identifier. An inode is unique only within its volume, so an
+    /// index spanning an external drive and the internal disk needs both
+    /// halves to identify a file.
+    public let device: Int64
     public let inode: Int64
     public let mediaType: MediaType
 }
@@ -48,6 +52,10 @@ public struct Walker: Sendable {
         var visited = Set<DirectoryIdentity>()
 
         while let dir = stack.popLast() {
+            // Synchronous, but callers run it inside a Task; without this a
+            // 50k-file tree on a slow external drive cannot be interrupted.
+            if Task.isCancelled { return }
+
             guard let identity = DirectoryIdentity(path: dir.path, followSymlink: true) else {
                 onEvent(.skipped(url: dir, reason: .unreadable))
                 continue
@@ -92,22 +100,13 @@ public struct Walker: Sendable {
                         size: Int64(st.st_size),
                         mtime: Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec)
                                     + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000),
+                        device: Int64(st.st_dev),
                         inode: Int64(bitPattern: UInt64(st.st_ino)),
                         mediaType: mediaType)))
                 default:
                     continue
                 }
             }
-        }
-    }
-
-    public func stream(root: URL, options: WalkOptions = WalkOptions()) -> AsyncStream<WalkEvent> {
-        AsyncStream { continuation in
-            let task = Task.detached(priority: .utility) {
-                scan(root: root, options: options) { continuation.yield($0) }
-                continuation.finish()
-            }
-            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
