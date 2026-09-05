@@ -11,21 +11,28 @@ public final class IndexStore: Sendable {
             .appendingPathComponent("index.sqlite")
     }
 
+    /// One configuration for the file-backed and in-memory stores, so tests
+    /// exercise the same database production runs. Every future setting (WAL,
+    /// busy timeout, custom functions) belongs here and nowhere else.
+    private static func makeConfiguration() -> Configuration {
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        return config
+    }
+
     public init(url: URL) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var config = Configuration()
-        config.foreignKeysEnabled = true
-        dbq = try DatabaseQueue(path: url.path, configuration: config)
+        dbq = try DatabaseQueue(path: url.path, configuration: Self.makeConfiguration())
         try Self.migrator.migrate(dbq)
     }
 
-    private init(inMemory: Bool) throws {
-        dbq = try DatabaseQueue()
+    private init() throws {
+        dbq = try DatabaseQueue(configuration: Self.makeConfiguration())
         try Self.migrator.migrate(dbq)
     }
 
-    public static func inMemory() throws -> IndexStore { try IndexStore(inMemory: true) }
+    public static func inMemory() throws -> IndexStore { try IndexStore() }
 
     // MARK: - Schema
 
@@ -97,6 +104,23 @@ public final class IndexStore: Sendable {
                     state TEXT NOT NULL
                 );
                 CREATE INDEX op_journal_on_batch ON op_journal(batch_id);
+
+                -- The FTS row is a shadow of its files row; deleting the file
+                -- must never leave a ghost in the search index, no matter which
+                -- code path (or later phase) performs the delete.
+                CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
+                  DELETE FROM analysis WHERE file_id = old.id;
+                  DELETE FROM files_fts WHERE rowid = old.id;
+                END;
+
+                -- A changed file's OCR text, feature print and CLIP embedding
+                -- are as stale as its hashes, and analysis carries no
+                -- source_size/source_mtime to detect that later. Drop the row
+                -- at the moment the change is recorded.
+                CREATE TRIGGER files_au_invalidate AFTER UPDATE OF size, mtime ON files
+                  WHEN old.size <> new.size OR old.mtime <> new.mtime BEGIN
+                  DELETE FROM analysis WHERE file_id = new.id;
+                END;
                 """)
         }
         return m
@@ -110,7 +134,7 @@ public final class IndexStore: Sendable {
     @discardableResult
     public func upsert(_ record: FileRecord) throws -> Int64 {
         try dbq.write { db in
-            let id = try Int64.fetchOne(db, sql: """
+            guard let id = try Int64.fetchOne(db, sql: """
                 INSERT INTO files
                     (path, parent_dir, name, ext, size, mtime, device, inode, width, height,
                      capture_time, capture_offset, camera_make, camera_model, orientation,
@@ -151,10 +175,20 @@ public final class IndexStore: Sendable {
                     record.cameraModel, record.orientation, record.contentHash,
                     record.imageHash, record.imageHashKind, record.phash,
                     record.hashedAt, record.indexedAt,
-                ])!
-            try db.execute(sql: "DELETE FROM files_fts WHERE rowid = ?", arguments: [id])
-            try db.execute(sql: "INSERT INTO files_fts (rowid, name, ocr_text) VALUES (?, ?, NULL)",
-                           arguments: [id, record.name])
+                ]) else {
+                throw DatabaseError(resultCode: .SQLITE_ERROR,
+                                    message: "upsert returned no row id for \(record.path)")
+            }
+            // Update-in-place rather than delete-and-reinsert: phase 3 writes
+            // ocr_text into this row, and a rescan of an unchanged file must
+            // not destroy it.
+            try db.execute(sql: "UPDATE files_fts SET name = ? WHERE rowid = ?",
+                           arguments: [record.name, id])
+            if db.changesCount == 0 {
+                try db.execute(
+                    sql: "INSERT INTO files_fts (rowid, name, ocr_text) VALUES (?, ?, NULL)",
+                    arguments: [id, record.name])
+            }
             return id
         }
     }
@@ -174,19 +208,18 @@ public final class IndexStore: Sendable {
     }
 
     /// Removes rows under `prefix` whose paths are not in `keeping`.
+    /// FTS and `analysis` rows follow via the `files_ad` trigger and the
+    /// `ON DELETE CASCADE` foreign key.
     @discardableResult
     public func deleteRows(under prefix: String, keeping: Set<String>) throws -> Int {
-        try dbq.write { db in
+        let scope = Self.pathScope(prefix)
+        return try dbq.write { db in
             let stale = try String.fetchAll(db, sql: """
-                SELECT path FROM files WHERE path = ? OR path LIKE ? ESCAPE '\\'
-                """, arguments: [prefix, Self.likePrefix(prefix)])
+                SELECT path FROM files WHERE path = ? OR (path > ? AND path < ?)
+                """, arguments: [scope.exact, scope.lower, scope.upper])
                 .filter { !keeping.contains($0) }
             for path in stale {
-                if let id = try Int64.fetchOne(db, sql: "SELECT id FROM files WHERE path = ?",
-                                               arguments: [path]) {
-                    try db.execute(sql: "DELETE FROM files_fts WHERE rowid = ?", arguments: [id])
-                    try db.execute(sql: "DELETE FROM files WHERE id = ?", arguments: [id])
-                }
+                try db.execute(sql: "DELETE FROM files WHERE path = ?", arguments: [path])
             }
             return stale.count
         }
@@ -206,17 +239,39 @@ public final class IndexStore: Sendable {
     }
 
     public func filesMissingHashes(under prefix: String, limit: Int) throws -> [FileRecord] {
-        try dbq.read { db in
+        let scope = Self.pathScope(prefix)
+        return try dbq.read { db in
             try FileRecord.fetchAll(db, sql: """
                 SELECT * FROM files
-                WHERE hashed_at IS NULL AND (path = ? OR path LIKE ? ESCAPE '\\')
+                WHERE hashed_at IS NULL AND (path = ? OR (path > ? AND path < ?))
                 ORDER BY id LIMIT ?
-                """, arguments: [prefix, Self.likePrefix(prefix), limit])
+                """, arguments: [scope.exact, scope.lower, scope.upper, limit])
         }
     }
 
     public func count() throws -> Int {
         try dbq.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM files")! }
+    }
+
+    // MARK: - Path scoping
+
+    /// Bounds for "every path at or under `prefix`" as byte comparisons.
+    ///
+    /// `LIKE` is the obvious tool and the wrong one: SQLite folds ASCII case in
+    /// `LIKE` regardless of `ESCAPE` or `COLLATE`, so a scope of `/lib` would
+    /// also match `/LIB` — and `deleteRows` would silently destroy a sibling
+    /// directory's index on a case-sensitive volume. `LIKE` also defeats the
+    /// index on `path`. Byte ranges have neither problem and need no wildcard
+    /// escaping: descendants of `p` are exactly the paths strictly between
+    /// `p + "/"` and `p + "0"`, because `'0'` (0x30) is the next byte after
+    /// `'/'` (0x2F). Usage: `path = exact OR (path > lower AND path < upper)`.
+    static func pathScope(_ prefix: String) -> (exact: String, lower: String, upper: String) {
+        precondition(prefix.hasPrefix("/"),
+                     "scope prefix must be a non-empty absolute path; got \"\(prefix)\"")
+        var p = prefix
+        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
+        if p == "/" { return (exact: "/", lower: "/", upper: "0") }
+        return (exact: p, lower: p + "/", upper: p + "0")
     }
 
     // MARK: - Test support
@@ -231,13 +286,28 @@ public final class IndexStore: Sendable {
         try dbq.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM files_fts")! }
     }
 
-    /// Escapes a path for use as a `LIKE` prefix so that a directory containing
-    /// `%` or `_` cannot match sibling directories.
-    static func likePrefix(_ prefix: String) -> String {
-        let escaped = prefix
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "%", with: "\\%")
-            .replacingOccurrences(of: "_", with: "\\_")
-        return escaped.hasSuffix("/") ? escaped + "%" : escaped + "/%"
+    /// Row ids of files whose FTS row matches `pattern` — what Task 13's
+    /// filename search actually depends on.
+    func ftsMatchRowIDs(_ pattern: String) throws -> [Int64] {
+        try dbq.read { db in
+            try Int64.fetchAll(db, sql: "SELECT rowid FROM files_fts WHERE files_fts MATCH ? ORDER BY rowid",
+                               arguments: [pattern])
+        }
+    }
+
+    /// Raw SQL escape hatches so tests can exercise schema-level behavior
+    /// (triggers, cascades) that the public API deliberately does not expose.
+    func testExecute(sql: String, arguments: StatementArguments = []) throws {
+        try dbq.write { db in try db.execute(sql: sql, arguments: arguments) }
+    }
+
+    func testFetchOne<T: DatabaseValueConvertible>(sql: String, arguments: StatementArguments = []) throws -> T? {
+        try dbq.read { db in try T.fetchOne(db, sql: sql, arguments: arguments) }
+    }
+
+    func queryPlan(sql: String) throws -> [String] {
+        try dbq.read { db in
+            try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql).map { $0["detail"] as String? ?? "" }
+        }
     }
 }
