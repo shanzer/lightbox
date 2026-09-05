@@ -1999,6 +1999,9 @@ git commit -m "feat: add PNG image-data hash"
 
 **Interfaces:**
 - Consumes: `MediaType` (Task 2), `HashError`/`ContentHasher` (Task 6), `ImageDataDigest`/`JPEGImageHash` (Task 7), `PNGImageHash` (Task 8).
+- Also requires adding to `ContentHasher` (Task 6's file): `func readWholeFile(_ url: URL) throws -> Data`, which reads via the same buffered, error-checked loop as `hash(_:)` and returns the bytes. It exists so `FileHasher` can get one catchable read without memory-mapping; do not reimplement the read loop.
+
+**No memory mapping on this path — this is a correction to the original plan text.** `Data(contentsOf:, .mappedIfSafe)` converts a mid-read `EIO` on a failing external volume into `SIGBUS`, which cannot be caught and cannot be mapped to `HashError.truncated`. That would silently bypass the error handling Task 6 exists to provide, on precisely the large files that motivated it. Add a test that a file larger than `inMemoryLimit` still yields a content hash and a nil image hash.
 - Produces:
   - `enum WebPImageHash { static let kind: String; static func includedRanges(_ bytes: UnsafeRawBufferPointer) throws -> [Range<Int>] }`
   - `public struct FileHashes: Sendable, Hashable { public let contentHash: String; public let imageHash: String?; public let imageHashKind: String? }`
@@ -2226,16 +2229,40 @@ public protocol FileHashing: Sendable {
     func hashes(for url: URL, mediaType: MediaType) throws -> FileHashes
 }
 
-/// Computes the whole-file and image-data hashes from one memory mapping, so a
-/// file is read from disk once rather than twice. On an external drive that
-/// halves the wall-clock cost of the hashing pass.
+/// Computes the whole-file and image-data hashes in a single read per file.
+///
+/// Deliberately NOT memory-mapped. `Data(contentsOf:, .mappedIfSafe)` would turn
+/// a mid-read I/O error on a flaky external volume into `SIGBUS` — an
+/// uncatchable fault rather than a `HashError` — on exactly the
+/// multi-hundred-megabyte RAW and PSD files that motivated streaming in the
+/// first place, silently bypassing `ContentHasher`'s error handling.
+///
+/// So the file is read once, by whichever of two routes fits its format:
+/// a format WITH an image-hash rule (JPEG, PNG, WebP) is read fully into memory
+/// and both hashes are computed from that buffer; a format WITHOUT one (RAW,
+/// PSD, HEIC, TIFF, GIF — which are the large ones) is streamed by
+/// `ContentHasher` and gets no image hash. Every failure stays catchable, and
+/// in-memory buffering is bounded to the formats that are small in practice.
 public struct FileHasher: FileHashing {
+    /// Above this size an image-hashable file is streamed for its content hash
+    /// only, and `imageHash` is left nil rather than buffering it whole.
+    public static let inMemoryLimit = 256 << 20
+
     public init() {}
 
     public func hashes(for url: URL, mediaType: MediaType) throws -> FileHashes {
-        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else {
-            throw HashError.unreadable
+        let streamed = ContentHasher()
+
+        guard mediaType.imageHashKind != nil,
+              let size = try? FileManager.default
+                  .attributesOfItem(atPath: url.path)[.size] as? Int,
+              size <= Self.inMemoryLimit
+        else {
+            return FileHashes(contentHash: try streamed.hash(url),
+                              imageHash: nil, imageHashKind: nil)
         }
+
+        let data = try streamed.readWholeFile(url)
 
         return data.withUnsafeBytes { bytes -> FileHashes in
             var content = SHA256()
