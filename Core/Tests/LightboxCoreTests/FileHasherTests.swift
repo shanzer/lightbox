@@ -190,7 +190,7 @@ struct FileHasherTests {
         // `hash(_:)` produces for the same file.
         let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.jpg"))
         let hasher = ContentHasher(bufferSize: 97)          // several partial reads
-        let data = try hasher.readWholeFile(url)
+        let data = try hasher.readWholeFile(url, upTo: 1 << 20)
 
         #expect(data == (try Data(contentsOf: url)))
         #expect(try hasher.hash(url) == ContentHasher().hash(url))
@@ -198,20 +198,91 @@ struct FileHasherTests {
 
     @Test func readWholeFileReportsAMissingFileAsUnreadable() throws {
         #expect(throws: HashError.unreadable) {
-            try ContentHasher().readWholeFile(tree.root.appendingPathComponent("gone.jpg"))
+            try ContentHasher().readWholeFile(tree.root.appendingPathComponent("gone.jpg"),
+                                              upTo: 1 << 20)
         }
     }
 
     @Test func readWholeFileReportsADirectoryAsTruncated() throws {
         let dir = try tree.directory("d")
         #expect(throws: HashError.truncated) {
-            try ContentHasher().readWholeFile(dir)
+            try ContentHasher().readWholeFile(dir, upTo: 1 << 20)
         }
     }
 
     @Test func readWholeFileReturnsEmptyForAnEmptyFile() throws {
         let url = try tree.file("empty.bin", bytes: 0)
-        #expect(try ContentHasher().readWholeFile(url).isEmpty)
+        #expect(try ContentHasher().readWholeFile(url, upTo: 1 << 20)?.isEmpty == true)
+    }
+
+    @Test func readWholeFileDeclinesAFileAboveItsOwnCap() throws {
+        // The cap belongs to `readWholeFile`, not to its caller: the method is
+        // public, and unbounded buffering is the one way to misuse it.
+        let url = try tree.file("big.bin", bytes: 4096)
+        #expect(try ContentHasher().readWholeFile(url, upTo: 4095) == nil)
+        #expect(try ContentHasher().readWholeFile(url, upTo: 4096)?.count == 4096)
+    }
+
+    @Test func readWholeFileSizesTheLinkTargetNotTheLink() throws {
+        // The bug this fix exists for, at the layer that now owns the cap.
+        // `attributesOfItem(atPath:)` and `URL.resourceValues(forKeys:
+        // [.fileSizeKey])` both report a symlink's own size — the length of the
+        // path it holds — while `open(2)` follows it. Sizing must use the
+        // descriptor, or a seven-byte link reads its multi-hundred-megabyte
+        // target whole.
+        let target = try tree.file("target.bin", bytes: 4096)
+        let link = tree.root.appendingPathComponent("link.bin")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        // Pin the lie itself, so this test still means something if a future
+        // edit reaches for a path-based size again.
+        let linkSize = try #require(
+            FileManager.default.attributesOfItem(atPath: link.path)[.size] as? Int)
+        #expect(linkSize < 4096)
+
+        #expect(try ContentHasher().readWholeFile(link, upTo: 4095) == nil)
+        #expect(try ContentHasher().readWholeFile(link, upTo: 4096)?.count == 4096)
+    }
+
+    @Test func aSymlinkToAnOversizedTargetTakesTheStreamingBranch() throws {
+        // `Walker.scan` with `followSymlinks` emits the *link* path after
+        // resolving it with `stat`, so this is the shape the indexer actually
+        // hands the hasher. Before the fix the link's own seven-byte size sailed
+        // past the guard and the target was buffered whole, producing an image
+        // hash and a resident set roughly twice the target's size.
+        let target = try Fixtures.writeImage(to: tree.root.appendingPathComponent("target.jpg"))
+        let targetSize = try #require(
+            FileManager.default.attributesOfItem(atPath: target.path)[.size] as? Int)
+        let link = tree.root.appendingPathComponent("link.jpg")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let hasher = FileHasher(inMemoryLimit: targetSize - 1)
+        let hashes = try hasher.hashes(for: link, mediaType: mediaType("jpg"))
+
+        #expect(hashes.imageHash == nil)
+        #expect(hashes.imageHashKind == nil)
+        #expect(hashes.contentHash == (try ContentHasher().hash(target)))
+    }
+
+    @Test func aSymlinkUnderTheLimitStillGetsAnImageHash() throws {
+        // The fix must not overshoot into refusing symlinks: a link to a file
+        // that fits is still hashed both ways, identically to the target.
+        let target = try Fixtures.writeImage(to: tree.root.appendingPathComponent("target.jpg"))
+        let link = tree.root.appendingPathComponent("link.jpg")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let type = try mediaType("jpg")
+        #expect(try FileHasher().hashes(for: link, mediaType: type)
+                == FileHasher().hashes(for: target, mediaType: type))
+    }
+
+    @Test func aDanglingSymlinkIsUnreadable() throws {
+        let link = tree.root.appendingPathComponent("dangling.jpg")
+        try FileManager.default.createSymbolicLink(
+            at: link, withDestinationURL: tree.root.appendingPathComponent("nowhere.jpg"))
+        #expect(throws: HashError.unreadable) {
+            try FileHasher().hashes(for: link, mediaType: mediaType("jpg"))
+        }
     }
 
     @Test func hashesAreValueEqual() throws {

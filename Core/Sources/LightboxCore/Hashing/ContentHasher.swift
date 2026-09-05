@@ -22,11 +22,15 @@ public struct ContentHasher: Sendable {
 
     public func hash(_ url: URL) throws -> String {
         var digest = SHA256()
-        try stream(url) { digest.update(data: $0) }
+        // No `sizing`, so no `fstat` is issued and this path is exactly the
+        // loop it has always been: open, read to a clean EOF, throw
+        // `.truncated` on anything else.
+        try stream(url, consume: { digest.update(data: $0); return true })
         return digest.finalize().hexEncoded
     }
 
-    /// The file's entire contents, read through the same loop as `hash(_:)`.
+    /// The file's entire contents, read through the same loop as `hash(_:)`,
+    /// or nil when the file is larger than `limit`.
     ///
     /// Exists so a caller that needs the bytes themselves — the image-data
     /// parsers, which have to walk a file's structure — gets one read whose
@@ -34,23 +38,61 @@ public struct ContentHasher: Sendable {
     /// be the obvious alternative and is the wrong one: a mid-read `EIO` on a
     /// failing external volume arrives as `SIGBUS` through a mapping, which
     /// cannot be caught and cannot be turned into `.truncated`.
-    public func readWholeFile(_ url: URL) throws -> Data {
+    ///
+    /// The cap is a parameter rather than the caller's business because this
+    /// method is `public` and unbounded buffering is the one way to misuse it.
+    /// It is enforced twice: once against the size `fstat` reports for the
+    /// descriptor being read, and again against the bytes actually accumulated,
+    /// so a file appended to after the first check still cannot exceed it.
+    ///
+    /// - Returns: the file's bytes, or nil if it exceeds `limit`.
+    public func readWholeFile(_ url: URL, upTo limit: Int) throws -> Data? {
+        precondition(limit >= 0, "upTo must not be negative")
         var out = Data()
-        if let size = try? FileManager.default
-            .attributesOfItem(atPath: url.path)[.size] as? Int, size > 0 {
-            // A hint only. The loop below is still what decides how many bytes
-            // there really are, so a stale or lying size cannot truncate it.
-            out.reserveCapacity(size)
-        }
-        try stream(url) { out.append($0) }
-        return out
+        let complete = try stream(
+            url,
+            sizing: { size in
+                guard size <= limit else { return false }
+                // Seeded from the descriptor's own size, so a symlink's
+                // seven-byte path length cannot start a doubling cascade.
+                // A hint only: the loop below still decides how many bytes
+                // there really are, so a stale size cannot truncate the read.
+                if size > 0 { out.reserveCapacity(size) }
+                return true
+            },
+            consume: { chunk in
+                out.append(chunk)
+                return out.count <= limit
+            })
+        return complete ? out : nil
     }
 
     /// Reads `url` in `bufferSize` chunks, handing each to `consume`.
     ///
-    /// Shared by `hash(_:)` and `readWholeFile(_:)` so the two cannot disagree
-    /// about what counts as a clean end-of-file or an I/O error.
-    private func stream(_ url: URL, _ consume: (Data) -> Void) throws {
+    /// Shared by `hash(_:)` and `readWholeFile(_:upTo:)` so the two cannot
+    /// disagree about what counts as a clean end-of-file or an I/O error.
+    ///
+    /// `sizing`, when supplied, is called once with the size `fstat` reports
+    /// for the descriptor that is about to be read, before any bytes are read;
+    /// returning false abandons the read. It is taken from the open descriptor
+    /// rather than from a separate stat of the path because the two need not
+    /// describe the same object: `FileManager.attributesOfItem(atPath:)` and
+    /// `URL.resourceValues(forKeys: [.fileSizeKey])` both report a *symlink's
+    /// own* size, while `open(2)` follows the link — so a `.jpg` link to a
+    /// 200 MB file measures seven bytes, passes any caller-side size guard, and
+    /// then reads 200 MB. Sizing the descriptor also closes the
+    /// check-then-read race, because the decision is made about the very file
+    /// the loop goes on to read.
+    ///
+    /// Returning false from `consume` abandons the read as well, so a caller
+    /// enforcing a cap stays bounded even if the file grows after `sizing` ran.
+    ///
+    /// - Returns: true if the file was read through to its end; false if
+    ///   `sizing` or `consume` abandoned it.
+    @discardableResult
+    private func stream(_ url: URL,
+                        sizing: ((Int) -> Bool)? = nil,
+                        consume: (Data) -> Bool) throws -> Bool {
         // Opened via raw POSIX `open` rather than `FileHandle(forReadingFrom:)`:
         // on this toolchain the latter pre-emptively rejects directories (and
         // similar non-regular-file paths) at open time, which would make every
@@ -74,6 +116,15 @@ public struct ContentHasher: Sendable {
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
 
+        if let sizing {
+            var info = stat()
+            // Cannot fail for a descriptor this function just opened, short of
+            // the kernel disagreeing with itself. Classified the same way a
+            // failed read is: the file opened, but could not be measured.
+            guard fstat(fd, &info) == 0 else { throw HashError.truncated }
+            guard sizing(Int(info.st_size)) else { return false }
+        }
+
         do {
             // `read(upToCount:)` returns nil only at a clean end-of-file; a
             // genuine I/O error (e.g. `EIO` from a failing drive, or `EISDIR`)
@@ -81,11 +132,12 @@ public struct ContentHasher: Sendable {
             // silently hash whatever partial data was read before the error —
             // exactly the corruption this streaming hasher must not produce.
             while let chunk = try handle.read(upToCount: bufferSize), !chunk.isEmpty {
-                consume(chunk)
+                guard consume(chunk) else { return false }
             }
         } catch {
             throw HashError.truncated
         }
+        return true
     }
 }
 

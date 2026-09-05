@@ -53,21 +53,24 @@ public struct FileHasher: FileHashing {
     public func hashes(for url: URL, mediaType: MediaType) throws -> FileHashes {
         let hasher = ContentHasher()
 
-        // A failed size lookup falls through to the streaming branch rather
-        // than throwing here: whatever is wrong with the path, `hash(_:)`
-        // classifies it as `.unreadable` or `.truncated` for one consistent
-        // set of errors across both branches.
-        let size = try? FileManager.default
-            .attributesOfItem(atPath: url.path)[.size] as? Int
-
-        guard mediaType.imageHashKind != nil, let size, size <= inMemoryLimit else {
-            return FileHashes(contentHash: try hasher.hash(url),
-                              imageHash: nil, imageHashKind: nil)
+        // The size test lives inside `readWholeFile`, measured by `fstat` on
+        // the descriptor it actually reads, rather than out here against a stat
+        // of the path. Path-based sizing does not follow a symlink but `open(2)`
+        // does, so a `.jpg` link to a 200 MB file measures seven bytes, sails
+        // past a caller-side guard, and gets buffered whole — and `Walker.scan`
+        // with `followSymlinks` hands this hasher exactly that shape, the link's
+        // own path. Nil means the file was declined for exceeding the limit, in
+        // which case it is streamed for its content hash alone.
+        if mediaType.imageHashKind != nil,
+           let data = try hasher.readWholeFile(url, upTo: inMemoryLimit) {
+            return Self.hashes(of: data, mediaType: mediaType)
         }
+        return FileHashes(contentHash: try hasher.hash(url),
+                          imageHash: nil, imageHashKind: nil)
+    }
 
-        let data = try hasher.readWholeFile(url)
-
-        return data.withUnsafeBytes { bytes -> FileHashes in
+    private static func hashes(of data: Data, mediaType: MediaType) -> FileHashes {
+        data.withUnsafeBytes { bytes -> FileHashes in
             var content = SHA256()
             // `update(bufferPointer:)` on an empty buffer is avoided: the
             // digest of no bytes is still the well-defined empty-input hash,
