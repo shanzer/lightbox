@@ -253,6 +253,13 @@ public final class IndexStore: Sendable {
         }
     }
 
+    public func search(_ query: SearchQuery) throws -> [FileRecord] {
+        let compiled = try QueryCompiler.compile(query)
+        return try dbq.read { db in
+            try FileRecord.fetchAll(db, sql: compiled.sql, arguments: compiled.arguments)
+        }
+    }
+
     public func count() throws -> Int {
         try dbq.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM files")! }
     }
