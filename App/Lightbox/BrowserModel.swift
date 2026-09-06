@@ -78,9 +78,28 @@ final class BrowserModel {
     }
 
     private(set) var records: [FileRecord] = []
+
+    /// `records` reduced to ids, in display order.
+    ///
+    /// Derived once here rather than recomputed by the grid, because the grid
+    /// needs it on every body evaluation *and* on every click, and Task 18
+    /// measures that grid at 50,000 items. `compactMap` over 50,000 records per
+    /// keystroke is the kind of cost that only shows up at the size this app is
+    /// built for.
+    private(set) var order: [Int64] = []
+
     private(set) var progress = IndexProgress()
     private(set) var root: URL?
     private(set) var status: Status = .ok
+
+    /// Which rows are selected. `SelectionModel` lives in `Core`; this is just
+    /// where the window keeps its copy.
+    var selection = SelectionModel()
+
+    /// The side of a thumbnail cell in points, driven by the size slider.
+    var thumbnailSide: CGFloat = 128
+
+    let thumbnails: ThumbnailCache
 
     var includeSubfolders = true {
         didSet {
@@ -105,20 +124,59 @@ final class BrowserModel {
     /// Monotonic; bumped by every action that changes what should be on screen.
     private var generation = 0
 
+    /// Where thumbnails are cached. Under `Caches` rather than Application
+    /// Support because every one of them is reproducible from the original
+    /// file, so the system is welcome to reclaim the space.
+    static var defaultThumbnailDirectory: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Lightbox/thumbnails", isDirectory: true)
+    }
+
     init() throws {
         let store = try IndexStore(url: IndexStore.defaultURL)
         self.store = store
         self.searcher = store
         coordinator = IndexCoordinator(store: store)
+        thumbnails = ThumbnailCache(directory: Self.defaultThumbnailDirectory)
     }
 
     /// Takes an already-open store, for tests and previews that must not touch
     /// Application Support. `searcher` defaults to the store itself and is
-    /// overridden only to control search timing in a test.
-    init(store: IndexStore, searcher: (any RecordSearching)? = nil) {
+    /// overridden only to control search timing in a test; `thumbnails`
+    /// likewise exists so a test can point the cache somewhere disposable and
+    /// give it a budget small enough to observe eviction.
+    init(store: IndexStore,
+         searcher: (any RecordSearching)? = nil,
+         thumbnails: ThumbnailCache? = nil) {
         self.store = store
         self.searcher = searcher ?? store
         coordinator = IndexCoordinator(store: store)
+        self.thumbnails = thumbnails ?? ThumbnailCache(directory: Self.defaultThumbnailDirectory)
+    }
+
+    // MARK: - Records
+
+    /// The only place `records` is assigned.
+    ///
+    /// Single-entry because two things have to move with it. `order` is derived
+    /// state the grid reads on every click, and the selection has to be pruned:
+    /// a rescan deletes rows, and a selection still naming them would go on to
+    /// drive a copy, a move, or — in phase 2 — a delete against files that are
+    /// no longer there.
+    ///
+    /// Pruning is `SelectionModel.retain(_:)` and not a rebuild by replaying
+    /// clicks over the surviving ids, because a replay depends on `Set`
+    /// iteration order and silently re-anchors the user's range on whichever id
+    /// came out last.
+    private func setRecords(_ rows: [FileRecord]) {
+        records = rows
+        order = rows.compactMap(\.id)
+        var pruned = selection
+        pruned.retain(Set(order))
+        // Compared rather than assigned unconditionally: `selection` is
+        // observed, and a reload that changed nothing about it must not
+        // invalidate every cell in the grid.
+        if pruned != selection { selection = pruned }
     }
 
     // MARK: - Generations
@@ -165,9 +223,53 @@ final class BrowserModel {
     /// does not know yet.
     private func reloadThenRescan() async {
         guard let pass = beginPass() else { return }
+        trimThumbnailCache()
         await reload(pass)
         await rescan(pass)
     }
+
+    // MARK: - Thumbnail cache
+
+    private var trimTask: Task<Void, Never>?
+
+    /// Brings the thumbnail cache back inside its budget.
+    ///
+    /// `ThumbnailCache` never evicts on its own — nothing in `Core` calls
+    /// `evictIfNeeded()`, so the budget does nothing at all until something
+    /// schedules it, and this is the first code that generates thumbnails. It
+    /// runs when a folder is opened, and deliberately nowhere else:
+    ///
+    /// - `evictIfNeeded()` enumerates the entire cache directory, which is tens
+    ///   of thousands of files once a library has been browsed. That cannot
+    ///   happen per cell, or per scroll event.
+    /// - Eviction sorts by write time, so it is least-recently-*generated*, not
+    ///   least-recently-used: a thumbnail the user is staring at right now ages
+    ///   exactly like one they have never seen. Running it as the user scrolls
+    ///   would therefore delete tiles out of the viewport they are looking at.
+    ///   Running it before the incoming folder's thumbnails have been generated
+    ///   puts the oldest entries — the ones for folders left long ago — at the
+    ///   front of the queue instead, which is the closest this policy gets to
+    ///   the right answer.
+    ///
+    /// Fire-and-forget, and coalesced: opening four folders quickly must not
+    /// queue four directory walks behind each other. A failure is deliberately
+    /// silent — a cache that is temporarily over budget is not something to
+    /// interrupt the user about, and the next folder tries again.
+    private func trimThumbnailCache() {
+        guard trimTask == nil else { return }
+        trimTask = Task { [weak self, thumbnails] in
+            try? await thumbnails.evictIfNeeded()
+            self?.trimTask = nil
+        }
+    }
+
+    /// Awaits the trim started by the last folder change, if one is still
+    /// running.
+    ///
+    /// Exists for tests. The trim is fire-and-forget by design — the user is
+    /// not waiting on cache housekeeping — and a test asserting on its effect
+    /// must not do so by sleeping.
+    func waitForThumbnailTrim() async { await trimTask?.value }
 
     // MARK: - Indexing
 
@@ -248,13 +350,13 @@ final class BrowserModel {
                 try searcher.search(query)
             }.value
             guard isCurrent(pass) else { return }
-            records = rows
+            setRecords(rows)
         } catch {
             // Checked on the failure path too: a slow search that fails for a
             // folder the user has already left must not put an error banner
             // over a folder that opened fine.
             guard isCurrent(pass) else { return }
-            records = []
+            setRecords([])
             status = .failed(error.localizedDescription)
         }
     }

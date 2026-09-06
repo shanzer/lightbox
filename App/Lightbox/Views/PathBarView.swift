@@ -16,6 +16,14 @@ struct PathBarView: View {
 
                 progressIndicator
 
+                // Resizes cells continuously. The thumbnails behind them are
+                // requested at quantised sizes, so a drag across the whole
+                // range costs a handful of renders, not one per point.
+                Slider(value: $model.thumbnailSide, in: 64...320) { Text("Size") }
+                    .labelsHidden()
+                    .frame(width: 120)
+                    .help("Thumbnail size")
+
                 Toggle("Include Subfolders", isOn: $model.includeSubfolders)
                     .toggleStyle(.checkbox)
                     .fixedSize()

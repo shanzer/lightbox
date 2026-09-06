@@ -15,8 +15,11 @@ struct BrowserView: View {
                     VStack(spacing: 0) {
                         PathBarView(model: model)
                         Divider()
-                        // Task 17 replaces this with PhotoGridView.
-                        Text("\(model.records.count) images")
+                        PhotoGridView(records: model.records,
+                                      order: model.order,
+                                      cache: model.thumbnails,
+                                      selection: Bindable(model).selection,
+                                      thumbnailSide: model.thumbnailSide)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
