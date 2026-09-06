@@ -1,6 +1,16 @@
 import Foundation
 import GRDB
 
+/// The result of `IndexStore.checkIntegrity()`.
+///
+/// `corrupt` carries SQLite's own description (the `quick_check` message, or
+/// the error that opening the database raised) so a failure report says more
+/// than "something is wrong".
+public enum IndexHealth: Sendable, Equatable {
+    case ok
+    case corrupt(String)
+}
+
 public enum IndexStoreError: Error, Equatable, Sendable {
     /// A scope prefix that is empty or not an absolute path. Thrown rather
     /// than trapped: the realistic bad input is a persisted setting (an
@@ -490,5 +500,67 @@ public final class IndexStore: Sendable {
             try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
                 .map { $0["detail"] as String? ?? "" }
         }
+    }
+}
+
+// MARK: - Integrity
+
+// An extension rather than free functions, because both members need `dbq`
+// (or, for `rebuild`, the initializer that opens it) and `dbq` is private to
+// this file on purpose — nothing outside `IndexStore` gets to hold a
+// `DatabaseQueue` and bypass the API above.
+extension IndexStore {
+    /// Runs SQLite's own consistency check against the file backing this
+    /// store.
+    ///
+    /// `PRAGMA quick_check` rather than `integrity_check`: `integrity_check`
+    /// also cross-checks every index against its table, which is real work on
+    /// a database with tens of thousands of rows. This check runs once at
+    /// every launch, not only when corruption is already suspected, so it has
+    /// to be cheap on the common case (a healthy database) as well as
+    /// sensitive on the rare one. `quick_check` skips the index cross-checks
+    /// but still walks every page verifying header fields, page links and
+    /// free-list structure — exactly what actually goes wrong when a file is
+    /// truncated, torn by a crash mid-write, or overwritten by something else
+    /// entirely, which is the corruption this app can actually encounter.
+    ///
+    /// A thrown error (the file cannot even be opened as SQLite) counts as
+    /// corrupt too, described by the error rather than by a generic message,
+    /// so a bug report says what actually failed.
+    public func checkIntegrity() -> IndexHealth {
+        do {
+            let result = try dbq.read { db in
+                try String.fetchOne(db, sql: "PRAGMA quick_check")
+            }
+            return result == "ok" ? .ok : .corrupt(result ?? "quick_check returned no result")
+        } catch {
+            return .corrupt(error.localizedDescription)
+        }
+    }
+
+    /// Discards the index at `url` — including its `-wal` and `-shm`
+    /// sidecars — and opens a fresh, empty one in its place.
+    ///
+    /// Always safe to call: the index is a derived cache. Every row in it is
+    /// recomputed the next time its folder is scanned, so nothing the user
+    /// created is lost, only time — which is exactly why a corrupt index gets
+    /// a one-button rebuild rather than a repair tool.
+    ///
+    /// The sidecars are not optional cleanup. A corrupt main file is often
+    /// corrupt precisely because a write-ahead log or shared-memory segment
+    /// next to it was left in a bad state (a crash mid-checkpoint, a filesystem
+    /// fault); opening a brand-new database file while leaving those in place
+    /// lets SQLite replay that same bad log into the replacement on its first
+    /// checkpoint, reintroducing the corruption the rebuild was supposed to
+    /// clear.
+    public static func rebuild(at url: URL) throws -> IndexStore {
+        let manager = FileManager.default
+        for suffix in ["", "-wal", "-shm"] {
+            let sidecar = URL(fileURLWithPath: url.path + suffix)
+            if manager.fileExists(atPath: sidecar.path) {
+                try manager.removeItem(at: sidecar)
+            }
+        }
+        return try IndexStore(url: url)
     }
 }

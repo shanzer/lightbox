@@ -112,6 +112,12 @@ final class BrowserModel {
     private(set) var root: URL?
     private(set) var status: Status = .ok
 
+    /// Set once, in `init(at:)`, when the on-disk index failed its launch
+    /// integrity check and was rebuilt empty. `BrowserView` reads it to show
+    /// the one-time banner — without it, a rebuild would look exactly like
+    /// data loss: the window would just quietly open onto an empty grid.
+    private(set) var didRebuildIndex = false
+
     /// Which rows are selected. `SelectionModel` lives in `Core`; this is just
     /// where the window keeps its copy.
     var selection = SelectionModel()
@@ -315,8 +321,26 @@ final class BrowserModel {
             .appendingPathComponent("Lightbox/thumbnails", isDirectory: true)
     }
 
-    init() throws {
-        let store = try IndexStore(url: IndexStore.defaultURL)
+    /// Opens the on-disk index, checked for corruption first.
+    ///
+    /// `url` defaults to `IndexStore.defaultURL` and is overridden only by a
+    /// test — production always takes the default, so this is the same path
+    /// `BrowserView` runs at launch, exercised without writing into the real
+    /// Application Support directory.
+    ///
+    /// A failed `IndexStore(url:)` and a store that opens but fails
+    /// `checkIntegrity()` are handled the same way: the index is a derived
+    /// cache, so neither case can lose anything a rebuild wouldn't also
+    /// recompute, and leaving the app unable to open at all over either one
+    /// would be strictly worse than a rescan.
+    init(at url: URL = IndexStore.defaultURL) throws {
+        let store: IndexStore
+        if let opened = try? IndexStore(url: url), opened.checkIntegrity() == .ok {
+            store = opened
+        } else {
+            store = try IndexStore.rebuild(at: url)
+            didRebuildIndex = true
+        }
         self.store = store
         self.searcher = store
         coordinator = IndexCoordinator(store: store)
