@@ -66,10 +66,19 @@ public struct SelectionModel: Sendable, Hashable {
         base = selected
     }
 
+    /// Selects every row on screen, anchored at the top one.
+    ///
+    /// The base is *emptied* rather than set to the selection. A shift-click
+    /// after Select All has to be able to narrow — `selectAll([1...8])` then
+    /// shift-click 3 gives `[1, 2, 3]` in the Finder — and a shift-click is
+    /// `base ∪ range`, so a base holding everything makes the union
+    /// unshrinkable and the gesture a permanent no-op. Empty is also the
+    /// truthful value: the base is the selection that predates the current
+    /// range, and Select All replaced whatever came before it.
     public mutating func selectAll(_ order: [Int64]) {
         selected = Set(order)
         anchor = order.first
-        base = selected
+        base = []
     }
 
     public mutating func clear() {
@@ -88,8 +97,8 @@ public struct SelectionModel: Sendable, Hashable {
     /// between runs, and every replayed `click` moves the anchor, so the user's
     /// range would silently re-anchor on whichever id happened to come last.
     ///
-    /// An anchor whose row is gone is *moved*, not dropped, to the lowest
-    /// surviving selected id.
+    /// An anchor whose row is gone is *moved*, not dropped, to the topmost
+    /// surviving selected row.
     ///
     /// Dropping it and keeping a dangling one look different but behave
     /// identically, and both are wrong: `click(_:in:shift:command:)` cannot
@@ -100,16 +109,28 @@ public struct SelectionModel: Sendable, Hashable {
     /// without a gesture that asked for it. Re-anchoring gives `[3, 4, 5, 6]`,
     /// which is the range the user still has on screen.
     ///
-    /// Lowest surviving *selected* id, because the anchor's job is to be one
+    /// Topmost surviving *selected* row, because the anchor's job is to be one
     /// end of the current range and the surviving selection is all that is left
     /// of it. When nothing survives there is no range to extend and the anchor
     /// is genuinely nil.
-    public mutating func retain(_ living: Set<Int64>) {
+    ///
+    /// `living` is the display order, not a `Set`, and that is load-bearing:
+    /// the lowest surviving *id* is the topmost surviving *row* only under an
+    /// identity sort, and `SearchQuery.Sort` defaults to name-ascending, so
+    /// display order is essentially never id order. With `[50, 40, 30, 20, 10]`
+    /// on screen — click 50, shift-click 20, `retain([40, 30, 20, 10])` —
+    /// anchoring on `selected.min()` picks 20, the *bottom* of the surviving
+    /// range, and the next shift-click to 10 leaves `[20, 10]`: rows 40 and 30
+    /// gone without a gesture, which is the exact failure the re-anchoring was
+    /// written to eliminate.
+    public mutating func retain(_ living: [Int64]) {
         selected.formIntersection(living)
         // The base is pruned too, or a later shift-click would union dead ids
         // straight back into the selection.
         base.formIntersection(living)
-        if let anchor, !living.contains(anchor) { self.anchor = selected.min() }
+        if let anchor, !living.contains(anchor) {
+            self.anchor = living.first(where: selected.contains)
+        }
     }
 
     /// The id `offset` positions away, clamped to the ends. Returns nil when

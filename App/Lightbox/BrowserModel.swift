@@ -172,7 +172,9 @@ final class BrowserModel {
         records = rows
         order = rows.compactMap(\.id)
         var pruned = selection
-        pruned.retain(Set(order))
+        // The ordered array, not a `Set`: `retain` re-anchors to the topmost
+        // surviving row, which it can only identify from display order.
+        pruned.retain(order)
         // Compared rather than assigned unconditionally: `selection` is
         // observed, and a reload that changed nothing about it must not
         // invalidate every cell in the grid.

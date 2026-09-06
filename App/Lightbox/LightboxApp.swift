@@ -33,10 +33,27 @@ struct LightboxApp: App {
             //
             // `replacing:` and not `after:`, because SwiftUI's stock Edit menu
             // already carries a Select All wired to the responder chain. Adding
-            // a second would leave two items sharing one shortcut, with AppKit
-            // choosing between them. This app has no text editing surface for
-            // the stock group to serve.
-            CommandGroup(replacing: .textEditing) {
+            // a second would leave two items sharing one shortcut, and AppKit
+            // resolves that collision by stripping the key equivalent off the
+            // *custom* item — leaving ⌘A routed to the stock `selectAll:`,
+            // which nothing in this app implements.
+            //
+            // The group is `.pasteboard`, not `.textEditing`, because that is
+            // where the stock Select All actually lives: Cut/Copy/Paste/Delete/
+            // Select All are one group. Measured, by dumping `NSApp.mainMenu`
+            // from a test hosted in this app — `replacing: .textEditing` left
+            // the stock item standing as `key='a' action=selectAll: target=nil`
+            // and handed the custom one `key='' action=menuAction:`, so ⌘A went
+            // to a selector nothing here implements and the command was
+            // mouse-only. Replacing `.pasteboard` yields a single item carrying
+            // both. `MenuCommandTests` pins all of it.
+            //
+            // The price is Cut, Copy, Paste and Delete, which go with the group
+            // and cannot be kept — SwiftUI replaces a `CommandGroup` whole.
+            // Free today because there is no text-entry surface for them to act
+            // on; `replacingThePasteboardGroupAlsoDropsCutCopyAndPaste` fails
+            // the moment that stops being true.
+            CommandGroup(replacing: .pasteboard) {
                 Button("Select All") {
                     NotificationCenter.default.post(name: .selectAllPhotos, object: nil)
                 }
