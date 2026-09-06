@@ -149,13 +149,18 @@ struct MenuCommandTests {
         }
     }
 
-    /// The forwarding is to the responder chain, not to a hard-coded target.
+    /// The selectors the menu forwards are the ones text editing answers.
     ///
-    /// `NSApp.sendAction(_:to:nil)` is what lets the focused `NSTextView`
-    /// answer ⌘C while the grid — which implements none of these — leaves the
-    /// items greyed out. A version wired to `BrowserModel` would either steal
-    /// ⌘C from the search field or need to reimplement text editing.
-    @Test func cutCopyAndPasteReachAFocusedTextFieldThroughTheResponderChain() throws {
+    /// Scoped precisely, because the earlier name for this test claimed more
+    /// than it does: it drives the field editor *directly* and so never
+    /// touches `LightboxApp.forwardToResponder`. What it does establish is
+    /// that `cut:`, `copy:` and `paste:` — built from string literals, so a
+    /// typo would compile fine and fail silently — name real text-editing
+    /// actions and round-trip through the real pasteboard. Whether
+    /// `performKeyEquivalent` delivers ⌘C to a focused field needs a live
+    /// event and a key window, which `xcodebuild test` does not provide; that
+    /// is on the human checklist in the Task 19 report.
+    @Test func theForwardedSelectorsAreTheOnesTextEditingImplements() throws {
         let field = NSTextField(string: "beach")
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 40),
                               styleMask: [.titled], backing: .buffered, defer: true)
@@ -179,5 +184,102 @@ struct MenuCommandTests {
         editor.perform(Selector(("cut:")), with: nil)
         #expect(field.stringValue.isEmpty)
         #expect(NSPasteboard.general.string(forType: .string) == "beachbeach")
+    }
+}
+
+/// Raised by a notification observer. A class, not a captured `var`: the
+/// observer block is `@Sendable`, and `queue: nil` delivers it synchronously
+/// on the posting thread, so the read after the post is ordered.
+private final class Flag: @unchecked Sendable {
+    var raised = false
+}
+
+extension MenuCommandTests {
+    private func observingSelectAllPhotos(_ body: () -> Void) -> Bool {
+        let flag = Flag()
+        let token = NotificationCenter.default.addObserver(
+            forName: .selectAllPhotos, object: nil, queue: nil) { _ in flag.raised = true }
+        defer { NotificationCenter.default.removeObserver(token) }
+        body()
+        return flag.raised
+    }
+
+    /// A window whose text field is really the first responder of a really key
+    /// window, or nil if this environment will not give the test process one.
+    ///
+    /// Returned rather than asserted, because whether a window can become key
+    /// depends on whether the app is active, and an inactive test host is an
+    /// environment fact rather than a defect in the code under test. The
+    /// caller decides what to do about it.
+    private func keyWindowEditingText() -> (NSWindow, NSTextView)? {
+        let field = NSTextField(string: "beach")
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 40),
+                              styleMask: [.titled], backing: .buffered, defer: true)
+        window.contentView?.addSubview(field)
+        NSApp?.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, NSApp?.keyWindow !== window {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        guard NSApp?.keyWindow === window else {
+            window.orderOut(nil)
+            return nil
+        }
+        window.makeFirstResponder(field)
+        guard let editor = field.currentEditor() as? NSTextView else {
+            window.orderOut(nil)
+            return nil
+        }
+        editor.setSelectedRange(NSRange(location: 0, length: 0))
+        return (window, editor)
+    }
+
+    /// The Task 17 guarantee, restated: with nothing editing text, ⌘A still
+    /// means "select every photo".
+    ///
+    /// The half of the new routing that is deterministic here — the test host
+    /// has no key window unless one is made — and the half that would break
+    /// silently if `forwardToResponder` ever started returning true for
+    /// everything.
+    @Test func selectAllReachesTheGridWhenNothingIsEditingText() {
+        #expect(LightboxApp.forwardToResponder("selectAll:") == false,
+                "something in the responder chain answered selectAll: with nothing focused")
+        #expect(observingSelectAllPhotos { LightboxApp.selectAll() },
+                "⌘A no longer selects the photos")
+    }
+
+    /// ⌘A must reach the search field when the search field is focused.
+    ///
+    /// The mirror image of the regression Task 17 fixed. Task 17 posted
+    /// `selectAllPhotos` unconditionally, which was right while nothing else
+    /// could want ⌘A; with a text field in the toolbar, measurement showed
+    /// `performKeyEquivalent` returning true and the photos being selected
+    /// while the user was typing, leaving the field's own Select All
+    /// unreachable.
+    ///
+    /// Needs a genuinely key window, which needs an active app. When the test
+    /// host is not active the assertion is unprovable rather than false, so
+    /// this records the gap instead of failing on it — a flaky red test would
+    /// teach the next reader to ignore it. `selectAllReachesTheGridWhenNothing
+    /// IsEditingText` still pins the other direction unconditionally, and the
+    /// Task 19 report puts this on the human checklist either way.
+    @Test func selectAllPrefersAFocusedTextFieldOverTheGrid() throws {
+        guard let (window, editor) = keyWindowEditingText() else {
+            Issue.record("""
+                could not make a key window in this test host, so ⌘A's routing \
+                to a focused text field is unverified here — check it by hand
+                """, severity: .warning)
+            return
+        }
+        defer { window.orderOut(nil) }
+
+        let selectedPhotos = observingSelectAllPhotos { LightboxApp.selectAll() }
+
+        #expect(!selectedPhotos,
+                "⌘A selected the photos while a text field was being edited")
+        #expect(editor.selectedRange().length == editor.string.count,
+                "the field's text was not selected, so ⌘A did nothing at all")
     }
 }

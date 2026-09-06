@@ -68,9 +68,21 @@ struct LightboxApp: App {
             // Deliberately *not* wired to `BrowserModel`: cutting a selection
             // of photos is a phase 2 feature and needs a pasteboard
             // representation that does not exist yet. Today these serve the
-            // search field only, which is what the responder chain gets right
-            // for free — when the field is not focused, nothing implements
-            // them and AppKit greys them out.
+            // search field only.
+            //
+            // **They are not greyed out when the field is unfocused.** Stock
+            // AppKit items validate through `NSMenuItem.isEnabled` and the
+            // responder chain, but a SwiftUI `Button` in a `CommandGroup` does
+            // not participate in that: measured with no key window, Cut, Copy,
+            // Paste and Delete all come out `isEnabled == true`, while the
+            // stock Undo and Redo — which SwiftUI did not build — correctly
+            // validate to false. So with the grid focused these look live and
+            // silently do nothing, because `sendAction` finds no handler.
+            // Wrong, but wrong in the safe direction: an item that does
+            // nothing beats a search field that cannot copy. Fixing it needs
+            // real `NSMenuItem` validation, which means reaching outside
+            // SwiftUI's command API; recorded in the Task 19 report rather
+            // than papered over here.
             CommandGroup(replacing: .pasteboard) {
                 Button("Cut") { Self.forwardToResponder("cut:") }
                     .keyboardShortcut("x", modifiers: .command)
@@ -90,10 +102,23 @@ struct LightboxApp: App {
 
                 Divider()
 
-                Button("Select All") {
-                    NotificationCenter.default.post(name: .selectAllPhotos, object: nil)
-                }
-                .keyboardShortcut("a", modifiers: .command)
+                // The responder chain gets first refusal, exactly as it does
+                // for Cut/Copy/Paste above.
+                //
+                // Task 17 posted the notification unconditionally, which was
+                // right when the only thing ⌘A could plausibly mean was "select
+                // every photo". With a search field in the toolbar it is wrong
+                // in the mirror image of the bug Task 17 fixed: measured with
+                // an `NSTextField` as first responder, `performKeyEquivalent`
+                // returns true and `selectAllPhotos` fires, so the field's own
+                // Select All became unreachable and ⌘A while typing silently
+                // selected the grid instead of the text.
+                //
+                // `sendAction` returns false when nothing in the chain
+                // implements `selectAll:` — which is the case whenever no text
+                // is being edited — and only then does this mean the photos.
+                Button("Select All") { Self.selectAll() }
+                    .keyboardShortcut("a", modifiers: .command)
             }
         }
     }
@@ -105,8 +130,20 @@ extension LightboxApp {
     /// `to: nil` is the load-bearing part: a targeted send would need this
     /// file to know which view is focused, which is the responder chain's job
     /// and not an app-definition's.
-    static func forwardToResponder(_ name: String) {
+    /// Returns whether anything in the chain handled it.
+    @discardableResult
+    static func forwardToResponder(_ name: String) -> Bool {
         NSApp.sendAction(Selector((name)), to: nil, from: nil)
+    }
+
+    /// ⌘A: the text being edited if there is any, the photos otherwise.
+    ///
+    /// A named method rather than a closure inside the `Button` so the rule
+    /// itself is reachable from a test. Asserting it by re-writing the same
+    /// two lines in the test would only prove the test can copy code.
+    static func selectAll() {
+        guard !forwardToResponder("selectAll:") else { return }
+        NotificationCenter.default.post(name: .selectAllPhotos, object: nil)
     }
 }
 

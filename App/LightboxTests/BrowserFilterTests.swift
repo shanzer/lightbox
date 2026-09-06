@@ -378,3 +378,141 @@ struct BrowserFilterTests {
                 "the anchor must survive as the topmost row still on screen")
     }
 }
+
+/// The interaction between a filter change and the filesystem pass behind it.
+///
+/// Separate from `BrowserFilterTests` because every test here needs files that
+/// really exist: the point is what tier 0 does, and tier 0 walks the disk.
+@MainActor
+struct FilterVersusIndexPassTests {
+    let tree: TempDirectory
+
+    init() throws {
+        tree = try TempDirectory()
+    }
+
+    private func folderOfFiles(_ name: String, count: Int) throws -> URL {
+        let folder = try tree.directory(name)
+        for index in 0..<count { _ = try tree.file("\(name)/img\(index).jpg") }
+        return folder
+    }
+
+    /// **One keystroke during `open()` must not cancel the folder's index pass.**
+    ///
+    /// `reload()` bumps a generation, and `rescan` opens by checking one. While
+    /// those were the same counter, a character typed inside the window between
+    /// `open()` starting and `rescan` reaching its guard made tier 0 return
+    /// before it began — and the failure was completely silent, because the
+    /// pass that would have set `status` was the one that never ran. The user
+    /// got an empty grid, an empty filter panel, an idle progress indicator and
+    /// no error, recoverable only by ⌘R or by navigating away and back.
+    ///
+    /// The window is the initial reload's round trip to SQLite. It is widened
+    /// here by holding that one search up in the searcher, so the test states a
+    /// fact rather than sampling a race: without the delay the reload can
+    /// finish before the keystroke lands and the bug hides.
+    ///
+    /// The control run is the expectation. Nothing here is compared against a
+    /// literal row count, so the assertion is "typing changed the outcome",
+    /// which is the actual claim.
+    @Test func aKeystrokeDuringOpenDoesNotCancelTheIndexPass() async throws {
+        let folder = try folderOfFiles("photos", count: 40)
+
+        let controlStore = try IndexStore.inMemory()
+        let control = BrowserModel(store: controlStore)
+        await control.open(folder)
+        let indexedRows = try controlStore.count()
+        #expect(indexedRows > 0, "the control run indexed nothing, so the test proves nothing")
+        #expect(control.status == .ok)
+
+        let store = try IndexStore.inMemory()
+        // Holds up the initial reload, so the keystroke reliably lands inside
+        // the window between `open()` starting and `rescan` guarding.
+        let model = BrowserModel(store: store,
+                                 searcher: SearcherDelayingOneCall(store, delayingCall: 1))
+        model.searchDebounce = .zero
+        let opening = Task { await model.open(folder) }
+        await Task.yield()
+        model.searchText = "img"
+        await opening.value
+        await model.waitForPendingSearch()
+
+        let rowsAfterTyping = try store.count()
+        #expect(rowsAfterTyping == indexedRows,
+                "typing during open cancelled the index pass: \(rowsAfterTyping) rows indexed, control had \(indexedRows)")
+        #expect(model.records.count == indexedRows,
+                "the grid is empty even though the index is not")
+        #expect(model.status == .ok,
+                "status is \(model.status); a skipped pass reports nothing at all")
+    }
+
+    /// The same guarantee for the filters that reload without a debounce.
+    @Test func tickingAFilterDuringOpenDoesNotCancelTheIndexPass() async throws {
+        let folder = try folderOfFiles("photos", count: 40)
+
+        let controlStore = try IndexStore.inMemory()
+        let control = BrowserModel(store: controlStore)
+        await control.open(folder)
+        let indexedRows = try controlStore.count()
+        #expect(indexedRows > 0)
+
+        let store = try IndexStore.inMemory()
+        let model = BrowserModel(store: store,
+                                 searcher: SearcherDelayingOneCall(store, delayingCall: 1))
+        let opening = Task { await model.open(folder) }
+        await Task.yield()
+        model.minimumWidth = 1
+        await opening.value
+        await model.waitForPendingSearch()
+
+        #expect(try store.count() == indexedRows, "a width filter cancelled the index pass")
+    }
+
+    /// Navigating away *must* still cancel it — the split token has to keep the
+    /// invalidation it was always there to provide.
+    ///
+    /// Asserted on the folder the user ends up looking at rather than on
+    /// whether the first scan ran: the first pass may legitimately have
+    /// finished before the second `open` landed, but the grid must show the
+    /// second folder either way.
+    @Test func openingAnotherFolderStillSupersedesTheFirst() async throws {
+        let first = try folderOfFiles("first", count: 30)
+        let second = try folderOfFiles("second", count: 2)
+
+        let store = try IndexStore.inMemory()
+        let model = BrowserModel(store: store,
+                                 searcher: SearcherDelayingOneCall(store, delayingCall: 1))
+        let opening = Task { await model.open(first) }
+        await Task.yield()
+        await model.open(second)
+        await opening.value
+
+        #expect(model.root == second)
+        #expect(model.records.allSatisfy { $0.path.hasPrefix(second.path + "/") },
+                "the grid is showing the folder the user navigated away from")
+    }
+
+    /// A scan that finishes must show its rows under the filters the user set
+    /// *while it ran*, not the ones in force when it started.
+    ///
+    /// `rescan` ends by reloading the grid. Replaying its own pass would lose
+    /// to the query guard and leave the newly indexed rows invisible; replaying
+    /// its own filter state would undo the filter the user set meanwhile.
+    @Test func theReloadAfterAScanUsesTheFiltersInForceWhenItFinishes() async throws {
+        let folder = try folderOfFiles("photos", count: 40)
+        _ = try tree.file("photos/beach.png")
+
+        let store = try IndexStore.inMemory()
+        let model = BrowserModel(store: store,
+                                 searcher: SearcherDelayingOneCall(store, delayingCall: 1))
+        model.searchDebounce = .zero
+        let opening = Task { await model.open(folder) }
+        await Task.yield()
+        model.searchText = "beach"
+        await opening.value
+        await model.waitForPendingSearch()
+
+        #expect(model.records.map(\.name) == ["beach.png"],
+                "the grid came back showing \(model.records.map(\.name)) rather than the search")
+    }
+}

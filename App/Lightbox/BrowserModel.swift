@@ -78,7 +78,13 @@ final class BrowserModel {
     /// `Sendable` because the tier 0 progress callback is `@Sendable` and hops
     /// back to the main actor carrying one.
     private struct Pass: Sendable {
-        let token: Int
+        /// Which folder, and how much of it, this pass is for. Bumped only by
+        /// the things that change the answer to that: opening a folder, the
+        /// subfolder toggle, and an explicit refresh.
+        let scopeToken: Int
+        /// Which *question* this pass is asking of the index. Bumped by every
+        /// reload, including one a keystroke scheduled.
+        let queryToken: Int
         let root: URL
         let includeSubfolders: Bool
         let sort: SearchQuery.Sort
@@ -220,12 +226,15 @@ final class BrowserModel {
     private func scheduleReload(after interval: Duration) {
         pendingReloadTask?.cancel()
         pendingReloadTask = Task { [weak self] in
-            if interval > .zero {
-                try? await Task.sleep(for: interval)
-                // Cancellation is the common case — the user typed another
-                // character — and must not go on to run the superseded query.
-                guard !Task.isCancelled else { return }
-            }
+            if interval > .zero { try? await Task.sleep(for: interval) }
+            // Outside the `if`, deliberately. A zero-interval reload is still
+            // cancellable — three ticks in quick succession schedule three
+            // tasks and cancel two of them — and checking only after a sleep
+            // would let all three run. The generation guard would still make
+            // the *result* right, so this is two wasted round trips to SQLite
+            // rather than a wrong grid; it is still two more than the user
+            // asked for.
+            guard !Task.isCancelled else { return }
             await self?.reload()
         }
     }
@@ -270,8 +279,33 @@ final class BrowserModel {
     private var indexingTask: Task<Void, Never>?
     private var hashingTask: Task<Void, Never>?
 
-    /// Monotonic; bumped by every action that changes what should be on screen.
-    private var generation = 0
+    /// Two monotonic counters, not one.
+    ///
+    /// A single counter conflates "the user is looking at a different folder"
+    /// with "the user is asking a different question about the same folder",
+    /// and the filesystem scan only cares about the first. With one counter,
+    /// `reload()` bumps it, and `rescan`'s opening `guard isCurrent(pass)`
+    /// then sees a superseded pass and returns — so **one keystroke landing
+    /// during `open()` skips tier 0 entirely.** Measured over 300 real files:
+    /// opening the folder untouched indexes 300 rows, opening it and typing a
+    /// single character mid-flight indexes 0, and the user is shown an empty
+    /// grid, an idle progress bar and no error at all, because the pass that
+    /// would have reported the failure is the one that never ran. The window
+    /// is the initial reload's round trip to SQLite, which Task 18 measured at
+    /// ~474 ms on 50,000 rows: click a folder and start typing, which is the
+    /// gesture the search field exists for.
+    ///
+    /// The defect predates the search field — `sort`'s `didSet` has the same
+    /// shape — but was unreachable in practice, because nobody changes the
+    /// sort order within 400 ms of clicking a folder. Three filter properties
+    /// firing on every keystroke make it routine.
+    ///
+    /// So: `scopeGeneration` invalidates filesystem work, `queryGeneration`
+    /// invalidates index reads, and a scope change bumps *both* — a new folder
+    /// does invalidate an in-flight query, while a new query has no business
+    /// invalidating a scan.
+    private var scopeGeneration = 0
+    private var queryGeneration = 0
 
     /// Where thumbnails are cached. Under `Caches` rather than Application
     /// Support because every one of them is reproducible from the original
@@ -355,18 +389,36 @@ final class BrowserModel {
 
     // MARK: - Generations
 
-    /// Invalidates everything in flight and returns the snapshot that replaces
-    /// it, or `nil` when there is no folder to work on.
-    private func beginPass() -> Pass? {
-        generation += 1
+    /// Invalidates *everything* in flight — scans included — and returns the
+    /// snapshot that replaces it, or `nil` when there is no folder to work on.
+    ///
+    /// For the things that change which files are in scope: opening a folder,
+    /// the subfolder toggle, and refresh.
+    private func beginScopePass() -> Pass? {
+        scopeGeneration += 1
+        return beginQueryPass()
+    }
+
+    /// Invalidates index reads only. A scan already running for this folder
+    /// keeps running, because the folder has not changed.
+    private func beginQueryPass() -> Pass? {
+        queryGeneration += 1
         guard let root else { return nil }
-        return Pass(token: generation, root: root,
+        return Pass(scopeToken: scopeGeneration, queryToken: queryGeneration,
+                    root: root,
                     includeSubfolders: includeSubfolders, sort: sort,
                     searchText: searchText, extensions: selectedExtensions,
                     minimumWidth: minimumWidth)
     }
 
-    private func isCurrent(_ pass: Pass) -> Bool { pass.token == generation }
+    /// Checked by everything that touches the filesystem or reports on it:
+    /// `rescan`, the tier 0 progress callback, and the hashing pass.
+    private func isCurrentScope(_ pass: Pass) -> Bool { pass.scopeToken == scopeGeneration }
+
+    /// Checked only where `records`, `order` and `facets` are assigned. A
+    /// scope change bumps the query token too, so this fails for a stale
+    /// folder as well as for a stale query.
+    private func isCurrentQuery(_ pass: Pass) -> Bool { pass.queryToken == queryGeneration }
 
     // MARK: - Navigation
 
@@ -398,7 +450,7 @@ final class BrowserModel {
     /// been opened before, then goes to the filesystem for whatever the index
     /// does not know yet.
     private func reloadThenRescan() async {
-        guard let pass = beginPass() else { return }
+        guard let pass = beginScopePass() else { return }
         trimThumbnailCache()
         await reload(pass)
         await rescan(pass)
@@ -451,14 +503,17 @@ final class BrowserModel {
 
     /// Re-scans the current folder, then reloads the grid from the index.
     func refresh() async {
-        guard let pass = beginPass() else { return }
+        guard let pass = beginScopePass() else { return }
         await rescan(pass)
     }
 
     private func rescan(_ pass: Pass) async {
         // A pass that was superseded before it even started must not touch the
         // task belonging to the pass that replaced it.
-        guard isCurrent(pass) else { return }
+        //
+        // *Scope*, not query: a keystroke landing during the reload this pass
+        // just finished must not cancel the folder's scan before it starts.
+        guard isCurrentScope(pass) else { return }
 
         // Awaited, not cancel-and-forget. Today `IndexCoordinator.indexTier0`
         // is a synchronous actor method, so a superseded pass throws at its
@@ -472,7 +527,7 @@ final class BrowserModel {
             inFlight.cancel()
             await inFlight.value
         }
-        guard isCurrent(pass) else { return }
+        guard isCurrentScope(pass) else { return }
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -481,7 +536,7 @@ final class BrowserModel {
                                                       recursive: pass.includeSubfolders) {
                     [weak self] progress in
                     Task { @MainActor in
-                        guard let self, self.isCurrent(pass) else { return }
+                        guard let self, self.isCurrentScope(pass) else { return }
                         self.progress = progress
                     }
                 }
@@ -489,19 +544,23 @@ final class BrowserModel {
                 // Superseded. The pass that replaced this one owns the window.
                 return
             } catch IndexCoordinatorError.rootUnreadable(let path) {
-                guard self.isCurrent(pass) else { return }
+                guard self.isCurrentScope(pass) else { return }
                 self.status = .rootUnreadable(path: path)
                 self.progress = IndexProgress(phase: .idle)
                 return
             } catch {
-                guard self.isCurrent(pass) else { return }
+                guard self.isCurrentScope(pass) else { return }
                 self.status = .failed(error.localizedDescription)
                 self.progress = IndexProgress(phase: .idle)
                 return
             }
-            guard self.isCurrent(pass) else { return }
+            guard self.isCurrentScope(pass) else { return }
             self.status = .ok
-            await self.reload(pass)
+            // A *fresh* query pass, not `pass`: the scan may have taken
+            // minutes, and the filters the user set while it ran are the ones
+            // the grid should come back showing. Replaying `pass` would lose
+            // to the query guard and leave the newly indexed rows invisible.
+            await self.reload()
         }
         indexingTask = task
         await task.value
@@ -509,12 +568,12 @@ final class BrowserModel {
 
     /// Re-runs the query against the index without touching the filesystem.
     func reload() async {
-        guard let pass = beginPass() else { return }
+        guard let pass = beginQueryPass() else { return }
         await reload(pass)
     }
 
     private func reload(_ pass: Pass) async {
-        guard isCurrent(pass) else { return }
+        guard isCurrentQuery(pass) else { return }
         let query = Self.query(for: pass)
         // Only when a file-type filter is actually on: with none ticked the
         // two queries are identical, and a second aggregate per keystroke for
@@ -537,14 +596,14 @@ final class BrowserModel {
                                      byCamera: counts.byCamera,
                                      total: counts.total))
             }.value
-            guard isCurrent(pass) else { return }
+            guard isCurrentQuery(pass) else { return }
             setRecords(answer.0)
             facets = answer.1
         } catch {
             // Checked on the failure path too: a slow search that fails for a
             // folder the user has already left must not put an error banner
             // over a folder that opened fine.
-            guard isCurrent(pass) else { return }
+            guard isCurrentQuery(pass) else { return }
             setRecords([])
             facets = .empty
             status = .failed(error.localizedDescription)
@@ -558,7 +617,13 @@ final class BrowserModel {
     /// picks up whatever rows the first has not reached.
     func startHashingPass() {
         guard let root else { return }
-        let pass = Pass(token: generation, root: root,
+        // Neither counter is bumped: starting a hashing pass supersedes
+        // nothing. It snapshots the scope so navigating away stops its
+        // progress reports, and because it checks the *scope* token, typing in
+        // the search field no longer freezes its progress bar or swallows the
+        // `rootUnreadable` it needs to report.
+        let pass = Pass(scopeToken: scopeGeneration, queryToken: queryGeneration,
+                        root: root,
                         includeSubfolders: includeSubfolders, sort: sort,
                         searchText: searchText, extensions: selectedExtensions,
                         minimumWidth: minimumWidth)
@@ -568,18 +633,18 @@ final class BrowserModel {
             do {
                 try await self.coordinator.runHashingPass(root: pass.root) { [weak self] progress in
                     Task { @MainActor in
-                        guard let self, self.isCurrent(pass) else { return }
+                        guard let self, self.isCurrentScope(pass) else { return }
                         self.progress = progress
                     }
                 }
             } catch is CancellationError {
                 return
             } catch IndexCoordinatorError.rootUnreadable(let path) {
-                guard self.isCurrent(pass) else { return }
+                guard self.isCurrentScope(pass) else { return }
                 self.status = .rootUnreadable(path: path)
                 self.progress = IndexProgress(phase: .idle)
             } catch {
-                guard self.isCurrent(pass) else { return }
+                guard self.isCurrentScope(pass) else { return }
                 self.status = .failed(error.localizedDescription)
                 self.progress = IndexProgress(phase: .idle)
             }
