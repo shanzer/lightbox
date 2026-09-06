@@ -47,7 +47,10 @@ public struct Walker: Sendable {
     /// Directories whose contents are implementation detail of an application
     /// or library, never a user's photos. Descending into a `.photoslibrary`
     /// yields tens of thousands of derivative files and no useful originals.
-    private static let opaqueBundleExtensions: Set<String> = [
+    ///
+    /// Internal rather than private so `FolderNode` can hide exactly the same
+    /// directories in the sidebar that the walk refuses to descend into.
+    static let opaqueBundleExtensions: Set<String> = [
         "photoslibrary", "aplibrary", "migratedaplibrary", "lrdata", "lrcat",
         "app", "bundle", "framework", "photolibrary", "pkg",
     ]
