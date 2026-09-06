@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -48,18 +49,64 @@ struct LightboxApp: App {
             // mouse-only. Replacing `.pasteboard` yields a single item carrying
             // both. `MenuCommandTests` pins all of it.
             //
-            // The price is Cut, Copy, Paste and Delete, which go with the group
-            // and cannot be kept — SwiftUI replaces a `CommandGroup` whole.
-            // Free today because there is no text-entry surface for them to act
-            // on; `replacingThePasteboardGroupAlsoDropsCutCopyAndPaste` fails
-            // the moment that stops being true.
+            // SwiftUI replaces a `CommandGroup` whole, so Cut, Copy, Paste and
+            // Delete go with it and have to be rebuilt here. That was free
+            // while the app had no text-entry surface; Task 19 adds the search
+            // field, and a text field with a dead ⌘C is worse than no search
+            // field at all.
+            //
+            // Each is a plain `Button` that forwards to the responder chain
+            // with a `nil` target, which is exactly what the stock items do:
+            // AppKit walks first responder → window → app looking for
+            // something that implements the selector, and `NSTextView` does.
+            // The selectors are built with `Selector(("cut:"))` because
+            // `#selector(NSText.cut(_:))` and friends resolve against a
+            // concrete class this file has no business importing behaviour
+            // from, and the double parentheses are Swift's syntax for "yes, a
+            // string literal selector, I mean it".
+            //
+            // Deliberately *not* wired to `BrowserModel`: cutting a selection
+            // of photos is a phase 2 feature and needs a pasteboard
+            // representation that does not exist yet. Today these serve the
+            // search field only, which is what the responder chain gets right
+            // for free — when the field is not focused, nothing implements
+            // them and AppKit greys them out.
             CommandGroup(replacing: .pasteboard) {
+                Button("Cut") { Self.forwardToResponder("cut:") }
+                    .keyboardShortcut("x", modifiers: .command)
+                Button("Copy") { Self.forwardToResponder("copy:") }
+                    .keyboardShortcut("c", modifiers: .command)
+                Button("Paste") { Self.forwardToResponder("paste:") }
+                    .keyboardShortcut("v", modifiers: .command)
+                // No key equivalent, which is what AppKit's canonical Edit
+                // menu ships and is not an oversight. A bare ⌫ on a menu item
+                // is matched in `performKeyEquivalent`, *before* the focused
+                // view sees the event, so it would route every backspace in
+                // the search field to `delete:` — which deletes a selection
+                // and does nothing without one. Adding the shortcut would
+                // therefore break backspace in the field this whole group
+                // exists to serve.
+                Button("Delete") { Self.forwardToResponder("delete:") }
+
+                Divider()
+
                 Button("Select All") {
                     NotificationCenter.default.post(name: .selectAllPhotos, object: nil)
                 }
                 .keyboardShortcut("a", modifiers: .command)
             }
         }
+    }
+}
+
+extension LightboxApp {
+    /// Sends `name` down the responder chain from the key window.
+    ///
+    /// `to: nil` is the load-bearing part: a targeted send would need this
+    /// file to know which view is focused, which is the responder chain's job
+    /// and not an app-definition's.
+    static func forwardToResponder(_ name: String) {
+        NSApp.sendAction(Selector((name)), to: nil, from: nil)
     }
 }
 

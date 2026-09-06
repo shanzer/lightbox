@@ -354,6 +354,52 @@ public final class IndexStore: Sendable {
         try dbq.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM files")! }
     }
 
+    // MARK: - Facets
+
+    /// Counts for the filter panel, over the *whole* result set of `query`.
+    ///
+    /// Whole, not the page on screen: `query.limit` and `query.offset` are
+    /// ignored — `QueryCompiler.compileFilter` never emits them — because a
+    /// count that described only the visible page would tell the user that
+    /// ticking `.png` would find 3 files when it would find 3,000.
+    ///
+    /// A `NULL` or empty bucket is not a bucket. "How many files have no
+    /// camera" is a different question from "how many are from a Canon", it
+    /// has no filter control behind it in phase 1, and an unlabelled row in
+    /// the panel would be indistinguishable from a rendering bug.
+    ///
+    /// Throws whatever the compiler throws — `IndexStoreError.invalidScope`
+    /// for a scope that is empty or relative, and
+    /// `QueryCompilerError.predicateTooDeep` — rather than reporting zero
+    /// counts, because zero is a legitimate answer and must not double as an
+    /// error signal.
+    public func facets(for query: SearchQuery) throws -> Facets {
+        let filter = try QueryCompiler.compileFilter(query)
+        return try dbq.read { db in
+            // `column` is a compiler-side literal chosen below, never user
+            // text; every value in the query is still a bound parameter.
+            func counts(_ column: String) throws -> [String: Int] {
+                let sql = """
+                    SELECT \(column) AS bucket, count(*) AS n FROM files
+                    WHERE (\(filter.sql)) AND \(column) IS NOT NULL AND \(column) <> ''
+                    GROUP BY bucket
+                    """
+                var result: [String: Int] = [:]
+                for row in try Row.fetchAll(db, sql: sql, arguments: filter.arguments) {
+                    guard let bucket = row["bucket"] as String? else { continue }
+                    result[bucket] = row["n"] as Int? ?? 0
+                }
+                return result
+            }
+            let total = try Int.fetchOne(
+                db, sql: "SELECT count(*) FROM files WHERE \(filter.sql)",
+                arguments: filter.arguments) ?? 0
+            return Facets(byExtension: try counts("ext"),
+                          byCamera: try counts("camera_make"),
+                          total: total)
+        }
+    }
+
     // MARK: - Path scoping
 
     /// The one copy of the scope predicate. Production queries and the

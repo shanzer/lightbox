@@ -34,6 +34,12 @@ final class SearcherDelayingOneCall: RecordSearching, @unchecked Sendable {
         if call == target { Thread.sleep(forTimeInterval: delay) }
         return try store.search(query)
     }
+
+    /// Undelayed: `calls` counts searches, so the reload's aggregate must not
+    /// consume a slot and shift which search the test is holding up.
+    func facets(for query: SearchQuery) throws -> Facets {
+        try store.facets(for: query)
+    }
 }
 
 /// A `struct` suite so swift-testing builds a fresh instance per test and

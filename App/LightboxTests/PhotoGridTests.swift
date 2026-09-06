@@ -12,6 +12,7 @@ private final class ScriptedSearcher: RecordSearching, @unchecked Sendable {
     private let results: [[FileRecord]]
     private let lock = NSLock()
     private var calls = 0
+    private var lastReturned: [FileRecord] = []
 
     init(_ results: [[FileRecord]]) {
         precondition(!results.isEmpty)
@@ -23,7 +24,19 @@ private final class ScriptedSearcher: RecordSearching, @unchecked Sendable {
         defer { lock.unlock() }
         let index = min(calls, results.count - 1)
         calls += 1
+        lastReturned = results[index]
         return results[index]
+    }
+
+    /// Derived from the rows the *same* reload's search just returned, not
+    /// from the next entry in the script: a reload asks for the rows and then
+    /// for their breakdown, so counting off the script position would have the
+    /// panel describing a page the grid is not showing.
+    func facets(for query: SearchQuery) throws -> Facets {
+        let rows = lock.withLock { lastReturned }
+        return Facets(byExtension: rows.reduce(into: [:]) { $0[$1.ext, default: 0] += 1 },
+                      byCamera: [:],
+                      total: rows.count)
     }
 }
 

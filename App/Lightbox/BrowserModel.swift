@@ -13,6 +13,13 @@ import LightboxCore
 /// search returns. Production always passes the real `IndexStore`.
 protocol RecordSearching: Sendable {
     func search(_ query: SearchQuery) throws -> [FileRecord]
+
+    /// The breakdown of the same result set, for the filter panel. On the
+    /// protocol rather than taken straight off the store so that the seam
+    /// covers a reload whole: a test that holds up one reload holds up its
+    /// facets with it, and cannot accidentally certify an ordering guarantee
+    /// that the counts do not share.
+    func facets(for query: SearchQuery) throws -> Facets
 }
 
 extension IndexStore: RecordSearching {}
@@ -75,6 +82,13 @@ final class BrowserModel {
         let root: URL
         let includeSubfolders: Bool
         let sort: SearchQuery.Sort
+        /// The filter state, snapshotted with everything else. A search that
+        /// suspends and then rebuilt its query from `self.searchText` would
+        /// query for whatever the user has typed *since* — which under a
+        /// debounce is routinely a different string.
+        let searchText: String
+        let extensions: Set<String>
+        let minimumWidth: Double?
     }
 
     private(set) var records: [FileRecord] = []
@@ -113,6 +127,141 @@ final class BrowserModel {
             guard sort != oldValue else { return }
             Task { await reload() }
         }
+    }
+
+    // MARK: - Filters
+
+    /// How the current result set breaks down, for the filter panel.
+    ///
+    /// Always describes the *whole* result set, never the page on screen —
+    /// see `IndexStore.facets(for:)`. Reset to `.empty` on a failed reload
+    /// rather than left standing, because stale counts next to an empty grid
+    /// are worse than no counts.
+    private(set) var facets: Facets = .empty
+
+    /// Filename search. Debounced — see `searchDebounce`.
+    var searchText = "" {
+        didSet {
+            guard searchText != oldValue else { return }
+            filtersChanged(debounced: true)
+        }
+    }
+
+    /// Extensions ticked in the filter panel. Empty means "no file-type
+    /// filter", not "match nothing".
+    var selectedExtensions: Set<String> = [] {
+        didSet {
+            guard selectedExtensions != oldValue else { return }
+            filtersChanged(debounced: false)
+        }
+    }
+
+    var minimumWidth: Double? {
+        didSet {
+            guard minimumWidth != oldValue else { return }
+            filtersChanged(debounced: false)
+        }
+    }
+
+    var hasActiveFilters: Bool {
+        !searchText.isEmpty || !selectedExtensions.isEmpty || minimumWidth != nil
+    }
+
+    /// Set while `clearFilters()` assigns all three filters, so the three
+    /// `didSet`s do not start three passes for one button press. Only ever
+    /// true within one synchronous stretch on the main actor, so nothing can
+    /// observe it half-set.
+    private var suppressFilterReload = false
+
+    private func filtersChanged(debounced: Bool) {
+        guard !suppressFilterReload else { return }
+        // A tick or a menu choice is one deliberate gesture, not a stream of
+        // them, so it reloads at once where a keystroke waits.
+        scheduleReload(after: debounced ? searchDebounce : .zero)
+    }
+
+    /// Clears every filter, in one reload rather than three.
+    func clearFilters() {
+        guard hasActiveFilters else { return }
+        suppressFilterReload = true
+        searchText = ""
+        selectedExtensions = []
+        minimumWidth = nil
+        suppressFilterReload = false
+        scheduleReload(after: .zero)
+    }
+
+    // MARK: - Search debounce
+
+    /// How long the search field waits after the last keystroke before it
+    /// queries.
+    ///
+    /// A reload is a search plus one or two aggregates, and Task 18 measured a
+    /// `width >= 1920` search over 50,000 rows at ~474 ms — dominated by row
+    /// materialisation, so the aggregates are much cheaper than the search but
+    /// none of it is free. Querying per character would leave a keystroke's
+    /// worth of work queued behind every other keystroke; 250 ms is below the
+    /// threshold where a filter feels laggy and above a fast typist's
+    /// inter-key interval, so a typed word costs one reload rather than five.
+    ///
+    /// Settable so a test can drive it to zero. Nothing in the UI changes it.
+    var searchDebounce: Duration = .milliseconds(250)
+
+    /// The one reload a filter change has outstanding.
+    ///
+    /// Single, and cancelled before a replacement is scheduled, so a change to
+    /// each of the three filters in a row costs one reload rather than three
+    /// racing ones. Three independent `Task`s would also complete in arbitrary
+    /// order, and while the generation guard means the *newest* pass always
+    /// wins the grid, whichever pass was newest would be decided by the
+    /// scheduler rather than by what the user did last.
+    private var pendingReloadTask: Task<Void, Never>?
+
+    private func scheduleReload(after interval: Duration) {
+        pendingReloadTask?.cancel()
+        pendingReloadTask = Task { [weak self] in
+            if interval > .zero {
+                try? await Task.sleep(for: interval)
+                // Cancellation is the common case — the user typed another
+                // character — and must not go on to run the superseded query.
+                guard !Task.isCancelled else { return }
+            }
+            await self?.reload()
+        }
+    }
+
+    /// Awaits the reload a filter change has outstanding, if any.
+    ///
+    /// Exists for tests: a filter change is deliberately fire-and-forget for
+    /// the UI, and a test that slept for the debounce instead would be
+    /// asserting on the scheduler.
+    func waitForPendingSearch() async { await pendingReloadTask?.value }
+
+    /// The query the window is currently showing.
+    ///
+    /// `applyingExtensionFilter: false` builds the same query with the
+    /// file-type ticks left out. That is what the extension facet is counted
+    /// over, and it is not an approximation: counting extensions under the
+    /// extension filter leaves `byExtension` holding only the types already
+    /// ticked, so every other type vanishes from the panel and the filter
+    /// becomes a one-way door — tick `jpg` and there is no longer a `png` row
+    /// to tick. Every other constraint still applies, so the counts still
+    /// answer "how many would ticking this find".
+    private static func query(for pass: Pass,
+                              applyingExtensionFilter: Bool = true) -> SearchQuery {
+        var parts: [SearchPredicate] = []
+        // Whitespace-only text is not empty but is not a filter either;
+        // `FTS5Query.sanitize` resolves that, and `.noSearchableTerms` — text
+        // that survives as nothing — deliberately matches nothing.
+        if !pass.searchText.isEmpty { parts.append(.filenameText(pass.searchText)) }
+        if applyingExtensionFilter, !pass.extensions.isEmpty {
+            parts.append(.fileExtension(pass.extensions))
+        }
+        if let minimumWidth = pass.minimumWidth { parts.append(.width(.atLeast(minimumWidth))) }
+        return SearchQuery(scope: .folder(path: pass.root.path,
+                                          recursive: pass.includeSubfolders),
+                           predicate: parts.isEmpty ? .all : .and(parts),
+                           sort: pass.sort)
     }
 
     private let store: IndexStore
@@ -191,6 +340,19 @@ final class BrowserModel {
         selection.selectAll(order)
     }
 
+    /// The selected rows, in display order, for the inspector.
+    ///
+    /// Derived here rather than in the view so the filter runs once per
+    /// change instead of once per body evaluation, and short-circuited on an
+    /// empty selection: no selection is the common case and a linear pass over
+    /// 50,000 records to produce an empty array is pure waste.
+    var selectedRecords: [FileRecord] {
+        guard !selection.selected.isEmpty else { return [] }
+        return records.filter { record in
+            record.id.map(selection.selected.contains) ?? false
+        }
+    }
+
     // MARK: - Generations
 
     /// Invalidates everything in flight and returns the snapshot that replaces
@@ -199,7 +361,9 @@ final class BrowserModel {
         generation += 1
         guard let root else { return nil }
         return Pass(token: generation, root: root,
-                    includeSubfolders: includeSubfolders, sort: sort)
+                    includeSubfolders: includeSubfolders, sort: sort,
+                    searchText: searchText, extensions: selectedExtensions,
+                    minimumWidth: minimumWidth)
     }
 
     private func isCurrent(_ pass: Pass) -> Bool { pass.token == generation }
@@ -351,24 +515,38 @@ final class BrowserModel {
 
     private func reload(_ pass: Pass) async {
         guard isCurrent(pass) else { return }
-        let query = SearchQuery(scope: .folder(path: pass.root.path,
-                                               recursive: pass.includeSubfolders),
-                                sort: pass.sort)
+        let query = Self.query(for: pass)
+        // Only when a file-type filter is actually on: with none ticked the
+        // two queries are identical, and a second aggregate per keystroke for
+        // an identical answer is not worth paying for.
+        let unfilteredByExtension = pass.extensions.isEmpty
+            ? nil
+            : Self.query(for: pass, applyingExtensionFilter: false)
         let searcher = self.searcher
         do {
             // Off the main actor: the index can hold hundreds of thousands of
             // rows and the window must not freeze while SQLite answers.
-            let rows = try await Task.detached(priority: .userInitiated) {
-                try searcher.search(query)
+            let answer = try await Task.detached(priority: .userInitiated) {
+                let rows = try searcher.search(query)
+                let counts = try searcher.facets(for: query)
+                guard let unfilteredByExtension else { return (rows, counts) }
+                // `total` and the camera breakdown describe what is on screen;
+                // only the file-type buckets come from the wider query.
+                let wider = try searcher.facets(for: unfilteredByExtension)
+                return (rows, Facets(byExtension: wider.byExtension,
+                                     byCamera: counts.byCamera,
+                                     total: counts.total))
             }.value
             guard isCurrent(pass) else { return }
-            setRecords(rows)
+            setRecords(answer.0)
+            facets = answer.1
         } catch {
             // Checked on the failure path too: a slow search that fails for a
             // folder the user has already left must not put an error banner
             // over a folder that opened fine.
             guard isCurrent(pass) else { return }
             setRecords([])
+            facets = .empty
             status = .failed(error.localizedDescription)
         }
     }
@@ -381,7 +559,9 @@ final class BrowserModel {
     func startHashingPass() {
         guard let root else { return }
         let pass = Pass(token: generation, root: root,
-                        includeSubfolders: includeSubfolders, sort: sort)
+                        includeSubfolders: includeSubfolders, sort: sort,
+                        searchText: searchText, extensions: selectedExtensions,
+                        minimumWidth: minimumWidth)
         hashingTask?.cancel()
         hashingTask = Task { [weak self] in
             guard let self else { return }

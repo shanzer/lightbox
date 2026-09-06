@@ -9,18 +9,33 @@ struct BrowserView: View {
         Group {
             if let model {
                 NavigationSplitView {
-                    FolderTreeView(model: model)
-                        .navigationSplitViewColumnWidth(min: 200, ideal: 260)
-                } detail: {
+                    // The tree and the filters share one column: they are both
+                    // "what am I looking at", and a third split would leave
+                    // the grid — the point of the window — with the least
+                    // room of the three.
                     VStack(spacing: 0) {
-                        PathBarView(model: model)
+                        FolderTreeView(model: model)
                         Divider()
-                        PhotoGridView(records: model.records,
-                                      order: model.order,
-                                      cache: model.thumbnails,
-                                      selection: Bindable(model).selection,
-                                      thumbnailSide: model.thumbnailSide)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        FilterPanelView(model: model)
+                            .frame(maxHeight: 420)
+                    }
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 280)
+                } detail: {
+                    HSplitView {
+                        VStack(spacing: 0) {
+                            PathBarView(model: model)
+                            Divider()
+                            PhotoGridView(records: model.records,
+                                          order: model.order,
+                                          cache: model.thumbnails,
+                                          selection: Bindable(model).selection,
+                                          thumbnailSide: model.thumbnailSide)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .frame(minWidth: 320)
+
+                        InspectorView(records: model.selectedRecords)
+                            .frame(minWidth: 240, idealWidth: 300)
                     }
                 }
             } else if let loadError {

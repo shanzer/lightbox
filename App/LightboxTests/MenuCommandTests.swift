@@ -105,17 +105,79 @@ struct MenuCommandTests {
         }
     }
 
-    /// The cost of `replacing: .pasteboard`, pinned so it is a decision and not
-    /// a surprise: Cut, Copy, Paste and Delete go with it.
+    /// The price of `replacing: .pasteboard` is that Cut, Copy, Paste and
+    /// Delete go with the group; Task 19 pays it back by hand.
     ///
-    /// Acceptable today because the app has no text-entry surface for them to
-    /// act on. The moment one is added — a rename field, a search box — this
-    /// test fails and forces the question to be re-answered rather than letting
-    /// a text field ship without ⌘X/⌘C/⌘V.
-    @Test func replacingThePasteboardGroupAlsoDropsCutCopyAndPaste() throws {
+    /// This test used to assert the opposite — that the four were gone —
+    /// which was the right call while the app had no text-entry surface for
+    /// them to act on. Task 19 adds the search field, so the assertion is
+    /// inverted rather than deleted: a text field shipping without ⌘X/⌘C/⌘V
+    /// is exactly the regression the original was written to catch.
+    @Test func thePasteboardItemsAreRebuiltAlongsideSelectAll() throws {
         let edit = try #require(editMenu(), "the app's main menu was never installed")
-        let titles = Set(edit.items.map(\.title))
-        #expect(titles.isDisjoint(with: ["Cut", "Copy", "Paste", "Delete"]),
-                "the pasteboard items are back, so the group is no longer being replaced")
+        let titles = edit.items.map(\.title)
+        for expected in ["Cut", "Copy", "Paste", "Delete"] {
+            #expect(titles.contains(expected),
+                    "\(expected) is missing; Edit holds \(titles)")
+            #expect(titles.filter { $0 == expected }.count == 1,
+                    "\(expected) appears more than once, so two items share one shortcut")
+        }
+    }
+
+    /// Each rebuilt item carries the shortcut its stock counterpart had, and
+    /// an action that can actually reach a text field.
+    ///
+    /// The shortcut and the action are asserted together for the same reason
+    /// `selectAllCarriesBothItsActionAndItsShortcut` does: an item with one
+    /// and not the other is the broken state, and it looks fine in a
+    /// screenshot.
+    ///
+    /// Delete deliberately has no key equivalent — see `LightboxApp`. A bare
+    /// ⌫ in the menu bar is matched before the focused view sees the event,
+    /// so it would break backspace in the search field.
+    @Test func theRebuiltPasteboardItemsCarryTheirShortcuts() throws {
+        let edit = try #require(editMenu(), "the app's main menu was never installed")
+        let expected: [String: String] = ["Cut": "x", "Copy": "c", "Paste": "v", "Delete": ""]
+        for (title, key) in expected {
+            let item = try #require(edit.items.first { $0.title == title },
+                                    "\(title) is missing from the Edit menu")
+            #expect(item.keyEquivalent == key,
+                    "\(title) has key equivalent '\(item.keyEquivalent)', expected '\(key)'")
+            #expect(item.keyEquivalentModifierMask == (key.isEmpty ? [] : .command))
+            #expect(item.action != nil,
+                    "\(title) has no action, so the menu item does nothing when chosen")
+        }
+    }
+
+    /// The forwarding is to the responder chain, not to a hard-coded target.
+    ///
+    /// `NSApp.sendAction(_:to:nil)` is what lets the focused `NSTextView`
+    /// answer ⌘C while the grid — which implements none of these — leaves the
+    /// items greyed out. A version wired to `BrowserModel` would either steal
+    /// ⌘C from the search field or need to reimplement text editing.
+    @Test func cutCopyAndPasteReachAFocusedTextFieldThroughTheResponderChain() throws {
+        let field = NSTextField(string: "beach")
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 40),
+                              styleMask: [.titled], backing: .buffered, defer: true)
+        window.contentView?.addSubview(field)
+        window.makeFirstResponder(field)
+        let editor = try #require(field.currentEditor() as? NSTextView,
+                                  "the field never became first responder")
+
+        // Round-trips through the real pasteboard, so this fails if the
+        // selectors the menu forwards are not the ones text editing answers.
+        editor.selectAll(nil)
+        NSPasteboard.general.clearContents()
+        editor.perform(Selector(("copy:")), with: nil)
+        #expect(NSPasteboard.general.string(forType: .string) == "beach")
+
+        editor.setSelectedRange(NSRange(location: 5, length: 0))
+        editor.perform(Selector(("paste:")), with: nil)
+        #expect(field.stringValue == "beachbeach")
+
+        editor.selectAll(nil)
+        editor.perform(Selector(("cut:")), with: nil)
+        #expect(field.stringValue.isEmpty)
+        #expect(NSPasteboard.general.string(forType: .string) == "beachbeach")
     }
 }

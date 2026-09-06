@@ -14,6 +14,32 @@ struct PathBarView: View {
 
                 Spacer(minLength: 12)
 
+                // Bound straight to `searchText`; the debounce lives in the
+                // model, so the field stays responsive per keystroke while
+                // the index is queried once per pause.
+                TextField("Search filenames", text: $model.searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 200)
+                    .help("Matches file names. The last word is a prefix, so \"bea\" finds \"beach\".")
+
+                Picker("Sort", selection: $model.sort.field) {
+                    ForEach(SearchQuery.SortField.allCases, id: \.self) { field in
+                        Text(Self.title(for: field)).tag(field)
+                    }
+                }
+                .frame(width: 150)
+
+                // Separate from the field, not two entries per field in one
+                // menu: the direction is orthogonal to what is being sorted,
+                // and doubling the menu makes both harder to scan.
+                Button {
+                    model.sort.ascending.toggle()
+                } label: {
+                    Image(systemName: model.sort.ascending
+                          ? "arrow.up" : "arrow.down")
+                }
+                .help(model.sort.ascending ? "Ascending" : "Descending")
+
                 progressIndicator
 
                 // Resizes cells continuously. The thumbnails behind them are
@@ -38,6 +64,20 @@ struct PathBarView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    /// `SortField.rawValue` is a Swift identifier — `captureDate` — and the
+    /// menu is read by a person, so the two are kept apart rather than
+    /// showing camelCase in the UI.
+    private static func title(for field: SearchQuery.SortField) -> String {
+        switch field {
+        case .name: "Name"
+        case .captureDate: "Date Taken"
+        case .modifiedDate: "Date Modified"
+        case .size: "File Size"
+        case .width: "Width"
+        case .height: "Height"
+        }
     }
 
     /// Driven by `phase`, never by `fraction`.

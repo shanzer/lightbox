@@ -26,13 +26,38 @@ public enum QueryCompilerError: Error, Equatable, Sendable {
 /// relative — the realistic source is a stale persisted setting, which must
 /// surface as an error rather than silently searching nothing.
 public enum QueryCompiler {
+    /// Just the half of a query that decides *which* rows match: scope AND
+    /// predicate, as a boolean expression with no `SELECT`, no `ORDER BY` and
+    /// no `LIMIT` around it.
+    ///
+    /// Exists for aggregates — `IndexStore.facets(for:)` — which have to
+    /// describe the whole result set. Reusing `compile(_:)` and wrapping it in
+    /// `SELECT ... FROM (...)` would carry the query's `LIMIT` into the
+    /// aggregate, so the counts would describe only the page on screen; it
+    /// would also drag an `ORDER BY` through a subquery whose order nothing
+    /// can observe. Returning the predicate on its own makes both impossible
+    /// by construction rather than by remembering to clear two fields.
+    ///
+    /// `sort`, `limit` and `offset` on `query` are ignored, not rejected: the
+    /// caller passes the query it is showing, and clearing them itself would
+    /// be ceremony for a value this never reads.
+    public static func compileFilter(_ query: SearchQuery) throws -> CompiledQuery {
+        var arguments: [DatabaseValueConvertible?] = []
+        let sql = try filter(query, &arguments)
+        return CompiledQuery(sql: sql, arguments: StatementArguments(arguments))
+    }
+
+    private static func filter(_ query: SearchQuery,
+                               _ arguments: inout [DatabaseValueConvertible?]) throws -> String {
+        let scopeClause = try scope(query.scope, &arguments)
+        let predicateClause = try condition(query.predicate, depth: 0, &arguments)
+        return "(\(scopeClause)) AND (\(predicateClause))"
+    }
+
     public static func compile(_ query: SearchQuery) throws -> CompiledQuery {
         var arguments: [DatabaseValueConvertible?] = []
 
-        let scopeClause = try scope(query.scope, &arguments)
-        let predicateClause = try condition(query.predicate, depth: 0, &arguments)
-
-        var sql = "SELECT * FROM files WHERE (\(scopeClause)) AND (\(predicateClause))"
+        var sql = "SELECT * FROM files WHERE " + (try filter(query, &arguments))
         sql += " ORDER BY \(orderBy(query.sort))"
         switch (query.limit, query.offset) {
         case (nil, nil):
