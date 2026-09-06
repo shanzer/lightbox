@@ -264,7 +264,15 @@ Tier 1 is `content_hash`, `image_hash`, and the perceptual hash together. All
 three require reading the file's bytes, and the perceptual hash additionally
 requires a decode, so they belong in the same explicitly started, resumable
 background pass rather than on the folder-open path. Both SHA-256 hashes are
-computed from a single memory mapping, so the file is read once.
+computed from a single read through `ContentHasher`, so the file is read once —
+a format with an image-hash rule is read whole and both digests come off that
+buffer, and one without a rule is streamed for its content hash alone.
+
+That read is deliberately *not* a memory mapping, which an earlier draft of this
+spec called for: on a failing external volume — exactly the hardware tier 1 is
+built to grind through — a mid-read I/O error reaches a mapped buffer as
+`SIGBUS`, an uncatchable fault that takes the whole app down, where the same
+error on a `read(2)` comes back as `EIO` for the pass to record and move past.
 
 Tier 2 (Vision) and tier 3 (CLIP) are likewise explicitly started, with visible
 progress and a pause control. The user is never surprised by an hour of CPU or

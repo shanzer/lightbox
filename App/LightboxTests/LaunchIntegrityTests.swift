@@ -28,6 +28,25 @@ struct LaunchIntegrityTests {
     /// this would only be testing that a throw is treated as corrupt — see
     /// `Core`'s `aDamagedTablePageIsReportedCorrupt` for why a header smash
     /// does not do that on this SQLite build.
+    ///
+    /// **`store` is deliberately left open, and this is not a leak.** Closing
+    /// the seeding connection before smashing the file made `checkIntegrity()`
+    /// report `.ok` on some runs, on a file whose bytes were verified changed —
+    /// which looks like a bug and is not one. SQLite pages carry no content
+    /// checksums, and `PRAGMA quick_check` validates page *structure*: the
+    /// b-tree header, the cell pointer array, the freeblock chain. Whether the
+    /// `0x7F` run written at +50 into each 4096-byte page lands in those bytes
+    /// (detected) or in the middle of a cell's payload (undetectable by any
+    /// pragma, because nothing records what the payload should have been)
+    /// depends on where the page boundaries fall — which shifts with FTS5
+    /// segment state, and therefore with the row count, the tokenizer's output
+    /// and whatever the last connection flushed. `.ok` on bytes that really
+    /// were corrupted is the expected answer some of the time.
+    ///
+    /// So do not re-investigate this, and do not "fix" it by making the check
+    /// stricter: real torn-page and truncated-write corruption damages
+    /// structure, which is what `quick_check` is for. Leaving `store` open is
+    /// the cheapest way to pin the page layout the smash was tuned against.
     @Test func aCorruptIndexIsRebuiltRatherThanLeavingTheAppUnableToLaunch() throws {
         let url = tree.root.appendingPathComponent("index.sqlite")
         let store = try IndexStore(url: url)

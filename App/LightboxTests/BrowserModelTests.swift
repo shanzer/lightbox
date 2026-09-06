@@ -207,3 +207,84 @@ struct BrowserModelTests {
         #expect(BrowserModel.Status.ok.message == nil)
     }
 }
+
+/// The tier 1 pause control.
+///
+/// The spec requires tier 1 to have "visible progress and a pause control", and
+/// the machinery for it is `Core`'s — see `HashingPassTests`. What is asserted
+/// here is the part the window owns: that the model's own paused flag tracks
+/// the coordinator, that a paused pass really does no work, and that resuming
+/// finishes the folder. Without it, a hashing pass started over a large
+/// external drive can only be stopped by quitting the app.
+@MainActor
+struct HashingPauseTests {
+    let tree: TempDirectory
+
+    init() throws {
+        tree = try TempDirectory()
+    }
+
+    private func folderOfFiles(_ name: String, count: Int) throws -> URL {
+        let folder = try tree.directory(name)
+        for index in 0..<count { _ = try tree.file("\(name)/img\(index).jpg") }
+        return folder
+    }
+
+    /// Paused *before* the pass starts, so the batch boundary it stops at is
+    /// the first one. Pausing a pass already in flight would make the
+    /// assertion a race against how many batches got through first — `Core`'s
+    /// `pauseStopsAPassMidFlightAndResumeContinuesIt` covers that shape with a
+    /// gate this layer does not have.
+    @Test func aPausedPassDoesNoWorkAndResumingFinishesTheFolder() async throws {
+        let fileCount = 20
+        let folder = try folderOfFiles("photos", count: fileCount)
+        let store = try IndexStore.inMemory()
+        let model = BrowserModel(store: store)
+        await model.open(folder)
+        #expect(try store.countMissingHashes(under: folder.path) == fileCount)
+
+        await model.pauseHashing()
+        #expect(model.isHashingPaused)
+        #expect(model.isHashingActive,
+                "the control has to stay enabled or the pause cannot be undone")
+
+        model.startHashingPass()
+        await model.waitForHashingPass()
+
+        #expect(model.progress.phase == .paused)
+        #expect(model.progress.completed == 0)
+        #expect(model.progress.total == fileCount, "the pass still counted the work it declined")
+        #expect(try store.countMissingHashes(under: folder.path) == fileCount,
+                "a paused pass hashed files anyway")
+
+        await model.resumeHashing()
+        #expect(!model.isHashingPaused)
+        await model.waitForHashingPass()
+
+        #expect(model.progress.phase == .finished)
+        #expect(model.progress.completed == fileCount)
+        #expect(try store.countMissingHashes(under: folder.path) == 0)
+    }
+
+    /// A folder with no pass running has nothing to pause, so the control is
+    /// off — and a finished pass turns it off again rather than leaving a
+    /// button that does nothing.
+    @Test func thePauseControlIsOffExceptWhileThereIsAPassToStop() async throws {
+        let folder = try folderOfFiles("photos", count: 5)
+        let model = BrowserModel(store: try IndexStore.inMemory())
+        #expect(!model.isHashingActive, "nothing is open, so there is nothing to pause")
+
+        await model.open(folder)
+        #expect(!model.isHashingActive, "tier 0 is not the pass this control stops")
+
+        model.startHashingPass()
+        // Synchronous, not awaited: the control must be live from the click
+        // that starts the pass, not from the progress callback after it.
+        #expect(model.isHashingActive)
+
+        await model.waitForHashingPass()
+        #expect(model.progress.phase == .finished)
+        #expect(!model.isHashingActive)
+        #expect(!model.isHashingPaused)
+    }
+}

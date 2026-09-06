@@ -375,4 +375,85 @@ struct IndexStoreTests {
         let reopened = try IndexStore(url: url)
         #expect(try reopened.count() == 1)
     }
+
+    // MARK: - Two windows, one file
+
+    /// File → New Window is free with `WindowGroup`, and each window builds its
+    /// own `IndexStore` on the same `index.sqlite`. GRDB's default busy mode
+    /// hands `SQLITE_BUSY` to the second connection the instant the first holds
+    /// the write lock; the configured busy timeout makes it wait instead.
+    ///
+    /// The lock is *held* rather than raced for, so this fails on every run
+    /// without the timeout rather than on the unlucky ones.
+    @Test func aWriteWaitsForAnotherConnectionsLockRatherThanFailingBusy() throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let store = try IndexStore(url: url)
+        // Created up front so the holder only has to INSERT: a CREATE TABLE
+        // inside the held transaction would change the schema under the
+        // connection being tested and muddy what the wait is being blamed on.
+        try store.testExecute(sql: "CREATE TABLE busy_probe (x)")
+
+        let locked = DispatchSemaphore(value: 0)
+        let holdTime = 0.3
+        let path = url.path
+        // A plain thread, not a `Task`: the holder blocks for the whole hold,
+        // and blocking a cooperative-pool thread in order to test a blocking
+        // API is how a test deadlocks its own executor.
+        Thread.detachNewThread {
+            guard let holder = try? DatabaseQueue(path: path) else { return }
+            try? holder.write { db in
+                // The write statement is what takes the RESERVED lock. Opening
+                // a deferred transaction and sleeping would block nobody.
+                try db.execute(sql: "INSERT INTO busy_probe (x) VALUES (1)")
+                locked.signal()
+                Thread.sleep(forTimeInterval: holdTime)
+            }
+        }
+        if case .timedOut = locked.wait(timeout: .now() + 10) {
+            Issue.record("the holding connection never took the write lock")
+            return
+        }
+
+        let started = Date()
+        // The assertion is that this does not throw. Without the busy timeout
+        // it throws SQLITE_BUSY before the holder has let go.
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg"))
+        let waited = Date().timeIntervalSince(started)
+        #expect(try store.count() == 1)
+        // And it genuinely had to wait, so a pass here cannot mean the lock had
+        // already been released before the write was attempted.
+        #expect(waited > holdTime / 2, "the write did not wait for the lock (\(waited)s)")
+    }
+
+    /// The same thing from the app's angle: two live stores on one file, both
+    /// reading and writing, neither throwing.
+    @Test func twoStoresOnOneFileBothWorkWithoutThrowing() async throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let one = try IndexStore(url: url)
+        let two = try IndexStore(url: url)
+        let query = SearchQuery(scope: .everywhere, predicate: .all)
+
+        // Detached and concurrent, because a serialised pair would contend for
+        // nothing: `DatabaseQueue` only serialises its *own* connection.
+        async let firstWindow: Void = Task.detached {
+            for i in 0..<100 {
+                _ = try one.upsert(sampleRecord(path: "/one/\(i).jpg"))
+                _ = try one.search(query)
+            }
+        }.value
+        async let secondWindow: Void = Task.detached {
+            for i in 0..<100 {
+                _ = try two.upsert(sampleRecord(path: "/two/\(i).jpg"))
+                _ = try two.facets(for: query)
+            }
+        }.value
+
+        // A throw from either window fails the test here rather than being
+        // swallowed; the counts are asserted afterwards, once both are done,
+        // because a count taken mid-flight would race the other window.
+        try await firstWindow
+        try await secondWindow
+        #expect(try one.count() == 200)
+        #expect(try two.count() == 200)
+    }
 }

@@ -95,6 +95,10 @@ final class BrowserModel {
         let searchText: String
         let extensions: Set<String>
         let minimumWidth: Double?
+        /// Snapshotted as the pair the query is built from, not as two
+        /// independent fields, because a half-entered pair is not a filter —
+        /// see `exactDimensions`.
+        let exactDimensions: (width: Int, height: Int)?
     }
 
     private(set) var records: [FileRecord] = []
@@ -175,13 +179,48 @@ final class BrowserModel {
         }
     }
 
-    var hasActiveFilters: Bool {
-        !searchText.isEmpty || !selectedExtensions.isEmpty || minimumWidth != nil
+    /// The two halves of the exact-dimensions filter.
+    ///
+    /// Separate stored properties rather than one optional pair because the
+    /// panel has two fields and the user fills them one at a time; the pair is
+    /// reassembled by `exactDimensions`, which is what the query is built from.
+    /// Debounced like the search field and unlike the ticks and the width menu:
+    /// typing `200` is three keystrokes, so an undebounced field would issue a
+    /// query for `2`, one for `20`, and one for the number actually wanted.
+    var exactWidth: Int? {
+        didSet {
+            guard exactWidth != oldValue else { return }
+            filtersChanged(debounced: true)
+        }
     }
 
-    /// Set while `clearFilters()` assigns all three filters, so the three
-    /// `didSet`s do not start three passes for one button press. Only ever
-    /// true within one synchronous stretch on the main actor, so nothing can
+    var exactHeight: Int? {
+        didSet {
+            guard exactHeight != oldValue else { return }
+            filtersChanged(debounced: true)
+        }
+    }
+
+    /// The exact-dimensions filter, or `nil` while it is not fully specified.
+    ///
+    /// Both halves or neither. A width with no height cannot be turned into
+    /// `.exactDimensions`, and quietly reinterpreting it as `width == n` would
+    /// mean the grid narrowed the moment the first field was filled and then
+    /// changed meaning when the second one was — so a half-entered pair filters
+    /// nothing and the panel says so.
+    var exactDimensions: (width: Int, height: Int)? {
+        guard let exactWidth, let exactHeight else { return nil }
+        return (exactWidth, exactHeight)
+    }
+
+    var hasActiveFilters: Bool {
+        !searchText.isEmpty || !selectedExtensions.isEmpty || minimumWidth != nil
+            || exactWidth != nil || exactHeight != nil
+    }
+
+    /// Set while `clearFilters()` assigns every filter, so the `didSet`s do
+    /// not start one pass each for a single button press. Only ever true
+    /// within one synchronous stretch on the main actor, so nothing can
     /// observe it half-set.
     private var suppressFilterReload = false
 
@@ -199,6 +238,8 @@ final class BrowserModel {
         searchText = ""
         selectedExtensions = []
         minimumWidth = nil
+        exactWidth = nil
+        exactHeight = nil
         suppressFilterReload = false
         scheduleReload(after: .zero)
     }
@@ -273,6 +314,14 @@ final class BrowserModel {
             parts.append(.fileExtension(pass.extensions))
         }
         if let minimumWidth = pass.minimumWidth { parts.append(.width(.atLeast(minimumWidth))) }
+        // Appended alongside the others rather than replacing them: an exact
+        // size composes with a search, a file type and a minimum width, and the
+        // combination is `.and`-ed like every other pair of filters. (A minimum
+        // width above the exact width then matches nothing, which is the
+        // honest answer to a contradictory pair of filters.)
+        if let exact = pass.exactDimensions {
+            parts.append(.exactDimensions(width: exact.width, height: exact.height))
+        }
         return SearchQuery(scope: .folder(path: pass.root.path,
                                           recursive: pass.includeSubfolders),
                            predicate: parts.isEmpty ? .all : .and(parts),
@@ -444,7 +493,7 @@ final class BrowserModel {
                     root: root,
                     includeSubfolders: includeSubfolders, sort: sort,
                     searchText: searchText, extensions: selectedExtensions,
-                    minimumWidth: minimumWidth)
+                    minimumWidth: minimumWidth, exactDimensions: exactDimensions)
     }
 
     /// Checked by everything that touches the filesystem or reports on it:
@@ -662,17 +711,30 @@ final class BrowserModel {
                         root: root,
                         includeSubfolders: includeSubfolders, sort: sort,
                         searchText: searchText, extensions: selectedExtensions,
-                        minimumWidth: minimumWidth)
+                        minimumWidth: minimumWidth, exactDimensions: exactDimensions)
         hashingTask?.cancel()
+        // Set here rather than left to the first progress callback, which
+        // arrives after a hop to the main actor: without it the pause control
+        // stays disabled for the round trip after the button that starts the
+        // pass was pressed, which reads as the pause button being broken.
+        progress = IndexProgress(phase: .hashing)
         hashingTask = Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.coordinator.runHashingPass(root: pass.root) { [weak self] progress in
+                let final = try await self.coordinator.runHashingPass(root: pass.root) { [weak self] progress in
                     Task { @MainActor in
                         guard let self, self.isCurrentScope(pass) else { return }
                         self.progress = progress
                     }
                 }
+                // Assigned here too, and not only from the callback: the
+                // callback hops to the main actor through a `Task`, so the
+                // pass's terminal state — `.finished`, or `.paused` — would
+                // otherwise land whenever that task happened to be scheduled,
+                // which for anything awaiting this pass is after it has already
+                // been told the pass is over.
+                guard self.isCurrentScope(pass) else { return }
+                self.progress = final
             } catch is CancellationError {
                 return
             } catch IndexCoordinatorError.rootUnreadable(let path) {
@@ -687,10 +749,47 @@ final class BrowserModel {
         }
     }
 
-    func pauseHashing() async { await coordinator.pause() }
+    /// Whether tier 1 is paused, as the panel needs to know it.
+    ///
+    /// The coordinator owns the real flag, but it is an actor and the button's
+    /// label has to be right on the next body evaluation rather than after an
+    /// `await`. Mirrored here — set only after the coordinator has accepted the
+    /// change, so the two cannot disagree in the direction that matters.
+    ///
+    /// Not derived from `progress.phase` instead: a pause is only observed by
+    /// the pass at its next batch boundary, so the phase lags the click by up
+    /// to a batch, and a control that stays reading "Pause" for a second after
+    /// being pressed invites a second press.
+    private(set) var isHashingPaused = false
 
+    /// Whether there is a tier 1 pass for the pause control to act on.
+    var isHashingActive: Bool {
+        progress.phase == .hashing || progress.phase == .paused || isHashingPaused
+    }
+
+    /// Stops the tier 1 pass at its next batch boundary.
+    ///
+    /// The pass returns rather than suspending: everything it hashed is already
+    /// committed, and the work queue is the set of rows with a NULL `hashed_at`,
+    /// so "paused" is a state the database agrees with and a resume is just a
+    /// new pass over what is left.
+    func pauseHashing() async {
+        await coordinator.pause()
+        isHashingPaused = true
+    }
+
+    /// Re-arms hashing and starts the pass that picks up where the paused one
+    /// stopped.
     func resumeHashing() async {
         await coordinator.resume()
+        isHashingPaused = false
         startHashingPass()
     }
+
+    /// Awaits the tier 1 pass, if one is running.
+    ///
+    /// Exists for tests. `startHashingPass()` is fire-and-forget for the UI —
+    /// the whole point of tier 1 is that the user is not waiting on it — and a
+    /// test that slept for it instead would be asserting on the scheduler.
+    func waitForHashingPass() async { await hashingTask?.value }
 }

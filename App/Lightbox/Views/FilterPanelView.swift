@@ -46,6 +46,29 @@ struct FilterPanelView: View {
                 }
                 .pickerStyle(.inline)
                 .labelsHidden()
+
+                // The presets answer "big enough?"; this answers "exactly this
+                // size?", which the width menu cannot express at all and which
+                // is how you find every 200×200 icon in a library.
+                LabeledContent("Exact size") {
+                    HStack(spacing: 6) {
+                        TextField("Width", text: exactBinding(\.exactWidth))
+                            .frame(width: 64)
+                        Text("×").foregroundStyle(.secondary)
+                        TextField("Height", text: exactBinding(\.exactHeight))
+                            .frame(width: 64)
+                    }
+                    .textFieldStyle(.roundedBorder)
+                }
+
+                // Only while exactly one half is filled. Without it a
+                // half-entered pair looks like a filter that silently did
+                // nothing, which is indistinguishable from a broken one.
+                if (model.exactWidth == nil) != (model.exactHeight == nil) {
+                    Text("Enter both a width and a height to filter by exact size.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Camera") {
@@ -69,10 +92,31 @@ struct FilterPanelView: View {
 
             Section("Content hashes") {
                 Button("Compute Hashes for This Folder") { model.startHashingPass() }
-                    .disabled(model.root == nil)
+                    // Disabled while paused rather than silently doing nothing:
+                    // a paused coordinator would return a fresh pass straight
+                    // back at its first batch boundary, so the only honest way
+                    // forward from a pause is the resume button below.
+                    .disabled(model.root == nil || model.isHashingPaused)
+
+                Button(model.isHashingPaused ? "Resume Hashing" : "Pause Hashing") {
+                    Task {
+                        if model.isHashingPaused {
+                            await model.resumeHashing()
+                        } else {
+                            await model.pauseHashing()
+                        }
+                    }
+                }
+                .disabled(!model.isHashingActive)
+
                 Text("Reads every file. Needed for duplicate detection.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if model.isHashingPaused {
+                    Text("Paused. Nothing already hashed is lost — resuming picks up the rest.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
@@ -87,6 +131,24 @@ struct FilterPanelView: View {
                 } else {
                     model.selectedExtensions.remove(ext)
                 }
+            })
+    }
+
+    /// Bridges one half of the exact-size filter to a text field.
+    ///
+    /// A `String` binding rather than `TextField(value:format:)`: the model
+    /// half is `Int?` because "no value" is a filter state, and the numeric
+    /// `TextField` initialisers bind a non-optional. Non-digits are dropped
+    /// rather than stored, and anything that is not a positive size — an empty
+    /// field, a lone `0` — clears the half, which is what turns the filter off.
+    private func exactBinding(
+        _ keyPath: ReferenceWritableKeyPath<BrowserModel, Int?>
+    ) -> Binding<String> {
+        Binding(
+            get: { model[keyPath: keyPath].map(String.init) ?? "" },
+            set: { text in
+                let value = Int(text.filter(\.isNumber))
+                model[keyPath: keyPath] = (value ?? 0) > 0 ? value : nil
             })
     }
 

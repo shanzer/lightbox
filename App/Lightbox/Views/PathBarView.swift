@@ -119,8 +119,12 @@ struct PathBarView: View {
             }
 
         case .paused:
-            Text("Paused")
+            // Reachable since the pause control landed in the filter panel:
+            // a paused pass returns rather than suspending, so this is the
+            // only thing left saying the folder is half-hashed.
+            Label("Hashing paused", systemImage: "pause.circle")
                 .foregroundStyle(.secondary)
+                .help("Resume it under Content hashes in the filter panel.")
         }
     }
 }

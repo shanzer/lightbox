@@ -123,24 +123,29 @@ struct JPEGImageHashTests {
 
     @Test func rejectsFilesThatAreNotJPEG() throws {
         let junk = Data("not a jpeg at all".utf8)
-        #expect(throws: (any Error).self) {
+        let error = #expect(throws: HashError.self) {
             try junk.withUnsafeBytes { try JPEGImageHash.includedRanges($0) }
         }
+        #expect(error == .malformed("missing JPEG SOI marker"))
     }
 
     @Test func rejectsATruncatedJPEG() throws {
         let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.jpg"))
         let truncated = try Data(contentsOf: url).prefix(20)
-        #expect(throws: (any Error).self) {
+        let error = #expect(throws: HashError.self) {
             try truncated.withUnsafeBytes { try JPEGImageHash.includedRanges($0) }
         }
+        // Not `.malformed`: the prefix is a well-formed JPEG as far as it goes,
+        // and what is wrong with it is that it stops before EOI.
+        #expect(error == .truncated)
     }
 
     @Test func rejectsAnEmptyBuffer() throws {
         let empty = Data()
-        #expect(throws: (any Error).self) {
+        let error = #expect(throws: HashError.self) {
             try empty.withUnsafeBytes { try JPEGImageHash.includedRanges($0) }
         }
+        #expect(error == .truncated)
     }
 
     @Test func appendedTrailingDataChangesTheHash() throws {

@@ -312,6 +312,8 @@ struct BrowserFilterTests {
         model.searchText = "beach"
         model.selectedExtensions = ["png"]
         model.minimumWidth = 100
+        model.exactWidth = 800
+        model.exactHeight = 100
         await model.waitForPendingSearch()
         #expect(model.hasActiveFilters)
         #expect(names(model) == ["beach.png"])
@@ -323,6 +325,8 @@ struct BrowserFilterTests {
         #expect(model.searchText.isEmpty)
         #expect(model.selectedExtensions.isEmpty)
         #expect(model.minimumWidth == nil)
+        #expect(model.exactWidth == nil)
+        #expect(model.exactHeight == nil)
         #expect(model.records.count == Self.library.count)
     }
 
@@ -340,6 +344,96 @@ struct BrowserFilterTests {
         // with the type filter lifted, which is the only way back out of a
         // filter that matched nothing.
         #expect(!model.facets.byExtension.isEmpty)
+    }
+
+    // MARK: - Exact dimensions
+
+    /// The filter the width presets cannot express.
+    ///
+    /// "Every 200×200 image" is the shape of question a library is searched
+    /// with — icons, sprite sheets, avatars — and `width ≥ n` cannot ask it at
+    /// any setting.
+    @Test func anExactSizeNarrowsTheGridToThatSizeAlone() async throws {
+        let model = try await openedModel()
+        model.exactWidth = 200
+        model.exactHeight = 100
+        await model.waitForPendingSearch()
+
+        #expect(names(model) == ["mountain.heic"])
+        #expect(model.facets.total == 1)
+    }
+
+    /// The height really is part of the query, not decoration on a width
+    /// filter: the whole library is 100 tall, so asking for 200×101 must find
+    /// nothing even though 200 wide exists.
+    @Test func anExactSizeMatchesTheHeightToo() async throws {
+        let model = try await openedModel()
+        model.exactWidth = 200
+        model.exactHeight = 101
+        await model.waitForPendingSearch()
+
+        #expect(model.records.isEmpty)
+        #expect(model.facets.total == 0)
+    }
+
+    /// A half-entered pair is not a filter.
+    ///
+    /// Reinterpreting a lone width as `width == n` would narrow the grid the
+    /// moment the first field was filled and then silently change meaning when
+    /// the second one was. `hasActiveFilters` still reports it, though —
+    /// otherwise Clear Filters would be disabled with text in the field.
+    @Test func aHalfEnteredExactSizeFiltersNothing() async throws {
+        let model = try await openedModel()
+        model.exactWidth = 200
+        await model.waitForPendingSearch()
+
+        #expect(model.exactDimensions == nil)
+        #expect(model.records.count == Self.library.count)
+        #expect(model.hasActiveFilters, "Clear Filters must still be reachable")
+
+        model.exactHeight = 100
+        await model.waitForPendingSearch()
+        #expect(names(model) == ["mountain.heic"])
+
+        // And emptying either half turns it back off rather than leaving the
+        // last complete pair standing.
+        model.exactHeight = nil
+        await model.waitForPendingSearch()
+        #expect(model.records.count == Self.library.count)
+    }
+
+    /// Composes with the other filters rather than replacing them.
+    @Test func anExactSizeCombinesWithTheOtherFilters() async throws {
+        let model = try await openedModel()
+        model.exactWidth = 4000
+        model.exactHeight = 100
+        model.selectedExtensions = ["jpg"]
+        await model.waitForPendingSearch()
+        #expect(names(model) == ["beach.jpg"])
+
+        // The search text still applies on top: 4000×100 exists, but not
+        // under the name "mountain".
+        model.searchText = "mountain"
+        await model.waitForPendingSearch()
+        #expect(model.records.isEmpty)
+    }
+
+    /// Typing a size is keystrokes, so it debounces like the search field and
+    /// unlike the ticks: `200` must cost one reload, not three.
+    @Test func theExactSizeFieldsQueryOncePerPauseNotOncePerCharacter() async throws {
+        let store = try seededStore()
+        let searcher = CountingSearcher(store)
+        let model = BrowserModel(store: store, searcher: searcher)
+        await model.open(ghost)
+
+        let baseline = searcher.searches
+        model.exactHeight = 100
+        for digits in [2, 20, 200] { model.exactWidth = digits }
+        await model.waitForPendingSearch()
+
+        #expect(searcher.searches == baseline + 1,
+                "typing a size cost \(searcher.searches - baseline) searches")
+        #expect(names(model) == ["mountain.heic"])
     }
 
     // MARK: - Selection and the inspector

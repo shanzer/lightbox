@@ -35,6 +35,27 @@ public final class IndexStore: Sendable {
     private static func makeConfiguration() -> Configuration {
         var config = Configuration()
         config.foreignKeysEnabled = true
+        // `WindowGroup` gives File → New Window (⌘N) for free, and every window
+        // builds its own `BrowserModel` → `IndexStore` → `DatabaseQueue` on the
+        // same `index.sqlite`. GRDB's default busy mode is `.immediateError`,
+        // so the moment two windows scan or search at once the second one takes
+        // `SQLITE_BUSY` straight into `status = .failed` mid-pass. Nothing is
+        // lost when that happens — `indexTier0` throws before its reconcile,
+        // `deleteRows` is a single transaction, and `setHashes(for:)` is
+        // guarded — but an ordinary gesture should not degrade the app.
+        //
+        // Five seconds is chosen against what actually contends: writes are
+        // batched and short, so a window waits milliseconds in practice, and
+        // the timeout only has to outlast one batch rather than a whole pass.
+        // Long enough to be invisible, short enough that a genuinely stuck
+        // writer still surfaces as an error instead of hanging the window.
+        //
+        // This is the cheap fix, not the durable one. Phase 2's answer is
+        // `DatabasePool` + WAL: readers then never block on the writer at all,
+        // and the busy timeout is left covering only writer-versus-writer
+        // contention, which is the one case a rollback-journal `DatabaseQueue`
+        // cannot avoid.
+        config.busyMode = .timeout(5)
         return config
     }
 
