@@ -20,6 +20,19 @@ struct PhotoGridView: View {
     @Binding var selection: SelectionModel
     let thumbnailSide: CGFloat
 
+    /// Scroll frame times, for the Task 18 measurement.
+    ///
+    /// Gated behind a launch argument rather than a build configuration so the
+    /// same binary can be measured and shipped, and so re-running the
+    /// measurement on other hardware needs no rebuild. `--measure-frames` is
+    /// read once per body evaluation, which is cheap next to laying out a grid.
+    @State private var frameTimes: [Double] = []
+    @State private var lastFrame = Date()
+
+    private var showsFrameTimes: Bool {
+        ProcessInfo.processInfo.arguments.contains("--measure-frames")
+    }
+
     private var columns: [GridItem] {
         [GridItem(.adaptive(minimum: thumbnailSide + 16), spacing: 12)]
     }
@@ -44,6 +57,33 @@ struct PhotoGridView: View {
                 }
             }
             .padding(12)
+        }
+        .overlay(alignment: .topTrailing) {
+            if showsFrameTimes, !frameTimes.isEmpty {
+                let sorted = frameTimes.sorted()
+                let median = sorted[sorted.count / 2] * 1000
+                let p99 = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.99))] * 1000
+                Text(String(format: "median %.1f ms  p99 %.1f ms  n=%d",
+                            median, p99, frameTimes.count))
+                    .font(.caption.monospaced())
+                    .padding(6)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    .padding(8)
+            }
+        }
+        // One sample per scroll geometry change, which during a continuous
+        // scroll is one per presented frame: the interval between two of them
+        // is the time the grid took to produce a frame. It is not a display
+        // link, so it says nothing while the view is still — hence the samples
+        // are only meaningful for a scroll that never stops.
+        .onScrollGeometryChange(for: CGFloat.self, of: \.contentOffset.y) { _, _ in
+            guard showsFrameTimes else { return }
+            let now = Date()
+            frameTimes.append(now.timeIntervalSince(lastFrame))
+            lastFrame = now
+            // Bounded, so a long scroll cannot grow this without limit; halving
+            // rather than dropping one keeps the copy amortised.
+            if frameTimes.count > 2000 { frameTimes.removeFirst(1000) }
         }
         .background(Color(nsColor: .textBackgroundColor))
         // Behind the cells, so a tap that misses every tile — the one place a
