@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import CryptoKit
+import Synchronization
 @testable import LightboxCore
 
 /// A `struct` suite so swift-testing builds a fresh instance per test and
@@ -296,10 +297,15 @@ struct FileHasherTests {
     }
 }
 
-/// Counts SIGUSR1 deliveries. A global because a C signal handler cannot
-/// capture context; safe because `ContentHasherSignalTests` is `.serialized`
-/// and is the only thing that installs the handler.
-nonisolated(unsafe) private var signalsDelivered = 0
+/// Counts SIGUSR1 deliveries.
+///
+/// A global because a C signal handler cannot capture context, and an atomic
+/// because the test now reads it *while* the handler is still running: the
+/// per-window assertion below compares readings taken either side of a signal
+/// burst, so a torn or reordered read would be an assertion on nothing.
+/// `wrappingAdd` on an `Int` is lock-free, which is what makes it legal in a
+/// handler; anything taking a lock would not be.
+private let signalDeliveries = Atomic<Int>(0)
 
 /// Carries a `pthread_t` and the hashing thread's result across threads.
 /// `pthread_t` is an opaque pointer and not `Sendable`; each field is written
@@ -313,38 +319,87 @@ private final class SignalTestBox: @unchecked Sendable {
 ///
 /// A regular file on a local disk effectively never leaves `read(2)` blocked
 /// long enough for a signal to land, so this uses a FIFO: the reader blocks
-/// inside `read` until the writer produces bytes, which is a wide and
-/// repeatable window. The hash runs on a dedicated `Thread` rather than
-/// directly in the test body because swift-testing runs the body on a Swift
-/// Concurrency executor thread, where the signal did not reach the blocked
-/// read — an earlier version of this test passed with the EINTR retry deleted,
-/// i.e. proved nothing.
+/// inside `read` until the writer produces bytes. The hash runs on a dedicated
+/// `Thread` rather than directly in the test body because swift-testing runs
+/// the body on a Swift Concurrency executor thread, where the signal did not
+/// reach the blocked read — an earlier version of this test passed with the
+/// EINTR retry deleted, i.e. proved nothing.
+///
+/// **The signals are fired in bounded windows, never continuously.** An earlier
+/// version ran a thread spraying `pthread_kill` every 100µs from before the
+/// FIFO was open until the hash returned, and hung roughly one run in twelve on
+/// a loaded machine — `done.wait(timeout:)` timing out after thirty seconds. It
+/// hung because a FIFO's `open` is itself interruptible: the reader and the
+/// writer have to be in `open` at the same instant to rendezvous, and a reader
+/// being kicked out with EINTR every 100µs can miss that rendezvous
+/// indefinitely, leaving the writer blocked in `open` with nothing to pair
+/// with. Signalling into a state the test has not established yet is the bug;
+/// the protocol below establishes each state first and only then signals.
 ///
 /// Separated into its own suite because it installs a process-wide signal
 /// handler; `.serialized` keeps that from overlapping other tests.
 @Suite(.serialized)
 struct ContentHasherSignalTests {
+    /// The hasher's read buffer, and the size of each chunk fed to it.
+    private static let chunkSize = 4096
+    /// How long each burst lasts and how often it fires inside that.
+    private static let windowDuration = 0.06
+    private static let signalInterval: UInt32 = 2_000
+    /// How many chunks get a burst before the rest of the payload is written at
+    /// full speed. More than one so the retry is exercised part-way through the
+    /// stream as well as on the very first read, where nothing has been
+    /// transferred yet and preserving the file offset is trivially correct.
+    private static let windowCount = 4
+    /// Every wait in the test. Generous enough never to fire on a loaded
+    /// machine, finite so a genuine wedge is a failed expectation rather than a
+    /// hung suite.
+    private static let patience = 15.0
+
     @Test func aSignalArrivingMidReadIsRetriedRatherThanReportedAsTruncated() throws {
         let tree = try TempTree()
         let fifo = tree.root.appendingPathComponent("pipe")
-        #expect(mkfifo(fifo.path, 0o600) == 0)
+        try #require(mkfifo(fifo.path, 0o600) == 0, "mkfifo failed: errno \(errno)")
+
+        // The test's end of the FIFO, opened `O_RDWR` before any reader exists.
+        // Two properties come out of that and both are load-bearing. It cannot
+        // block — `O_WRONLY` alone blocks until a reader arrives, which is the
+        // rendezvous the old version deadlocked in — so the hashing thread's
+        // own `open` returns immediately and the test never waits here. And
+        // because this descriptor is also a read end, `poll` on it reports
+        // precisely whether the pipe still holds bytes the hasher has not taken,
+        // which is how the protocol below knows where the hasher is without
+        // guessing with a sleep.
+        let writeFD = fifo.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_RDWR | O_NONBLOCK)
+        }
+        try #require(writeFD >= 0, "could not open the FIFO: errno \(errno)")
+        var writeClosed = false
+        defer { if !writeClosed { close(writeFD) } }
+        // Belt and braces. Holding a read end here already makes EPIPE
+        // unreachable, but a regression that closes the hasher's end early must
+        // fail an expectation, never take the whole run down with signal 13.
+        _ = fcntl(writeFD, F_SETNOSIGPIPE, 1)
 
         // A handler without SA_RESTART, so a delivered signal makes the
         // in-flight `read` return -1/EINTR instead of being restarted for us.
-        signalsDelivered = 0
+        signalDeliveries.store(0, ordering: .relaxed)
         var installed = sigaction()
         var previous = sigaction()
-        installed.__sigaction_u.__sa_handler = { _ in signalsDelivered += 1 }
+        installed.__sigaction_u.__sa_handler = { _ in
+            signalDeliveries.wrappingAdd(1, ordering: .relaxed)
+        }
         installed.sa_flags = 0
         sigemptyset(&installed.sa_mask)
-        #expect(sigaction(SIGUSR1, &installed, &previous) == 0)
+        try #require(sigaction(SIGUSR1, &installed, &previous) == 0)
         defer { sigaction(SIGUSR1, &previous, nil) }
 
-        // Larger than the buffer and written in small pieces, so the reader
-        // makes many blocking reads for the signals to land inside.
-        let payload = Data((0..<(64 << 10)).map { UInt8($0 % 251) })
+        // Larger than the buffer, so the hasher makes many reads and the retry
+        // has to preserve the file offset across more than one of them.
+        let payload = [UInt8]((0..<(64 << 10)).map { UInt8($0 % 251) })
 
         let box = SignalTestBox()
+        let ready = DispatchSemaphore(value: 0)
         let done = DispatchSemaphore(value: 0)
 
         let hashing = Thread {
@@ -358,55 +413,138 @@ struct ContentHasherSignalTests {
             pthread_sigmask(SIG_UNBLOCK, &unblock, nil)
 
             box.thread = pthread_self()
+            // Publishes `box.thread`; nothing signals this thread before the
+            // test has waited on it.
+            ready.signal()
             // Without the EINTR retry this throws `.truncated`, or — far worse
             // — treats the interrupted read as end-of-file and returns the
             // hash of a prefix of the payload.
-            box.result = Result { try ContentHasher(bufferSize: 4096).hash(fifo) }
+            box.result = Result { try ContentHasher(bufferSize: Self.chunkSize).hash(fifo) }
             done.signal()
         }
 
-        nonisolated(unsafe) var signalling = true
-        let signaller = Thread {
-            while signalling {
-                if let t = box.thread { pthread_kill(t, SIGUSR1) }
-                usleep(100)
+        /// Feeds `range` of the payload into the pipe without ever blocking, so
+        /// a hasher that has stopped draining ends the test with a failed
+        /// expectation instead of wedging it.
+        func push(_ range: Range<Int>) -> Bool {
+            var offset = range.lowerBound
+            let deadline = Date().addingTimeInterval(Self.patience)
+            while offset < range.upperBound {
+                guard Date() < deadline else { return false }
+                let written = payload.withUnsafeBufferPointer { buffer in
+                    write(writeFD, buffer.baseAddress! + offset, range.upperBound - offset)
+                }
+                if written > 0 { offset += written; continue }
+                guard written < 0, errno == EAGAIN || errno == EINTR else { return false }
+                usleep(200)
             }
+            return true
         }
 
-        let writer = Thread {
-            let fd = open(fifo.path, O_WRONLY)
-            guard fd >= 0 else { return }
-            // If the hasher gives up early — which is exactly what a regression
-            // here looks like — the read end closes and this thread writes to a
-            // pipe with no reader. Without this the process takes SIGPIPE and
-            // the whole test run dies with signal 13 instead of reporting a
-            // failed expectation.
-            fcntl(fd, F_SETNOSIGPIPE, 1)
-            payload.withUnsafeBytes { bytes in
-                var written = 0
-                while written < bytes.count {
-                    let n = write(fd, bytes.baseAddress! + written,
-                                  min(4096, bytes.count - written))
-                    if n > 0 { written += n } else if errno != EINTR { break }
-                    usleep(300)
-                }
+        /// Whether the hashing thread has already returned. Consuming `done`
+        /// here is why the flag exists: it must not then be waited on twice.
+        var finishedEarly = false
+        func hasherFinished() -> Bool {
+            if !finishedEarly, done.wait(timeout: .now()) == .success { finishedEarly = true }
+            return finishedEarly
+        }
+
+        /// Waits until the pipe is empty again.
+        ///
+        /// Nothing but the hasher can consume from this FIFO, so an empty pipe
+        /// means the hasher has taken every byte written so far. From there its
+        /// only remaining move is another `read`, on a pipe the test is not
+        /// writing to — which blocks. That is the state the burst below needs,
+        /// established rather than assumed.
+        ///
+        /// `.hasherFinished` is the regression's shape, not an internal error:
+        /// a hasher that reports an interrupted read as a failure returns
+        /// part-way through the payload and never drains the rest. Detecting it
+        /// here turns that into the error assertion at the end of the test
+        /// rather than into `patience` seconds of waiting for a thread that has
+        /// already gone.
+        enum DrainOutcome { case drained, hasherFinished, timedOut }
+        func drain() -> DrainOutcome {
+            let deadline = Date().addingTimeInterval(Self.patience)
+            while Date() < deadline {
+                var watched = pollfd(fd: writeFD, events: Int16(POLLIN), revents: 0)
+                let signalled = poll(&watched, 1, 0)
+                if signalled == 0 { return .drained }
+                if hasherFinished() { return .hasherFinished }
+                guard signalled > 0 || errno == EINTR else { return .timedOut }
+                usleep(200)
             }
-            close(fd)
+            return .timedOut
+        }
+
+        /// Fires SIGUSR1 at the hashing thread for one window, and reports how
+        /// many the handler actually took.
+        func signalWindow() -> Int {
+            let before = signalDeliveries.load(ordering: .relaxed)
+            let deadline = Date().addingTimeInterval(Self.windowDuration)
+            while Date() < deadline {
+                if let thread = box.thread { pthread_kill(thread, SIGUSR1) }
+                usleep(Self.signalInterval)
+            }
+            return signalDeliveries.load(ordering: .relaxed) - before
         }
 
         hashing.start()
-        signaller.start()
-        writer.start()
-        #expect(done.wait(timeout: .now() + 30) == .success)
-        signalling = false
+        try #require(ready.wait(timeout: .now() + Self.patience) == .success,
+                     "the hashing thread never started")
 
-        // Without this the test could quietly go vacuous: if signals stopped
-        // reaching the hashing thread, the hash would match for the boring
-        // reason that nothing ever interrupted it.
-        #expect(signalsDelivered > 0, "no SIGUSR1 reached the hashing thread")
+        windows: for window in 0..<Self.windowCount {
+            let chunk = (window * Self.chunkSize)..<((window + 1) * Self.chunkSize)
+            try #require(push(chunk), "could not write chunk \(window): errno \(errno)")
+            switch drain() {
+            case .drained:
+                break
+            case .hasherFinished:
+                break windows
+            case .timedOut:
+                Issue.record("the hasher stopped draining chunk \(window)")
+                break windows
+            }
+
+            // Two deliveries, not one, and that is the whole proof. With the
+            // pipe empty the hasher can only be finishing the digest of the
+            // chunk it just took, or already blocked in `read`. If the first
+            // delivery caught it in the digest, it then enters `read` and the
+            // second interrupts it there; if the first caught it in `read`, so
+            // did the second. Either way a blocked `read` was interrupted —
+            // without needing to assume anything about how the scheduler
+            // treated the thread. One delivery would leave the vacuous case
+            // (caught before it ever reached `read`) open.
+            let delivered = signalWindow()
+            #expect(delivered >= 2, """
+                window \(window): \(delivered) SIGUSR1 delivered, too few to prove a \
+                blocked read was interrupted
+                """)
+        }
+
+        if !finishedEarly {
+            try #require(push((Self.windowCount * Self.chunkSize)..<payload.count),
+                         "could not write the tail of the payload: errno \(errno)")
+        }
+        // Drops the last reference to both ends, so the hasher's next read sees
+        // a clean end-of-file.
+        close(writeFD)
+        writeClosed = true
+        if !finishedEarly {
+            try #require(done.wait(timeout: .now() + Self.patience) == .success,
+                         "the hash never returned")
+        }
 
         var expected = SHA256()
-        expected.update(data: payload)
-        #expect(try box.result?.get() == expected.finalize().hexEncoded)
+        expected.update(data: Data(payload))
+        switch try #require(box.result, "the hashing thread recorded no result") {
+        case .success(let hash):
+            #expect(hash == expected.finalize().hexEncoded)
+        case .failure(let error):
+            Issue.record("""
+                hashing threw \(error); a signal delivered into a blocked read must be \
+                retried, not reported as a failure
+                """)
+        }
     }
 }
