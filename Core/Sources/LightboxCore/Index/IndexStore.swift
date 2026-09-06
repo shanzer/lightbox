@@ -204,6 +204,11 @@ public final class IndexStore: Sendable {
     /// `content` is optional because `hashed_at` records that hashing was
     /// *attempted*. A file that cannot be read must still be marked, or the
     /// tier 1 pass retries it on every run forever.
+    ///
+    /// Unconditional, so it is only safe for a caller holding a row it knows
+    /// nothing else can have changed. The tier 1 pass does not: it reads a row,
+    /// hashes the file while other work runs, and writes afterwards. It uses
+    /// `setHashes(for:…)` instead.
     public func setHashes(fileID: Int64, content: String?, image: String?,
                           imageKind: String?, phash: String?, hashedAt: Double) throws {
         try dbq.write { db in
@@ -212,6 +217,42 @@ public final class IndexStore: Sendable {
                                  phash = ?, hashed_at = ?
                 WHERE id = ?
                 """, arguments: [content, image, imageKind, phash, hashedAt, fileID])
+        }
+    }
+
+    /// Records a hashing attempt against the row `record` came from, and only
+    /// if that row still describes the file that was hashed. Returns whether
+    /// the write landed.
+    ///
+    /// **The identity check is the point of this method.** Hashing a file takes
+    /// long enough that the tier 1 pass must release its isolation while it
+    /// runs, so a tier 0 pass can re-index the same file in between. Tier 0 has
+    /// then already cleared this row's hashes — the bytes changed, so they were
+    /// a lie — and an unconditional write would put them straight back with
+    /// `hashed_at` set, permanently marking the row as hashed from bytes the
+    /// file no longer has. Worse, SQLite reuses row ids after a delete, so a
+    /// reconcile that removes the highest row and indexes a new file can hand
+    /// that id to a different file entirely: an id-only write would then stamp
+    /// one photo's content hash onto another photo's row. Duplicate detection
+    /// deletes files on the strength of those hashes.
+    ///
+    /// Matching on `path`, `size` and `mtime` together is exactly the evidence
+    /// tier 0 uses to decide a file is unchanged, so a write is refused in
+    /// precisely the cases where the hashes might not describe the row. A
+    /// refused write leaves `hashed_at` NULL, which re-queues the file — the
+    /// safe direction: work repeated, never a wrong hash recorded.
+    @discardableResult
+    public func setHashes(for record: FileRecord, content: String?, image: String?,
+                          imageKind: String?, phash: String?, hashedAt: Double) throws -> Bool {
+        guard let id = record.id else { return false }
+        return try dbq.write { db in
+            try db.execute(sql: """
+                UPDATE files SET content_hash = ?, image_hash = ?, image_hash_kind = ?,
+                                 phash = ?, hashed_at = ?
+                WHERE id = ? AND path = ? AND size = ? AND mtime = ?
+                """, arguments: [content, image, imageKind, phash, hashedAt,
+                                 id, record.path, record.size, record.mtime])
+            return db.changesCount == 1
         }
     }
 
@@ -300,6 +341,18 @@ public final class IndexStore: Sendable {
         }
     }
 
+    /// How many files under `prefix` the tier 1 pass still has to attempt.
+    ///
+    /// The pass's queue *is* this predicate, so the count and the batches it
+    /// drains cannot describe different sets of rows.
+    public func countMissingHashes(under prefix: String) throws -> Int {
+        let scope = try Self.pathScope(prefix)
+        return try dbq.read { db in
+            try Int.fetchOne(db, sql: Self.countMissingHashesSQL,
+                             arguments: [scope.exact, scope.lower, scope.upper])!
+        }
+    }
+
     public func search(_ query: SearchQuery) throws -> [FileRecord] {
         let compiled = try QueryCompiler.compile(query)
         return try dbq.read { db in
@@ -327,6 +380,11 @@ public final class IndexStore: Sendable {
         SELECT * FROM files
         WHERE hashed_at IS NULL AND \(scopePredicateSQL)
         ORDER BY id LIMIT ?
+        """
+    /// The same predicate as `missingHashesSQL`, counted rather than fetched,
+    /// so the tier 1 pass's total and its batches cannot drift apart.
+    static let countMissingHashesSQL = """
+        SELECT count(*) FROM files WHERE hashed_at IS NULL AND \(scopePredicateSQL)
         """
 
     /// Appends the optional device restriction to a scope query, keeping the

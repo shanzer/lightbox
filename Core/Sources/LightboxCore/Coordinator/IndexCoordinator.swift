@@ -21,23 +21,46 @@ public enum IndexCoordinatorError: Error, Equatable, Sendable {
 /// two SHA-256 hashes need a decode or a whole-file read, so they belong to the
 /// tier 1 pass.
 ///
-/// Reentrancy: `indexTier0`'s body is entirely synchronous, so the actor
-/// serialises whole passes today and two callers cannot interleave. Task 15's
-/// concurrent hashing puts the first `await` inside a pass, and from that
-/// moment two overlapping passes over the same root can interleave — one
-/// pass's live set going stale while the other reconciles against it. Whoever
-/// adds that `await` must also add a guard: an in-flight set keyed by root, or
-/// a queue of pending roots.
+/// **Reentrancy.** `indexTier0`'s body is entirely synchronous, so the actor
+/// still runs a whole tier 0 pass without interleaving. `runHashingPass` is
+/// not: it suspends inside the actor while a batch is hashed concurrently, and
+/// during that suspension any other pass can run. Two hazards follow, and each
+/// is closed by a different mechanism because they are different problems.
+///
+/// - *Wasted work.* Two overlapping hashing passes would both read the same
+///   `hashed_at IS NULL` rows and hash every one of them twice. A hashing pass
+///   therefore holds `hashingPassInFlight` across each whole batch — read,
+///   hash, write — so a second pass can only ever see rows the first has
+///   already finished with. The gate is released between batches, so a hashing
+///   pass never blocks a folder open for longer than one batch.
+/// - *A stale write.* A tier 0 pass running in the same window can re-index a
+///   file whose bytes changed, clearing that row's hashes. The hashing pass
+///   would then write hashes of the old bytes back over it with `hashed_at`
+///   set, so no later pass would ever revisit it. This one is *not* fixed by
+///   the gate: tier 0 does not take it, and nothing stops a second
+///   `IndexCoordinator` from sharing this store. It is fixed in the database
+///   instead — `IndexStore.setHashes(for:…)` refuses a write whose row no
+///   longer has the path, size and mtime that were hashed. See that method for
+///   why an id alone is not enough.
+///
+/// What is deliberately *not* serialised: a tier 0 pass may run between two
+/// hashing batches, and should. Its reconcile is unaffected by hashing, which
+/// only ever updates hash columns of rows that already exist — it inserts
+/// nothing, deletes nothing, and touches no path, so it cannot make a live set
+/// stale or a delete wrong.
 public actor IndexCoordinator {
     private let store: IndexStore
     private let walker: Walker
     private let metadata: any MetadataReading
-    // Unused by tier 0 and deliberately so: `runHashingPass` lands on this same
-    // actor and needs both, and taking them now keeps that change from
-    // rewriting every call site and test written against this initializer.
     private let hasher: any FileHashing
     private let grayscale: any GrayscaleRendering
     private let concurrency: Int
+
+    /// Set for the duration of a hashing batch, with the callers waiting to run
+    /// one of their own. See the reentrancy note above.
+    private var hashingPassInFlight = false
+    private var hashingPassWaiters: [CheckedContinuation<Void, Never>] = []
+    private var paused = false
 
     public init(store: IndexStore,
                 walker: Walker = Walker(),
@@ -214,6 +237,194 @@ public actor IndexCoordinator {
         return progress
     }
 
+    // MARK: - Tier 1: hashing
+
+    /// Whether new hashing work is currently suspended.
+    public var isPaused: Bool { paused }
+
+    /// Stops the tier 1 pass at the end of the batch it is working on. A paused
+    /// pass returns rather than blocking, so nothing is left holding the index.
+    public func pause() { paused = true }
+
+    /// Re-arms hashing. The work itself is not resumed here: the caller starts
+    /// a new pass, which picks up exactly the rows the paused one left behind.
+    public func resume() { paused = false }
+
+    /// Computes the content hash, image-data hash, and perceptual hash for
+    /// every file under `root` that has not been attempted yet.
+    ///
+    /// **The work queue is the database** — the rows with `hashed_at IS NULL` —
+    /// drained in batches. There is no separate progress record to keep in sync
+    /// and none to drift, so the pass resumes across a pause, a cancellation or
+    /// a quit for free: every run simply asks what is still unhashed.
+    ///
+    /// `hashed_at` is set even when hashing fails. Without that, an unreadable
+    /// or malformed file would be re-read on every pass for the life of the
+    /// index; with it, the row records that the attempt happened and carries
+    /// NULL hashes. A file only re-enters the queue when its bytes change,
+    /// which tier 0's upsert detects and which clears `hashed_at` again.
+    @discardableResult
+    public func runHashingPass(root: URL,
+                               onProgress: (@Sendable (IndexProgress) -> Void)? = nil)
+        async throws -> IndexProgress {
+        var progress = IndexProgress(phase: .hashing)
+        progress.total = try store.countMissingHashes(under: root.path)
+        onProgress?(progress)
+
+        while true {
+            // Checked before the batch rather than inside it: a batch's results
+            // are written as a unit, so stopping between batches is what makes
+            // "paused" a state the database agrees with.
+            if paused {
+                progress.phase = .paused
+                onProgress?(progress)
+                return progress
+            }
+            // After the writes of the previous batch, so a cancelled pass keeps
+            // everything it paid for.
+            try Task.checkCancellation()
+
+            let outcome = try await drainOneHashingBatch(root: root)
+            progress.completed += outcome.hashed
+            progress.failed += outcome.failed
+            guard outcome.hadWork else { break }
+            // Every write refused means every row in the batch was changed by
+            // something else while it was being hashed. They are still queued,
+            // so re-reading them here would spin; the next pass takes them.
+            guard outcome.wrote > 0 else { break }
+            onProgress?(progress)
+        }
+
+        progress.phase = .finished
+        onProgress?(progress)
+        return progress
+    }
+
+    /// Reads one batch of unhashed rows, hashes them `concurrency`-at-a-time,
+    /// and records the outcome of every one. Holds the hashing gate for the
+    /// whole of it — see the reentrancy note on the type.
+    private func drainOneHashingBatch(root: URL) async throws -> BatchOutcome {
+        await acquireHashingGate()
+        defer { releaseHashingGate() }
+
+        var outcome = BatchOutcome()
+        // A row with no id cannot be written back. Dropping it here rather than
+        // mid-loop keeps the pass terminating: the batch query would otherwise
+        // keep returning it forever.
+        let work = try store.filesMissingHashes(under: root.path,
+                                                limit: Self.hashingBatchSize)
+            .filter { $0.id != nil }
+        guard !work.isEmpty else { return outcome }
+        outcome.hadWork = true
+
+        let results = await withTaskGroup(of: HashOutcome.self) { group in
+            var collected: [HashOutcome] = []
+            collected.reserveCapacity(work.count)
+            var next = 0
+            // A bounded window rather than one task per row: a batch is far
+            // wider than the number of files worth reading from one disk at
+            // once, and each hash may buffer the whole file.
+            while next < work.count && next < concurrency {
+                let record = work[next]
+                next += 1
+                group.addTask { [hasher, grayscale] in
+                    Self.hash(record, hasher: hasher, grayscale: grayscale)
+                }
+            }
+            while let result = await group.next() {
+                collected.append(result)
+                if next < work.count {
+                    let record = work[next]
+                    next += 1
+                    group.addTask { [hasher, grayscale] in
+                        Self.hash(record, hasher: hasher, grayscale: grayscale)
+                    }
+                }
+            }
+            return collected
+        }
+
+        let now = Date().timeIntervalSince1970
+        for result in results {
+            // `hashed_at` is written either way: it means "attempted".
+            let landed = try store.setHashes(for: result.record,
+                                             content: result.hashes?.contentHash,
+                                             image: result.hashes?.imageHash,
+                                             imageKind: result.hashes?.imageHashKind,
+                                             phash: result.phash,
+                                             hashedAt: now)
+            guard landed else { continue }
+            outcome.wrote += 1
+            if result.hashes == nil { outcome.failed += 1 } else { outcome.hashed += 1 }
+        }
+        return outcome
+    }
+
+    /// Hashes one file, off the actor.
+    ///
+    /// Cancellation is deliberately not checked in here. A cancelled child that
+    /// returned early would still be written as an *attempt*, and the file
+    /// would then never be hashed again — the pass stops between batches
+    /// instead, where stopping costs nothing but the current batch.
+    private static func hash(_ record: FileRecord, hasher: any FileHashing,
+                             grayscale: any GrayscaleRendering) -> HashOutcome {
+        let url = URL(fileURLWithPath: record.path)
+        // An extension the app does not recognise yields no hashes and is still
+        // recorded as attempted: re-queueing it would cost a read per pass to
+        // learn the same thing.
+        let hashes = MediaType.forExtension(record.ext)
+            .flatMap { try? hasher.hashes(for: url, mediaType: $0) }
+        // A perceptual hash failure costs one column, not the row. The two
+        // hashes answer different questions — "the same file" versus "the same
+        // picture" — and a file whose pixels will not decode can still answer
+        // the first.
+        let phash = (try? grayscale.gray32(from: url))
+            .flatMap { try? PerceptualHash(gray: $0) }?.hex
+        return HashOutcome(record: record, hashes: hashes, phash: phash)
+    }
+
+    /// The result of hashing one file, carrying the row it was read from so the
+    /// write can check that row still describes it.
+    private struct HashOutcome: Sendable {
+        let record: FileRecord
+        let hashes: FileHashes?
+        let phash: String?
+    }
+
+    private struct BatchOutcome {
+        /// Whether there was anything left to do at all.
+        var hadWork = false
+        /// Rows whose outcome was actually recorded. Lower than the batch size
+        /// when a row changed under the pass and its write was refused.
+        var wrote = 0
+        var hashed = 0
+        var failed = 0
+    }
+
+    private func acquireHashingGate() async {
+        guard hashingPassInFlight else {
+            hashingPassInFlight = true
+            return
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            hashingPassWaiters.append(continuation)
+        }
+        // The gate was handed over directly and is still marked in-flight.
+    }
+
+    private func releaseHashingGate() {
+        // Direct handoff rather than clearing the flag and letting whoever runs
+        // next take it: a caller arriving between the two could otherwise barge
+        // ahead of a waiter indefinitely.
+        if hashingPassWaiters.isEmpty {
+            hashingPassInFlight = false
+        } else {
+            hashingPassWaiters.removeFirst().resume()
+        }
+    }
+
+    // MARK: - Helpers
+
     /// Path identity, for matching a skip against the scan's own root. In
     /// practice the walker emits the very URL it was handed, but a root built
     /// by string concatenation or carrying a trailing slash must not slip past
@@ -249,4 +460,10 @@ public actor IndexCoordinator {
     /// reporting rarely makes a small folder look stuck. The pass always
     /// reports on entering each phase regardless of this.
     private static let progressReportInterval = 25
+
+    /// How many rows one hashing batch claims. It is the unit of three
+    /// separate things — the read, the gate's hold, and how much work a pause
+    /// or a cancellation can discard — so it is small enough that stopping is
+    /// prompt and large enough that the queue query is not the cost.
+    private static let hashingBatchSize = 64
 }
