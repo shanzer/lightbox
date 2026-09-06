@@ -4206,17 +4206,29 @@ git commit -m "feat: add resumable tier 1 hashing pass with pause and failure re
 
 The folder enumeration lives in `Core` so it is testable headless; only the views live in the app target.
 
-- [ ] **Step 1: Create the Xcode project**
+- [ ] **Step 1: Generate the Xcode project**
 
-Follow exactly; the two easily-missed steps are the deployment target and the sandbox.
+**Write `App/Lightbox.xcodeproj/project.pbxproj` directly — do not use the Xcode GUI.** I verified this route works on this machine before assigning the task: a hand-written pbxproj at `objectVersion = 77` using a `PBXFileSystemSynchronizedRootGroup` builds to `** BUILD SUCCEEDED **` under `xcodebuild` with no GUI involvement.
 
-1. Xcode → File → New → Project → macOS → **App**.
-2. Product Name `Lightbox`, Interface **SwiftUI**, Language **Swift**, Storage **None**, Testing System **None**. Uncheck "Create Git repository".
-3. Save into `lightbox/App/`.
-4. Target `Lightbox` → General → Minimum Deployments → **macOS 26.0**.
-5. Target `Lightbox` → Signing & Capabilities → **remove the App Sandbox capability** if the template added one. The spec calls for no sandbox: with it enabled, browsing an arbitrary directory requires security-scoped bookmarks for every folder.
-6. File → Add Package Dependencies → **Add Local…** → select `lightbox/Core` → add product `LightboxCore` to the `Lightbox` target.
-7. Confirm the `Lightbox` group in the navigator is a **file-system synchronized group** (Xcode 16+ default, shown with a folder icon). Files dropped into `App/Lightbox/` then compile without editing `project.pbxproj`. If it is a plain group, delete it and re-add the folder as a synchronized group.
+The properties that make it work, each of which I confirmed:
+
+- `objectVersion = 77` and `preferredProjectObjectVersion = 77` on the `PBXProject`.
+- The app's source folder is a `PBXFileSystemSynchronizedRootGroup` (`isa = PBXFileSystemSynchronizedRootGroup; path = Lightbox;`), referenced from the target's `fileSystemSynchronizedGroups`. This is what makes files dropped into `App/Lightbox/` compile without any further pbxproj editing — every later task adds views this way.
+- An empty `PBXSourcesBuildPhase` is still required even though the synchronized group supplies the sources.
+- `CODE_SIGNING_ALLOWED = NO` in the target's build settings, so `xcodebuild` does not need a signing identity. Xcode ad-hoc signs and notes it is disabling hardened runtime; that is expected.
+- `MACOSX_DEPLOYMENT_TARGET = 26.0`, `SDKROOT = macosx`, `SWIFT_VERSION = 6.0`, `GENERATE_INFOPLIST_FILE = YES`, `PRODUCT_BUNDLE_IDENTIFIER = com.shanzer.Lightbox`.
+- **No App Sandbox entitlement.** The spec calls for none: with the sandbox on, browsing an arbitrary directory needs security-scoped bookmarks for every folder.
+- Add the local package by referencing `../Core` as an `XCLocalSwiftPackageReference`, with an `XCSwiftPackageProductDependency` on `LightboxCore` in the target's `packageProductDependencies` and a matching entry in the target's `PBXFrameworksBuildPhase`.
+- A shared scheme at `App/Lightbox.xcodeproj/xcshareddata/xcschemes/Lightbox.xcscheme`, or `xcodebuild -scheme Lightbox` cannot find it.
+
+Verify before moving on:
+
+```bash
+xcodebuild -project App/Lightbox.xcodeproj -scheme Lightbox -configuration Debug build 2>&1 | tail -3
+```
+Expected: `** BUILD SUCCEEDED **`
+
+If hand-writing the project proves genuinely intractable, stop and report rather than burning the task on it — the GUI steps are a documented fallback and the user can perform them.
 
 Verify from the command line:
 
