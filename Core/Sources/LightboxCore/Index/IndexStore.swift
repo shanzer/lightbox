@@ -52,6 +52,21 @@ public final class IndexStore: Sendable {
 
     public static func inMemory() throws -> IndexStore { try IndexStore() }
 
+    /// Closes the underlying SQLite connection synchronously.
+    ///
+    /// Not required for ordinary use — GRDB closes the connection when the
+    /// `DatabaseQueue` deinitializes, and that is sufficient for a store an
+    /// `IndexStore` owns for its own lifetime. It matters for exactly one
+    /// case in this codebase: `BrowserModel.init(at:)` opens a connection to
+    /// check its integrity, and, if that check fails, discards it in favor of
+    /// a fresh one at the same path. `deinit` is not synchronous enough for
+    /// that — the old connection's file descriptor can still be open when
+    /// `rebuild(at:)` unlinks the file out from under it, which SQLite flags
+    /// as a client API violation even though it happens to tolerate it. This
+    /// makes closing the old connection an explicit, ordered step instead of
+    /// a race with ARC.
+    public func close() throws { try dbq.close() }
+
     // MARK: - Schema
 
     private static let migrator: DatabaseMigrator = {

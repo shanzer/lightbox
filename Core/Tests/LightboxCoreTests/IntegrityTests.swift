@@ -90,6 +90,36 @@ struct IntegrityTests {
         }
     }
 
+    /// `close()` exists so `BrowserModel.init(at:)` can release a
+    /// corrupt-but-openable connection before `rebuild(at:)` deletes the file
+    /// it points at, rather than trusting `deinit` to have finished first. A
+    /// connection that claims to be closed but still answers queries would
+    /// defeat the entire point, so this pins both halves of the contract:
+    /// the connection stops working, and the file it was holding is left in
+    /// a state a fresh connection (or a delete-and-recreate) can safely take
+    /// over.
+    @Test func closeReleasesTheConnectionSoTheFileCanBeSafelyReplaced() throws {
+        let tree = try TempTree()
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let store = try IndexStore(url: url)
+        _ = try store.upsert(FileRecord(
+            id: nil, path: "/a/b.jpg", parentDir: "/a", name: "b.jpg", ext: "jpg",
+            size: 1, mtime: 1, device: 1, inode: 1, width: nil, height: nil, captureTime: nil,
+            captureOffset: nil, cameraMake: nil, cameraModel: nil, orientation: nil,
+            contentHash: nil, imageHash: nil, imageHashKind: nil, phash: nil,
+            hashedAt: nil, indexedAt: 1))
+
+        try store.close()
+
+        #expect(throws: (any Error).self) {
+            try store.count()
+        }
+        // The file must still be a valid, independent database that a
+        // rebuild can safely delete and replace now that nothing holds it open.
+        let rebuilt = try IndexStore.rebuild(at: url)
+        #expect(try rebuilt.count() == 0)
+    }
+
     @Test func rebuildReplacesTheFileWithAnEmptyIndex() throws {
         let tree = try TempTree()
         let url = tree.root.appendingPathComponent("index.sqlite")

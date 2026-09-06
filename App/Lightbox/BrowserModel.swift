@@ -335,9 +335,21 @@ final class BrowserModel {
     /// would be strictly worse than a rescan.
     init(at url: URL = IndexStore.defaultURL) throws {
         let store: IndexStore
-        if let opened = try? IndexStore(url: url), opened.checkIntegrity() == .ok {
+        // Bound outside the `if` so a corrupt-but-openable connection is
+        // still reachable in the `else` branch to be closed — see below.
+        let opened = try? IndexStore(url: url)
+        if let opened, opened.checkIntegrity() == .ok {
             store = opened
         } else {
+            // `opened` may be a live connection to exactly the file
+            // `rebuild(at:)` is about to delete. `deinit` closing it is not
+            // synchronous enough: the old file descriptor can still be open
+            // when `FileManager.removeItem` unlinks the file, which SQLite
+            // logs as a client API violation (`vnode unlinked while in
+            // use`) even on a build where it happens not to fail outright.
+            // Closing it explicitly, in order, before the delete removes the
+            // race rather than relying on it resolving in our favor.
+            try? opened?.close()
             store = try IndexStore.rebuild(at: url)
             didRebuildIndex = true
         }
