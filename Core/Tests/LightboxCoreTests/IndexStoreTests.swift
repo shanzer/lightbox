@@ -111,9 +111,11 @@ struct IndexStoreTests {
 
     @Test func setHashesStoresAllThreeAndTheKind() throws {
         let store = try IndexStore.inMemory()
-        let id = try store.upsert(sampleRecord(path: "/a/b.jpg"))
-        try store.setHashes(fileID: id, content: "aa", image: "bb", imageKind: "jpeg-scan-v1",
-                            phash: "0123456789abcdef", hashedAt: 1_700_000_500)
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg"))
+        let seeded = try #require(try store.record(atPath: "/a/b.jpg"))
+        #expect(try store.setHashes(for: seeded, content: "aa", image: "bb",
+                                    imageKind: "jpeg-scan-v1",
+                                    phash: "0123456789abcdef", hashedAt: 1_700_000_500))
         let row = try #require(try store.record(atPath: "/a/b.jpg"))
         #expect(row.contentHash == "aa")
         #expect(row.imageHash == "bb")
@@ -124,20 +126,23 @@ struct IndexStoreTests {
 
     @Test func filesMissingHashesReturnsOnlyUnhashedRowsUnderThePrefix() throws {
         let store = try IndexStore.inMemory()
-        let a = try store.upsert(sampleRecord(path: "/lib/a.jpg"))
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg"))
         _ = try store.upsert(sampleRecord(path: "/lib/b.jpg"))
         _ = try store.upsert(sampleRecord(path: "/other/c.jpg"))
-        try store.setHashes(fileID: a, content: "aa", image: nil, imageKind: nil,
-                            phash: nil, hashedAt: 1)
+        let a = try #require(try store.record(atPath: "/lib/a.jpg"))
+        #expect(try store.setHashes(for: a, content: "aa", image: nil, imageKind: nil,
+                                    phash: nil, hashedAt: 1))
         let pending = try store.filesMissingHashes(under: "/lib", limit: 10)
         #expect(pending.map(\.name) == ["b.jpg"])
     }
 
     @Test func upsertClearsHashesOnlyWhenTheFileActuallyChanged() throws {
         let store = try IndexStore.inMemory()
-        let id = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 100, mtime: 1_700_000_000))
-        try store.setHashes(fileID: id, content: "cc", image: "ii", imageKind: "jpeg-scan-v1",
-                            phash: "0123456789abcdef", hashedAt: 500)
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 100, mtime: 1_700_000_000))
+        let seeded = try #require(try store.record(atPath: "/a/b.jpg"))
+        #expect(try store.setHashes(for: seeded, content: "cc", image: "ii",
+                                    imageKind: "jpeg-scan-v1",
+                                    phash: "0123456789abcdef", hashedAt: 500))
 
         // Re-indexing an unchanged file must not throw away work the tier 1 pass
         // already paid for.
@@ -161,9 +166,11 @@ struct IndexStoreTests {
 
     @Test func upsertClearsHashesWhenOnlyMtimeChanged() throws {
         let store = try IndexStore.inMemory()
-        let id = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 100, mtime: 1_700_000_000))
-        try store.setHashes(fileID: id, content: "cc", image: "ii", imageKind: "jpeg-scan-v1",
-                            phash: "0123456789abcdef", hashedAt: 500)
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 100, mtime: 1_700_000_000))
+        let seeded = try #require(try store.record(atPath: "/a/b.jpg"))
+        #expect(try store.setHashes(for: seeded, content: "cc", image: "ii",
+                                    imageKind: "jpeg-scan-v1",
+                                    phash: "0123456789abcdef", hashedAt: 500))
         // Same size, touched mtime: an edit that preserves length still
         // invalidates every hash.
         _ = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 100, mtime: 1_700_000_000.5))

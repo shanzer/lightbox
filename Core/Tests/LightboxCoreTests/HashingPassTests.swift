@@ -403,25 +403,67 @@ struct HashingPassTests {
                 == fileCount - calls.withLock { $0.count })
     }
 
+    /// Cancellation outranks pause. Both are true at the same loop boundary
+    /// here, and the pass must report the one that is a failure to complete,
+    /// not the one that is a state — otherwise a caller that cancels a paused
+    /// pass gets a `.paused` result and no error.
+    @Test func cancellingAPausedPassThrowsRatherThanReportingPaused() async throws {
+        let store = try IndexStore.inMemory()
+        try await seedTier0(tree, store, count: 200)
+
+        let calls = LockBox<[String]>([])
+        let release = DispatchSemaphore(value: 0)
+        let c = coordinator(store, hasher: GatedHasher(calls: calls, release: release))
+
+        let root = tree.root
+        let task = Task { try await c.runHashingPass(root: root, onProgress: nil) }
+        #expect(try await poll { calls.withLock { !$0.isEmpty } })
+
+        await c.pause()
+        task.cancel()
+        release.signal()
+
+        await #expect(throws: CancellationError.self) { try await task.value }
+        let isPaused = await c.isPaused
+        #expect(isPaused)
+    }
+
     // MARK: - Reentrancy
 
     /// `runHashingPass` suspends inside the actor, so without a guard a second
     /// pass could read the same `hashed_at IS NULL` rows the first is still
     /// hashing and pay for every one of them twice.
+    ///
+    /// The overlap is forced rather than hoped for. One pass is held inside its
+    /// first file while the other is allowed to arrive, and a pass reports its
+    /// opening `.hashing` progress with no suspension point between that
+    /// callback and the gate — so once both have reported and one is blocked in
+    /// the hasher, the other is provably queued behind it.
     @Test func overlappingHashingPassesDoNotDuplicateWork() async throws {
         let fileCount = 200
         let store = try IndexStore.inMemory()
         try await seedTier0(tree, store, count: fileCount)
 
         let calls = LockBox<[String]>([])
-        let c = coordinator(store, hasher: CountingHasher(calls: calls))
+        let release = DispatchSemaphore(value: 0)
+        let c = coordinator(store, hasher: GatedHasher(calls: calls, release: release))
 
         let root = tree.root
-        async let first = c.runHashingPass(root: root, onProgress: nil)
-        async let second = c.runHashingPass(root: root, onProgress: nil)
+        let started = LockBox(0)
+        let bothStarted: @Sendable (IndexProgress) -> Void = { progress in
+            if progress.completed == 0 { started.withLock { $0 += 1 } }
+        }
+        async let first = c.runHashingPass(root: root, onProgress: bothStarted)
+        async let second = c.runHashingPass(root: root, onProgress: bothStarted)
+
+        #expect(try await poll { started.withLock { $0 == 2 } && calls.withLock { !$0.isEmpty } })
+        release.signal()
         let results = try await [first, second]
 
         #expect(results.allSatisfy { $0.phase == .finished })
+        // Both really did work, or the test would pass vacuously on a scheduler
+        // that ran them one after the other.
+        #expect(results.allSatisfy { $0.completed > 0 })
         #expect(results.map(\.completed).reduce(0, +) == fileCount)
         let hashed = calls.withLock { $0 }
         #expect(hashed.count == fileCount)
@@ -478,5 +520,140 @@ struct HashingPassTests {
             .runHashingPass(root: root, onProgress: nil)
         #expect(recovery.completed == 1)
         #expect(try store.countMissingHashes(under: root.path) == 0)
+    }
+
+    // MARK: - An unreachable root
+
+    /// The invariant tier 0 already holds, in the form that survives a
+    /// remount: a whole-volume absence is not evidence about individual files.
+    ///
+    /// Marking an attempt is almost irreversible — only a change of size or
+    /// mtime re-queues a row, and an unmounted drive changes neither — so a
+    /// pass that ran against a vanished root would leave the entire library
+    /// permanently unhashable, recoverable only by editing the database.
+    @Test func anUnreachableRootThrowsRatherThanMarkingEveryFileAttempted() async throws {
+        let store = try IndexStore.inMemory()
+        try await seedTier0(tree, store, count: 5)
+        let before = try (0..<5).map { try #require(try store.record(atPath: path("img\($0).jpg"))) }
+        #expect(try store.countMissingHashes(under: tree.root.path) == 5)
+
+        // Stand in for the drive going away: the root stops resolving, and
+        // crucially no file's size or mtime changes — which is exactly what a
+        // disconnect looks like from the index's side.
+        let parked = tree.root.deletingLastPathComponent()
+            .appendingPathComponent("parked-\(UUID().uuidString)")
+        try FileManager.default.moveItem(at: tree.root, to: parked)
+
+        let hasher = CountingHasher(calls: LockBox([]))
+        let c = coordinator(store, hasher: hasher)
+        await #expect(throws: IndexCoordinatorError.rootUnreadable(tree.root.path)) {
+            try await c.runHashingPass(root: tree.root, onProgress: nil)
+        }
+        #expect(hasher.calls.withLock { $0.isEmpty })
+
+        // Remount.
+        try FileManager.default.moveItem(at: parked, to: tree.root)
+
+        // Nothing was recorded while the volume was away...
+        #expect(try store.countMissingHashes(under: tree.root.path) == 5)
+        for (i, was) in before.enumerated() {
+            let now = try #require(try store.record(atPath: path("img\(i).jpg")))
+            #expect(now.hashedAt == nil)
+            #expect(now.size == was.size)
+            #expect(now.mtime == was.mtime)
+        }
+
+        // ...which matters because tier 0 will not re-queue them: the files are
+        // byte-for-byte what they were, so `needsReindex` is false for all five.
+        let rescan = try await runTier0(store, root: tree.root)
+        #expect(rescan.completed == 0)
+        #expect(try store.countMissingHashes(under: tree.root.path) == 5)
+
+        // And the work simply resumes.
+        let resumed = try await c.runHashingPass(root: tree.root, onProgress: nil)
+        #expect(resumed.completed == 5)
+        #expect(resumed.failed == 0)
+        #expect(try store.countMissingHashes(under: tree.root.path) == 0)
+    }
+
+    /// The same guard, at the point where it actually has to hold: the volume
+    /// leaves while a batch is being hashed. The results are already computed
+    /// when it is noticed, and they must still not be written.
+    @Test func aRootThatLeavesMidBatchWritesNothing() async throws {
+        let store = try IndexStore.inMemory()
+        try await seedTier0(tree, store, count: 5)
+
+        let calls = LockBox<[String]>([])
+        let release = DispatchSemaphore(value: 0)
+        let c = coordinator(store, hasher: GatedHasher(calls: calls, release: release))
+
+        let root = tree.root
+        let task = Task { try await c.runHashingPass(root: root, onProgress: nil) }
+        #expect(try await poll { calls.withLock { !$0.isEmpty } })
+
+        let parked = root.deletingLastPathComponent()
+            .appendingPathComponent("parked-\(UUID().uuidString)")
+        try FileManager.default.moveItem(at: root, to: parked)
+        release.signal()
+
+        await #expect(throws: IndexCoordinatorError.rootUnreadable(root.path)) {
+            try await task.value
+        }
+        try FileManager.default.moveItem(at: parked, to: root)
+
+        // The hasher answered for these files — the guard, not a hashing
+        // failure, is what kept them out of the database.
+        #expect(calls.withLock { !$0.isEmpty })
+        #expect(try store.countMissingHashes(under: root.path) == 5)
+        for i in 0..<5 {
+            let record = try #require(try store.record(atPath: path("img\(i).jpg")))
+            #expect(record.hashedAt == nil)
+        }
+    }
+
+    // MARK: - Real components
+
+    /// Every other test here stubs the hasher and the renderer, and `TempTree`
+    /// writes eight bytes of `0x41` rather than a decodable image — so nothing
+    /// else proves the pass produces *correct* hashes, only that it drives the
+    /// protocols correctly. This runs real files through the real components.
+    @Test func theRealHasherAndRendererProduceTheStoredHashes() async throws {
+        let store = try IndexStore.inMemory()
+        let jpeg = try Fixtures.writeImage(to: tree.root.appendingPathComponent("photo.jpg"))
+        // A checked-in WebP as well: a second image-hash rule, and a format
+        // ImageIO cannot write, so it can only come from a real file.
+        let webp = tree.root.appendingPathComponent("simple.webp")
+        try FileManager.default.copyItem(at: try Fixtures.url("simple.webp"), to: webp)
+
+        let c = IndexCoordinator(store: store, walker: Walker(), metadata: MetadataReader(),
+                                 hasher: FileHasher(), grayscale: GrayscaleRenderer(),
+                                 concurrency: 2)
+        _ = try await c.indexTier0(root: tree.root, recursive: true, onProgress: nil)
+        let progress = try await c.runHashingPass(root: tree.root, onProgress: nil)
+        #expect(progress.completed == 2)
+        #expect(progress.failed == 0)
+
+        for url in [jpeg, webp] {
+            let mediaType = try #require(MediaType.forExtension(url.pathExtension))
+            let expected = try FileHasher().hashes(for: url, mediaType: mediaType)
+            let expectedPhash = try PerceptualHash(gray: GrayscaleRenderer().gray32(from: url)).hex
+
+            let record = try #require(try store.record(atPath: url.path))
+            #expect(record.contentHash == expected.contentHash)
+            #expect(record.imageHash == expected.imageHash)
+            #expect(record.imageHashKind == expected.imageHashKind)
+            #expect(record.phash == expectedPhash)
+            #expect(record.hashedAt != nil)
+            // Shape, independent of the components: SHA-256 hex and 64 bits.
+            #expect(record.contentHash?.count == 64)
+            #expect(record.imageHash?.count == 64)
+            #expect(record.phash?.count == 16)
+            #expect(record.contentHash != record.imageHash)
+        }
+        // The two files are different pictures and must not collide.
+        let a = try #require(try store.record(atPath: jpeg.path))
+        let b = try #require(try store.record(atPath: webp.path))
+        #expect(a.contentHash != b.contentHash)
+        #expect(a.phash != b.phash)
     }
 }

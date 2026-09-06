@@ -263,16 +263,35 @@ public actor IndexCoordinator {
     /// index; with it, the row records that the attempt happened and carries
     /// NULL hashes. A file only re-enters the queue when its bytes change,
     /// which tier 0's upsert detects and which clears `hashed_at` again.
+    ///
+    /// **That last property is why this pass carries tier 0's volume check.**
+    /// Marking an attempt is almost irreversible: nothing re-queues a row until
+    /// its size or mtime changes, and an unmounted drive changes neither. A
+    /// pass that ran against a vanished root would hash nothing, record every
+    /// file as attempted, and leave the whole library permanently unhashable —
+    /// the same mistake as reconciling against a missing volume, in a form that
+    /// survives the remount. So the volume answering at `root` is captured
+    /// before the pass and re-checked before every batch is *read* and again
+    /// before its results are *written*; if it is gone or is a different
+    /// filesystem, the pass throws `rootUnreadable` and writes nothing.
     @discardableResult
     public func runHashingPass(root: URL,
                                onProgress: (@Sendable (IndexProgress) -> Void)? = nil)
         async throws -> IndexProgress {
+        guard let rootDevice = Self.device(ofDirectory: root) else {
+            throw IndexCoordinatorError.rootUnreadable(root.path)
+        }
+
         var progress = IndexProgress(phase: .hashing)
         progress.total = try store.countMissingHashes(under: root.path)
         onProgress?(progress)
 
         while true {
-            // Checked before the batch rather than inside it: a batch's results
+            // Ahead of the pause check so a cancelled pass reports cancellation
+            // rather than the state it happened to be in, and after the writes
+            // of the previous batch so it keeps everything it paid for.
+            try Task.checkCancellation()
+            // Checked between batches rather than inside one: a batch's results
             // are written as a unit, so stopping between batches is what makes
             // "paused" a state the database agrees with.
             if paused {
@@ -280,17 +299,16 @@ public actor IndexCoordinator {
                 onProgress?(progress)
                 return progress
             }
-            // After the writes of the previous batch, so a cancelled pass keeps
-            // everything it paid for.
-            try Task.checkCancellation()
 
-            let outcome = try await drainOneHashingBatch(root: root)
+            let outcome = try await drainOneHashingBatch(root: root, device: rootDevice)
             progress.completed += outcome.hashed
             progress.failed += outcome.failed
             guard outcome.hadWork else { break }
-            // Every write refused means every row in the batch was changed by
-            // something else while it was being hashed. They are still queued,
-            // so re-reading them here would spin; the next pass takes them.
+            // Every write in the batch was refused, so something else is
+            // rewriting these rows as fast as they are hashed. They are still
+            // queued and the next pass takes them; re-reading them here would
+            // livelock against the writer. (Not an infinite loop: with no
+            // concurrent writer the re-read simply succeeds.)
             guard outcome.wrote > 0 else { break }
             onProgress?(progress)
         }
@@ -303,14 +321,20 @@ public actor IndexCoordinator {
     /// Reads one batch of unhashed rows, hashes them `concurrency`-at-a-time,
     /// and records the outcome of every one. Holds the hashing gate for the
     /// whole of it — see the reentrancy note on the type.
-    private func drainOneHashingBatch(root: URL) async throws -> BatchOutcome {
+    ///
+    /// `device` is the volume the pass started against. It is re-checked here
+    /// twice: once before any work is read, and once after hashing and before
+    /// a single row is written, because the drive can go away mid-batch and it
+    /// is the write that would do the permanent damage.
+    private func drainOneHashingBatch(root: URL, device: Int64) async throws -> BatchOutcome {
         await acquireHashingGate()
         defer { releaseHashingGate() }
 
+        try Self.checkStillMounted(root, device: device)
+
         var outcome = BatchOutcome()
-        // A row with no id cannot be written back. Dropping it here rather than
-        // mid-loop keeps the pass terminating: the batch query would otherwise
-        // keep returning it forever.
+        // `id` is a rowid alias, so in practice it is never NULL; the filter is
+        // here to keep the write's unwrap total rather than to fix anything.
         let work = try store.filesMissingHashes(under: root.path,
                                                 limit: Self.hashingBatchSize)
             .filter { $0.id != nil }
@@ -343,6 +367,11 @@ public actor IndexCoordinator {
             }
             return collected
         }
+
+        // The batch is hashed; nothing is recorded yet. If the volume left
+        // while that ran, none of these outcomes is evidence about anything —
+        // and writing them would mark the files attempted forever.
+        try Self.checkStillMounted(root, device: device)
 
         let now = Date().timeIntervalSince1970
         for result in results {
@@ -399,6 +428,16 @@ public actor IndexCoordinator {
         var wrote = 0
         var hashed = 0
         var failed = 0
+    }
+
+    /// Throws unless `root` is still answered by the same volume the pass
+    /// started against. A missing root and a root on a different filesystem are
+    /// the same thing here: the pass is about to record facts about files it
+    /// cannot see.
+    private static func checkStillMounted(_ root: URL, device: Int64) throws {
+        guard Self.device(ofDirectory: root) == device else {
+            throw IndexCoordinatorError.rootUnreadable(root.path)
+        }
     }
 
     private func acquireHashingGate() async {

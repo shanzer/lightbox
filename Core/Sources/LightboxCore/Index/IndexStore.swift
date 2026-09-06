@@ -201,28 +201,18 @@ public final class IndexStore: Sendable {
         }
     }
 
+    /// Records a hashing attempt against the row `record` came from, and only
+    /// if that row still describes the file that was hashed. Returns whether
+    /// the write landed.
+    ///
     /// `content` is optional because `hashed_at` records that hashing was
     /// *attempted*. A file that cannot be read must still be marked, or the
     /// tier 1 pass retries it on every run forever.
     ///
-    /// Unconditional, so it is only safe for a caller holding a row it knows
-    /// nothing else can have changed. The tier 1 pass does not: it reads a row,
-    /// hashes the file while other work runs, and writes afterwards. It uses
-    /// `setHashes(for:…)` instead.
-    public func setHashes(fileID: Int64, content: String?, image: String?,
-                          imageKind: String?, phash: String?, hashedAt: Double) throws {
-        try dbq.write { db in
-            try db.execute(sql: """
-                UPDATE files SET content_hash = ?, image_hash = ?, image_hash_kind = ?,
-                                 phash = ?, hashed_at = ?
-                WHERE id = ?
-                """, arguments: [content, image, imageKind, phash, hashedAt, fileID])
-        }
-    }
-
-    /// Records a hashing attempt against the row `record` came from, and only
-    /// if that row still describes the file that was hashed. Returns whether
-    /// the write landed.
+    /// There is deliberately no id-only variant. An unconditional hash writer
+    /// on the one type whose integrity story is "the write must be guarded" is
+    /// exactly the API that reintroduces the bug below, and a doc comment is
+    /// not a type system.
     ///
     /// **The identity check is the point of this method.** Hashing a file takes
     /// long enough that the tier 1 pass must release its isolation while it
