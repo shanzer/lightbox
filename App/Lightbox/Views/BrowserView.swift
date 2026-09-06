@@ -31,6 +31,10 @@ struct BrowserView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openFolder)) { _ in
             chooseFolder()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .refreshFolder)) { _ in
+            guard let model else { return }
+            Task { await model.refreshCurrentFolder() }
+        }
     }
 
     private func start() {
