@@ -52,11 +52,10 @@ struct PhotoGridView: View {
         .focusable()
         .onKeyPress(.leftArrow) { move(-1) }
         .onKeyPress(.rightArrow) { move(1) }
-        .onKeyPress(keys: ["a"]) { press in
-            guard press.modifiers.contains(.command) else { return .ignored }
-            selection.selectAll(order)
-            return .handled
-        }
+        // No ⌘A here. A key equivalent is claimed by the menu bar before the
+        // focused view is offered the event, so a view-level handler for it is
+        // dead code that reads like coverage. Select All is a menu command in
+        // `LightboxApp`, which also makes it discoverable.
     }
 
     /// Moves the selection one cell along the display order.

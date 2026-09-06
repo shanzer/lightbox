@@ -96,7 +96,10 @@ struct PhotoGridTests {
                 "row 2 is still on screen, so the range must still extend from it")
     }
 
-    @Test func anAnchorThatIsDeletedIsDropped() async throws {
+    /// A deleted anchor is dropped only when the selection it anchored is gone
+    /// too. When rows survive it moves to the lowest of them — see
+    /// `retainReAnchorsToTheLowestSurvivorWhenTheAnchorRowIsGone`.
+    @Test func anAnchorThatIsDeletedIsDroppedWhenNothingSurvives() async throws {
         let folder = missingFolder
         let all = (1...4).map { record(id: $0, in: folder) }
         let survivors = [all[2], all[3]]
@@ -112,6 +115,56 @@ struct PhotoGridTests {
 
         #expect(model.selection.selected.isEmpty)
         #expect(model.selection.anchor == nil, "nothing may extend from a row that is gone")
+    }
+
+    /// A reload that deletes the anchored row but leaves the rest of the range
+    /// must not silently collapse the user's next shift-click.
+    @Test func aReloadThatDeletesTheAnchorLeavesTheRangeExtendable() async throws {
+        let folder = missingFolder
+        let all = (1...5).map { record(id: $0, in: folder) }
+        let survivors = Array(all[1...])
+        let model = BrowserModel(store: try store(),
+                                 searcher: ScriptedSearcher([all, survivors]))
+
+        await model.open(folder)
+        model.selection.click(1, in: model.order, shift: false, command: false)
+        model.selection.click(3, in: model.order, shift: true, command: false)
+        #expect(model.selection.selected == [1, 2, 3])
+
+        await model.reload()
+
+        #expect(model.selection.selected == [2, 3])
+        #expect(model.selection.anchor == 2, "the range now extends from its lowest survivor")
+
+        model.selection.click(5, in: model.order, shift: true, command: false)
+        #expect(model.selection.selected == [2, 3, 4, 5],
+                "a dropped anchor would have collapsed this to [5]")
+    }
+
+    // MARK: - Select All
+
+    /// The menu command's target. ⌘A is a menu key equivalent, so this is the
+    /// path the shortcut actually takes — `PhotoGridView` never sees the event.
+    @Test func selectAllTakesEverythingOnScreen() async throws {
+        let folder = missingFolder
+        let rows = (1...4).map { record(id: $0, in: folder) }
+        let model = BrowserModel(store: try store(), searcher: ScriptedSearcher([rows]))
+
+        await model.open(folder)
+        model.selectAll()
+
+        #expect(model.selection.selected == [1, 2, 3, 4])
+        #expect(model.selection.anchor == 1)
+    }
+
+    @Test func selectAllOnAnEmptyGridSelectsNothing() async throws {
+        let model = BrowserModel(store: try store(), searcher: ScriptedSearcher([[]]))
+
+        await model.open(missingFolder)
+        model.selectAll()
+
+        #expect(model.selection.selected.isEmpty)
+        #expect(model.selection.anchor == nil)
     }
 
     @Test func aReloadThatChangesNothingLeavesTheSelectionAlone() async throws {

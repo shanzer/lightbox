@@ -342,8 +342,10 @@ private final class SignalTestBox: @unchecked Sendable {
 struct ContentHasherSignalTests {
     /// The hasher's read buffer, and the size of each chunk fed to it.
     private static let chunkSize = 4096
-    /// How long each burst lasts and how often it fires inside that.
-    private static let windowDuration = 0.06
+    /// How many deliveries each burst waits for, and how often it fires while
+    /// waiting. The burst ends on the count, never on a stopwatch — see
+    /// `signalWindow()`.
+    private static let requiredDeliveries = 2
     private static let signalInterval: UInt32 = 2_000
     /// How many chunks get a burst before the rest of the payload is written at
     /// full speed. More than one so the retry is exercised part-way through the
@@ -401,6 +403,14 @@ struct ContentHasherSignalTests {
         let box = SignalTestBox()
         let ready = DispatchSemaphore(value: 0)
         let done = DispatchSemaphore(value: 0)
+        /// Holds the hashing thread alive until the test is finished with it.
+        ///
+        /// The test signals that thread by `pthread_t`, and a `Thread`'s pthread
+        /// is detached: once it exits, the id is free to be recycled, and a
+        /// `pthread_kill` racing the exit either fails or lands on an unrelated
+        /// thread. Parking after the result is published costs nothing and
+        /// makes the id valid for as long as the test can still use it.
+        let teardown = DispatchSemaphore(value: 0)
 
         let hashing = Thread {
             // The test host blocks SIGUSR1, and a new `Thread` inherits the
@@ -421,6 +431,7 @@ struct ContentHasherSignalTests {
             // hash of a prefix of the payload.
             box.result = Result { try ContentHasher(bufferSize: Self.chunkSize).hash(fifo) }
             done.signal()
+            teardown.wait()
         }
 
         /// Feeds `range` of the payload into the pipe without ever blocking, so
@@ -477,19 +488,43 @@ struct ContentHasherSignalTests {
             return .timedOut
         }
 
-        /// Fires SIGUSR1 at the hashing thread for one window, and reports how
-        /// many the handler actually took.
+        /// Fires SIGUSR1 at the hashing thread until the handler has taken
+        /// `requiredDeliveries` of them, and reports how many it took.
+        ///
+        /// **Bounded by progress, not by wall clock, and that distinction is
+        /// the whole fix.** A previous version fired for a fixed 60ms and then
+        /// demanded two deliveries — which is not a statement about the hasher
+        /// at all, it is a statement about how often the scheduler runs the
+        /// hashing thread inside 60ms. On a loaded machine it sometimes does
+        /// not run it twice, and the test failed on correct code roughly twice
+        /// in 130 runs. Waiting for the deliveries instead removes the
+        /// assumption rather than trading one timing guess for another, and
+        /// costs nothing on an idle machine, where two arrive in ~4ms.
+        ///
+        /// The cap is `patience`, and a hasher that has already returned ends
+        /// the loop early. That is precisely the regression's shape — a hasher
+        /// that reports the interrupted read as a failure stops taking signals
+        /// — and the short count it leaves behind is what fails the
+        /// expectation below.
         func signalWindow() -> Int {
             let before = signalDeliveries.load(ordering: .relaxed)
-            let deadline = Date().addingTimeInterval(Self.windowDuration)
-            while Date() < deadline {
+            let deadline = Date().addingTimeInterval(Self.patience)
+            var delivered = 0
+            while delivered < Self.requiredDeliveries {
+                // Checked before the kill, not after: a hasher that has
+                // returned will never take another signal, so there is nothing
+                // left to wait for.
+                if hasherFinished() { break }
+                guard Date() < deadline else { break }
                 if let thread = box.thread { pthread_kill(thread, SIGUSR1) }
                 usleep(Self.signalInterval)
+                delivered = signalDeliveries.load(ordering: .relaxed) - before
             }
-            return signalDeliveries.load(ordering: .relaxed) - before
+            return delivered
         }
 
         hashing.start()
+        defer { teardown.signal() }
         try #require(ready.wait(timeout: .now() + Self.patience) == .success,
                      "the hashing thread never started")
 
@@ -507,16 +542,21 @@ struct ContentHasherSignalTests {
             }
 
             // Two deliveries, not one, and that is the whole proof. With the
-            // pipe empty the hasher can only be finishing the digest of the
-            // chunk it just took, or already blocked in `read`. If the first
-            // delivery caught it in the digest, it then enters `read` and the
-            // second interrupts it there; if the first caught it in `read`, so
-            // did the second. Either way a blocked `read` was interrupted —
-            // without needing to assume anything about how the scheduler
-            // treated the thread. One delivery would leave the vacuous case
-            // (caught before it ever reached `read`) open.
+            // pipe verifiably empty the hasher can only be finishing the digest
+            // of the chunk it just took — microseconds — or already blocked in
+            // `read`. If the first delivery caught it in the digest, it then
+            // enters `read` and the second, at least one `signalInterval`
+            // later, interrupts it there; if the first caught it in `read`, so
+            // did the second. Either way a blocked `read` was interrupted. One
+            // delivery would leave the vacuous case — caught before it ever
+            // reached `read` — open.
+            //
+            // Reaching this line short is therefore only possible if the hasher
+            // stopped taking signals within `patience`, which is the
+            // regression, not a scheduling accident: `signalWindow()` waits for
+            // the count rather than for a stopwatch.
             let delivered = signalWindow()
-            #expect(delivered >= 2, """
+            #expect(delivered >= Self.requiredDeliveries, """
                 window \(window): \(delivered) SIGUSR1 delivered, too few to prove a \
                 blocked read was interrupted
                 """)

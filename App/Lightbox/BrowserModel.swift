@@ -179,6 +179,16 @@ final class BrowserModel {
         if pruned != selection { selection = pruned }
     }
 
+    /// Selects everything on screen.
+    ///
+    /// Here rather than in the view because `order` is the model's derived
+    /// state and the Select All menu command has no view to reach into: the
+    /// command posts, `BrowserView` forwards, and this is the one place that
+    /// knows what "everything" currently means.
+    func selectAll() {
+        selection.selectAll(order)
+    }
+
     // MARK: - Generations
 
     /// Invalidates everything in flight and returns the snapshot that replaces

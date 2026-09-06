@@ -38,6 +38,9 @@ struct BrowserView: View {
             guard let model else { return }
             Task { await model.refreshCurrentFolder() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .selectAllPhotos)) { _ in
+            model?.selectAll()
+        }
     }
 
     private func start() {
