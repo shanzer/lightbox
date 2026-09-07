@@ -438,8 +438,19 @@ with progress.
   which is recorded — that is what makes deletion undoable. Permanent delete is
   a separate command behind a confirmation naming the file count.
 - **Undo journal.** Every operation is written to `op_journal` before it runs
-  and marked complete after. Undo reverses moves, removes copies, and restores
-  from the Trash by recorded URL. The journal survives quitting.
+  and marked complete after. Undo reverses moves, **sends copies to the Trash**,
+  and restores from the Trash by recorded URL. The journal survives quitting.
+  *(Amended: this bullet said undo "removes copies". It trashes them. `delete`
+  is the only operation in this app that destroys a file, it lives behind its
+  own confirmation, and an undo that unlinked would be a destructive operation
+  reachable from ⌘Z with no confirmation at all. The Trash also keeps the
+  reversal reversible, which is what makes redo undo-of-the-undo.)*
+  *(Amended: undo reverses **the last batch** and only an all-`complete` one. A
+  batch with `in_flight`, `reconciled` or `failed` rows is refused with a reason
+  — `FileOperator.undoability(of:)` reports it, and reports a permanent delete
+  as un-undoable **before** the operation rather than after. Reversing a row
+  whose outcome the launch-time reconcile had to infer from two `stat`s is how a
+  half-finished cross-volume move becomes a lost photo.)*
 - **Collisions are resolved before anything moves.** A pre-flight pass checks
   the destination and presents skip / rename / replace, per item or applied to
   all. No batch discovers a collision at file 300.

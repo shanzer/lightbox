@@ -1,0 +1,716 @@
+import Testing
+import Foundation
+@testable import LightboxCore
+
+// MARK: - Support
+
+/// A crash is simulated rather than caused: the journal row is written by hand
+/// in the state a crash would have left it, the filesystem is arranged to match
+/// the moment being tested, and the store is then **opened** — which is where
+/// the reconcile runs. Nothing here calls the reconcile directly except the
+/// retention tests, which need a fixed clock.
+private struct ReconcileFixture {
+    let tree: TempTree
+    let indexURL: URL
+
+    init() throws {
+        tree = try TempTree()
+        indexURL = tree.root.appendingPathComponent("index/index.sqlite")
+    }
+
+    /// Opens the store at the fixture's path, running the launch-time reconcile.
+    func open() throws -> IndexStore { try IndexStore(url: indexURL) }
+}
+
+@discardableResult
+private func index(_ url: URL, into store: IndexStore,
+                   contentHash: String? = nil, phash: String? = nil) throws -> FileRecord {
+    var st = stat()
+    guard stat(url.path, &st) == 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    let record = FileRecord(
+        id: nil, path: url.path,
+        parentDir: url.deletingLastPathComponent().path,
+        name: url.lastPathComponent, ext: url.pathExtension.lowercased(),
+        size: Int64(st.st_size),
+        mtime: TimeInterval(st.st_mtimespec.tv_sec)
+            + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000,
+        device: Int64(st.st_dev), inode: Int64(bitPattern: UInt64(st.st_ino)),
+        volumeUUID: nil, width: 4000, height: 3000,
+        captureTime: 1_700_000_000, captureOffset: nil,
+        cameraMake: "Canon", cameraModel: "EOS R5", orientation: 1,
+        contentHash: contentHash, imageHash: nil, imageHashKind: nil, phash: phash,
+        hashedAt: contentHash == nil ? nil : 1_700_000_100,
+        indexedAt: 1_700_000_000)
+    _ = try store.upsert(record)
+    return try #require(try store.record(atPath: url.path))
+}
+
+/// Writes one `op_journal` row by hand and returns its `op_id`.
+@discardableResult
+private func journalRow(_ store: IndexStore, batch: String = "crashed-batch",
+                        kind: String, src: URL, dst: URL? = nil, trashURL: URL? = nil,
+                        timestamp: Double = Date().timeIntervalSince1970,
+                        state: String = "in_flight") throws -> Int64 {
+    try store.testExecute(sql: """
+        INSERT INTO op_journal (batch_id, kind, src, dst, trash_url, timestamp, state)
+        VALUES (?,?,?,?,?,?,?)
+        """, arguments: [batch, kind, src.path, dst?.path, trashURL?.path,
+                         timestamp, state])
+    return try #require(try store.testFetchOne(sql: "SELECT max(op_id) FROM op_journal")
+                        as Int64?)
+}
+
+private func rowState(_ store: IndexStore, _ opID: Int64) throws -> String? {
+    try store.testFetchOne(sql: "SELECT state FROM op_journal WHERE op_id = ?",
+                           arguments: [opID])
+}
+
+private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+
+// MARK: - move
+
+/// The `move` half of the decision table. Every case asserts **where the photo
+/// physically is** as well as what the index and the row say: the whole point of
+/// the reconcile is that it believes the filesystem, and a test that only reads
+/// the journal cannot tell whether it did.
+struct JournalReconcileMoveTests {
+    /// src exists, dst does not: the move never happened. The row must be left
+    /// exactly where it is.
+    @Test func aMoveThatNeverHappenedLeavesTheIndexAlone() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = fixture.tree.root
+            .appendingPathComponent("to/IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(source, into: store, contentHash: "content-abc")
+            opID = try journalRow(store, kind: "move", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(source))
+        #expect(!exists(destination))
+        let row = try #require(try store.record(atPath: source.path))
+        #expect(row.contentHash == "content-abc")
+        #expect(try store.record(atPath: destination.path) == nil)
+        #expect(try rowState(store, opID) == "reconciled")
+        #expect(store.journalReconcileReport.conclusions[opID] == .neverHappened)
+    }
+
+    /// src is gone, dst is there: it happened, and the row follows the file —
+    /// hashes and all, because a move does not change a byte.
+    @Test func aMoveThatHappenedRewritesTheRowToTheDestination() throws {
+        let fixture = try ReconcileFixture()
+        let source = fixture.tree.root.appendingPathComponent("from/IMG_0001.jpg")
+        let destination = try fixture.tree.file("to/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        var rowID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            // The row as it stood before the move: at `src`, with hashes.
+            try FileManager.default.createDirectory(
+                at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: source)
+            rowID = try #require(try index(source, into: store,
+                                           contentHash: "content-abc",
+                                           phash: "ffff0000ffff0000").id)
+            try FileManager.default.removeItem(at: source)
+            opID = try journalRow(store, kind: "move", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(!exists(source))
+        #expect(exists(destination))
+        #expect(try store.record(atPath: source.path) == nil)
+        let row = try #require(try store.record(atPath: destination.path))
+        #expect(row.id == rowID)
+        #expect(row.parentDir == destination.deletingLastPathComponent().path)
+        #expect(row.name == "IMG_0001.jpg")
+        #expect(row.contentHash == "content-abc")
+        #expect(row.phash == "ffff0000ffff0000")
+        // `files_fts` is standalone; a rewrite that forgets it answers filename
+        // search with a path that is gone.
+        #expect(try store.ftsMatchRowIDs("\"IMG_0001.jpg\"") == [rowID])
+        #expect(try rowState(store, opID) == "reconciled")
+        #expect(store.journalReconcileReport.conclusions[opID] == .happened)
+    }
+
+    /// A tier 0 pass between the crash and this open has already indexed the
+    /// destination. Moving the old row onto that path would collide with
+    /// `UNIQUE(path)`; the correct correction is to retire the stale source row
+    /// and leave the fresher one alone.
+    @Test func aMoveWhoseDestinationIsAlreadyIndexedRetiresTheSourceRow() throws {
+        let fixture = try ReconcileFixture()
+        let source = fixture.tree.root.appendingPathComponent("from/IMG_0001.jpg")
+        let destination = try fixture.tree.file("to/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        var destinationID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: source)
+            try index(source, into: store, contentHash: "content-abc")
+            try FileManager.default.removeItem(at: source)
+            destinationID = try #require(try index(destination, into: store).id)
+            opID = try journalRow(store, kind: "move", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(destination))
+        #expect(try store.record(atPath: source.path) == nil)
+        let row = try #require(try store.record(atPath: destination.path))
+        #expect(row.id == destinationID)
+        #expect(try store.count() == 1)
+        #expect(try rowState(store, opID) == "reconciled")
+    }
+
+    /// **The row that matters.** A crash between the copy leg and the delete leg
+    /// of a cross-volume move leaves both paths holding the photo. A journal row
+    /// saying `move` plus a destination that exists must never be read as
+    /// permission to unlink the source.
+    @Test func aCrossVolumeMoveWithBothPathsPresentKeepsBothAndAddsACopyRow() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try fixture.tree.file("to/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        var sourceID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            sourceID = try #require(try index(source, into: store,
+                                              contentHash: "content-abc",
+                                              phash: "ffff0000ffff0000").id)
+            opID = try journalRow(store, kind: "move", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        // Neither file may be removed. This is the assertion the issue is about.
+        #expect(exists(source))
+        #expect(exists(destination))
+        let original = try #require(try store.record(atPath: source.path))
+        #expect(original.id == sourceID)
+        #expect(original.contentHash == "content-abc")
+        #expect(original.phash == "ffff0000ffff0000")
+        let copy = try #require(try store.record(atPath: destination.path))
+        #expect(copy.id != sourceID)
+        // Never carry hashes across a crash: nothing verified these bytes.
+        #expect(copy.contentHash == nil)
+        #expect(copy.phash == nil)
+        #expect(copy.hashedAt == nil)
+        // Metadata that cannot change when bytes are copied does come across, so
+        // the new row is not a blank the grid cannot draw.
+        #expect(copy.width == 4000)
+        #expect(copy.volumeUUID == nil)
+        #expect(try rowState(store, opID) == "reconciled")
+        #expect(store.journalReconcileReport.conclusions[opID] == .copyDoneDeleteNot)
+    }
+
+    /// Neither path holds anything. The index must not go on claiming a photo at
+    /// either of them.
+    @Test func aMoveWithNeitherPathPresentRetiresBothStaleRows() throws {
+        let fixture = try ReconcileFixture()
+        let source = fixture.tree.root.appendingPathComponent("from/IMG_0001.jpg")
+        let destination = fixture.tree.root.appendingPathComponent("to/IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            for url in [source, destination] {
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(repeating: 0x41, count: 64).write(to: url)
+                try index(url, into: store)
+                try FileManager.default.removeItem(at: url)
+            }
+            opID = try journalRow(store, kind: "move", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(try store.count() == 0)
+        #expect(try rowState(store, opID) == "reconciled")
+        #expect(store.journalReconcileReport.conclusions[opID] == .goneFromBoth)
+    }
+
+    /// A `move` row with no `dst` names one of the two paths the decision needs.
+    /// There is nothing to believe the filesystem about, so the row stays
+    /// `in_flight` and retention never takes it.
+    @Test func aMoveRowWithNoDestinationIsLeftInFlight() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(source, into: store, contentHash: "content-abc")
+            opID = try journalRow(store, kind: "move", src: source, dst: nil)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(try rowState(store, opID) == "in_flight")
+        #expect(store.journalReconcileReport.conclusions[opID] == .malformed)
+        #expect(store.journalReconcileReport.unresolved == 1)
+        #expect(try store.record(atPath: source.path)?.contentHash == "content-abc")
+    }
+}
+
+// MARK: - copy
+
+struct JournalReconcileCopyTests {
+    @Test func aCopyWhoseDestinationLandedGetsARowWithoutHashes() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try fixture.tree.file("to/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(source, into: store, contentHash: "content-abc")
+            opID = try journalRow(store, kind: "copy", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(source))
+        #expect(exists(destination))
+        #expect(try store.record(atPath: source.path)?.contentHash == "content-abc")
+        let copy = try #require(try store.record(atPath: destination.path))
+        #expect(copy.contentHash == nil)
+        #expect(copy.hashedAt == nil)
+        #expect(copy.size == 64)
+        #expect(try rowState(store, opID) == "reconciled")
+        #expect(store.journalReconcileReport.conclusions[opID] == .happened)
+    }
+
+    @Test func aCopyWhoseDestinationIsNotThereChangesNothing() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = fixture.tree.root.appendingPathComponent("to/IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(source, into: store, contentHash: "content-abc")
+            opID = try journalRow(store, kind: "copy", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(try store.count() == 1)
+        #expect(try store.record(atPath: source.path)?.contentHash == "content-abc")
+        #expect(store.journalReconcileReport.conclusions[opID] == .neverHappened)
+    }
+}
+
+// MARK: - trash: the plain rows
+
+struct JournalReconcilePlainTrashTests {
+    @Test func aTrashWhoseSourceIsStillThereChangedNothing() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("lib/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(source, into: store, contentHash: "content-abc")
+            opID = try journalRow(store, kind: "trash", src: source)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(source))
+        #expect(try store.record(atPath: source.path)?.contentHash == "content-abc")
+        #expect(store.journalReconcileReport.conclusions[opID] == .neverHappened)
+        #expect(try rowState(store, opID) == "reconciled")
+    }
+
+    /// The file is gone from `src` and the row named where it went. The index
+    /// row goes; the recorded URL is what makes it recoverable.
+    @Test func aTrashThatHappenedRetiresTheRowAndNamesTheTrashURL() throws {
+        let fixture = try ReconcileFixture()
+        let source = fixture.tree.root.appendingPathComponent("lib/IMG_0001.jpg")
+        // A stand-in for the Trash, so the suite never touches the real one.
+        let trashed = try fixture.tree.file("trash/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: source)
+            try index(source, into: store)
+            try FileManager.default.removeItem(at: source)
+            opID = try journalRow(store, kind: "trash", src: source, trashURL: trashed)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(trashed))
+        #expect(try store.record(atPath: source.path) == nil)
+        #expect(store.journalReconcileReport.conclusions[opID]
+                == .inTrash(url: trashed.path, present: true))
+        #expect(try rowState(store, opID) == "reconciled")
+    }
+
+    /// `trash_url` records where the photo went, not a promise that it is still
+    /// there. A Trash emptied since the crash is reported as such rather than
+    /// asserted to hold the file.
+    @Test func aTrashWhoseURLNoLongerExistsIsReportedAsGone() throws {
+        let fixture = try ReconcileFixture()
+        let source = fixture.tree.root.appendingPathComponent("lib/IMG_0001.jpg")
+        let trashed = fixture.tree.root.appendingPathComponent("trash/IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: source)
+            try index(source, into: store)
+            try FileManager.default.removeItem(at: source)
+            opID = try journalRow(store, kind: "trash", src: source, trashURL: trashed)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(try store.record(atPath: source.path) == nil)
+        #expect(store.journalReconcileReport.conclusions[opID]
+                == .inTrash(url: trashed.path, present: false))
+    }
+
+    /// Gone from `src` with no `trash_url` is `trashURLNotRecorded`: the Trash
+    /// renames on collision, so nothing can derive the name. Not repairable —
+    /// but it must be *reported*, not silently treated as an ordinary trash.
+    @Test func aTrashWithNoRecordedURLIsReportedAsUnderivable() throws {
+        let fixture = try ReconcileFixture()
+        let source = fixture.tree.root.appendingPathComponent("lib/IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: source)
+            try index(source, into: store)
+            try FileManager.default.removeItem(at: source)
+            opID = try journalRow(store, kind: "trash", src: source)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(try store.record(atPath: source.path) == nil)
+        #expect(store.journalReconcileReport.conclusions[opID]
+                == .trashedUnderAnUnknownName)
+    }
+}
+
+// MARK: - trash: the aside rows a `replace` writes
+
+/// An aside row (`kind = trash`, `dst` = the stash) covers three moments and
+/// only the filesystem distinguishes them. The read order is `dst` →
+/// `trash_url` → `src`, and reading any one field alone gets a different case
+/// wrong each time.
+struct JournalReconcileAsideTests {
+    @Test func anAsideStillInItsStashIsReportedAtTheStash() throws {
+        let fixture = try ReconcileFixture()
+        let occupant = fixture.tree.root.appendingPathComponent("to/IMG_0001.jpg")
+        let stash = try fixture.tree.file("to/.lightbox-replaced-abc-0-0", bytes: 64)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: occupant.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: occupant)
+            try index(occupant, into: store, contentHash: "displaced")
+            try FileManager.default.removeItem(at: occupant)
+            opID = try journalRow(store, kind: "trash", src: occupant, dst: stash)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        // The stash is never removed: the reconcile only writes to `files`.
+        #expect(exists(stash))
+        #expect(try store.record(atPath: occupant.path) == nil)
+        #expect(store.journalReconcileReport.conclusions[opID] == .inStash(stash.path))
+        #expect(try rowState(store, opID) == "reconciled")
+    }
+
+    @Test func anAsideAlreadyDisposedOfIsReportedInTheTrash() throws {
+        let fixture = try ReconcileFixture()
+        let occupant = fixture.tree.root.appendingPathComponent("to/IMG_0001.jpg")
+        let stash = fixture.tree.root.appendingPathComponent("to/.lightbox-replaced-abc-0-0")
+        let trashed = try fixture.tree.file("trash/.lightbox-replaced-abc-0-0", bytes: 64)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: occupant.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: occupant)
+            try index(occupant, into: store, contentHash: "displaced")
+            try FileManager.default.removeItem(at: occupant)
+            opID = try journalRow(store, kind: "trash", src: occupant, dst: stash,
+                                  trashURL: trashed)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(!exists(stash))
+        #expect(exists(trashed))
+        #expect(try store.record(atPath: occupant.path) == nil)
+        #expect(store.journalReconcileReport.conclusions[opID]
+                == .inTrash(url: trashed.path, present: true))
+    }
+
+    /// The item was abandoned before staging ever ran: **neither the stash nor a
+    /// Trash URL holds anything and the photo never moved.** Reading `dst` alone
+    /// would call this "gone"; the occupant is untouched at `src`.
+    @Test func anAsideThatWasNeverStagedLeavesTheOccupantAlone() throws {
+        let fixture = try ReconcileFixture()
+        let occupant = try fixture.tree.file("to/IMG_0001.jpg", bytes: 64)
+        let stash = fixture.tree.root.appendingPathComponent("to/.lightbox-replaced-abc-0-0")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(occupant, into: store, contentHash: "displaced")
+            opID = try journalRow(store, kind: "trash", src: occupant, dst: stash)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(occupant))
+        #expect(try store.record(atPath: occupant.path)?.contentHash == "displaced")
+        #expect(store.journalReconcileReport.conclusions[opID] == .neverHappened)
+        #expect(try rowState(store, opID) == "reconciled")
+    }
+
+    @Test func anAsideWithNeitherStashNorURLIsReportedAsUnderivable() throws {
+        let fixture = try ReconcileFixture()
+        let occupant = fixture.tree.root.appendingPathComponent("to/IMG_0001.jpg")
+        let stash = fixture.tree.root.appendingPathComponent("to/.lightbox-replaced-abc-0-0")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: occupant.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: occupant)
+            try index(occupant, into: store)
+            try FileManager.default.removeItem(at: occupant)
+            opID = try journalRow(store, kind: "trash", src: occupant, dst: stash)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(try store.record(atPath: occupant.path) == nil)
+        #expect(store.journalReconcileReport.conclusions[opID]
+                == .trashedUnderAnUnknownName)
+    }
+}
+
+// MARK: - delete
+
+struct JournalReconcileDeleteTests {
+    @Test func aDeleteThatHappenedRetiresTheRow() throws {
+        let fixture = try ReconcileFixture()
+        let source = fixture.tree.root.appendingPathComponent("lib/IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: source)
+            try index(source, into: store)
+            try FileManager.default.removeItem(at: source)
+            opID = try journalRow(store, kind: "delete", src: source)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(try store.count() == 0)
+        #expect(store.journalReconcileReport.conclusions[opID] == .happened)
+        #expect(try rowState(store, opID) == "reconciled")
+    }
+
+    @Test func aDeleteThatNeverRanLeavesTheRow() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("lib/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(source, into: store, contentHash: "content-abc")
+            opID = try journalRow(store, kind: "delete", src: source)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(source))
+        #expect(try store.record(atPath: source.path)?.contentHash == "content-abc")
+        #expect(store.journalReconcileReport.conclusions[opID] == .neverHappened)
+    }
+}
+
+// MARK: - the staleness guard
+
+struct JournalReconcileStalenessTests {
+    /// **Never remove a row whose file is there.** Between the crash and this
+    /// open, another photo took the path over and a tier 0 pass indexed it. The
+    /// crashed row names that path, and retiring it on the strength of "the
+    /// journal said this file went to the Trash" would delete a live photo's row
+    /// — hashes, dimensions, analysis and all.
+    @Test func aRowWhoseSourcePathHoldsAnIndexedPhotoIsLeftAlone() throws {
+        let fixture = try ReconcileFixture()
+        let path = try fixture.tree.file("lib/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        var survivorID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(path, into: store, contentHash: "the-old-photo")
+            // The old photo goes; a different one arrives at the same path and
+            // is indexed.
+            try FileManager.default.removeItem(at: path)
+            try Data(repeating: 0x42, count: 128).write(to: path)
+            // No hashes on the new row: `upsertRow` clears them when size or
+            // mtime change, which is exactly what happened here.
+            survivorID = try #require(try index(path, into: store).id)
+            opID = try journalRow(store, kind: "trash", src: path)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(path))
+        let row = try #require(try store.record(atPath: path.path))
+        #expect(row.id == survivorID)
+        #expect(row.size == 128)
+        #expect(store.journalReconcileReport.conclusions[opID] == .neverHappened)
+    }
+
+    /// The mirror of the case above: the path holds a file, but the row still
+    /// describes the *old* one — different size, different inode. Keeping it
+    /// leaves a stale digest at a path that now holds different bytes, which is
+    /// the row duplicate detection would act on.
+    @Test func aRowThatNoLongerDescribesTheFileAtItsPathIsRetired() throws {
+        let fixture = try ReconcileFixture()
+        let path = try fixture.tree.file("lib/IMG_0001.jpg", bytes: 64)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try index(path, into: store, contentHash: "the-old-photo")
+            try FileManager.default.removeItem(at: path)
+            try Data(repeating: 0x42, count: 128).write(to: path)
+            opID = try journalRow(store, kind: "trash", src: path)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(path))
+        #expect(try store.record(atPath: path.path) == nil)
+        #expect(try rowState(store, opID) == "reconciled")
+    }
+}
+
+// MARK: - launch, robustness and retention
+
+struct JournalRetentionTests {
+    /// The reconcile is not something a caller opts into: opening the store runs
+    /// it, before the initializer hands anything back.
+    @Test func openingTheStoreIsWhatRunsTheReconcile() throws {
+        let fixture = try ReconcileFixture()
+        let source = fixture.tree.root.appendingPathComponent("from/IMG_0001.jpg")
+        let destination = try fixture.tree.file("to/IMG_0001.jpg", bytes: 64)
+        do {
+            let store = try fixture.open()
+            try FileManager.default.createDirectory(
+                at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0x41, count: 64).write(to: source)
+            try index(source, into: store)
+            try FileManager.default.removeItem(at: source)
+            try journalRow(store, kind: "move", src: source, dst: destination)
+            // Nothing has reconciled it yet: this store opened before the row
+            // existed.
+            #expect(try store.journalRows(inState: .inFlight).count == 1)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(try store.journalRows(inState: .inFlight).isEmpty)
+        #expect(store.journalReconcileReport.examined == 1)
+        #expect(store.journalReconcileReport.reconciled == 1)
+        #expect(try store.record(atPath: destination.path) != nil)
+    }
+
+    /// A `kind` or `state` string this build does not know belongs to whoever
+    /// wrote it. Opening the store must not crash, and must not touch the row.
+    @Test func aRowThisBuildCannotDecodeIsLeftUntouchedAndTheStoreOpens() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("lib/IMG_0001.jpg", bytes: 64)
+        do {
+            let store = try fixture.open()
+            try journalRow(store, kind: "teleport", src: source)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(store.journalReconcileReport.examined == 0)
+        let kind: String? = try store.testFetchOne(sql: "SELECT kind FROM op_journal")
+        let state: String? = try store.testFetchOne(sql: "SELECT state FROM op_journal")
+        #expect(kind == "teleport")
+        #expect(state == "in_flight")
+    }
+
+    @Test func retentionDropsBatchesOlderThanThirtyDays() throws {
+        let fixture = try ReconcileFixture()
+        let store = try fixture.open()
+        let source = try fixture.tree.file("lib/IMG_0001.jpg", bytes: 8)
+        let now = 1_800_000_000.0
+        let old = now - 31 * 86_400
+        try journalRow(store, batch: "ancient", kind: "trash", src: source,
+                       timestamp: old, state: "complete")
+        try journalRow(store, batch: "recent", kind: "trash", src: source,
+                       timestamp: now - 86_400, state: "complete")
+
+        let report = try store.reconcileJournal(now: now)
+        #expect(report.retired == 1)
+        let batches: [String] = try store.journalRows(batchID: "ancient").map(\.batchID)
+        #expect(batches.isEmpty)
+        #expect(try store.journalRows(batchID: "recent").count == 1)
+    }
+
+    @Test func retentionKeepsOnlyTheNewestBatches() throws {
+        let fixture = try ReconcileFixture()
+        let store = try fixture.open()
+        let source = try fixture.tree.file("lib/IMG_0001.jpg", bytes: 8)
+        let now = 1_800_000_000.0
+        let total = IndexStore.journalRetentionBatches + 5
+        for n in 0..<total {
+            try journalRow(store, batch: String(format: "batch-%04d", n), kind: "trash",
+                           src: source, timestamp: now - Double(total - n),
+                           state: "complete")
+        }
+
+        let report = try store.reconcileJournal(now: now)
+        #expect(report.retired == 5)
+        let remaining: Int? = try store.testFetchOne(
+            sql: "SELECT count(DISTINCT batch_id) FROM op_journal")
+        #expect(remaining == IndexStore.journalRetentionBatches)
+        // The oldest five went; the newest survived.
+        #expect(try store.journalRows(batchID: "batch-0000").isEmpty)
+        #expect(try store.journalRows(batchID: String(format: "batch-%04d", total - 1))
+                    .count == 1)
+    }
+
+    /// Retention deletes settled rows. A row still `in_flight` — the malformed
+    /// kind the reconcile refuses to interpret — is the one record that it
+    /// exists, and no age makes it safe to throw away.
+    @Test func retentionNeverDeletesAnInFlightRow() throws {
+        let fixture = try ReconcileFixture()
+        let store = try fixture.open()
+        let source = try fixture.tree.file("lib/IMG_0001.jpg", bytes: 8)
+        let now = 1_800_000_000.0
+        let opID = try journalRow(store, batch: "ancient", kind: "move", src: source,
+                                  dst: nil, timestamp: now - 400 * 86_400)
+
+        let report = try store.reconcileJournal(now: now)
+        #expect(report.unresolved == 1)
+        #expect(report.retired == 0)
+        #expect(try rowState(store, opID) == "in_flight")
+    }
+}

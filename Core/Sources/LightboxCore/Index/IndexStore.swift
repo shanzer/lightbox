@@ -110,6 +110,7 @@ public final class IndexStore: Sendable {
         ownedDirectory = nil
         pool = try Self.openPool(at: url)
         try Self.migrator.migrate(pool)
+        journalReconcileReport = Self.reconcileJournalAtOpen(in: pool)
     }
 
     private init(temporaryDirectory: URL) throws {
@@ -118,7 +119,20 @@ public final class IndexStore: Sendable {
         ownedDirectory = temporaryDirectory
         pool = try Self.openPool(at: url)
         try Self.migrator.migrate(pool)
+        journalReconcileReport = Self.reconcileJournalAtOpen(in: pool)
     }
+
+    /// What the launch-time reconcile found and did when this store was opened
+    /// (spec §8, `IndexStore+Reconcile.swift`).
+    ///
+    /// Every `in_flight` journal row is resolved against the filesystem here,
+    /// **before this initializer returns**, so no window can start a pass over
+    /// rows that a crash left describing files which have since moved. The
+    /// report is kept rather than discarded because its `conclusions` are the
+    /// only record of where a photo actually ended up when the answer was
+    /// "in a stash" or "in the Trash under a name nothing can derive" — the
+    /// journal row itself, once `reconciled`, no longer says.
+    public let journalReconcileReport: JournalReconcileReport
 
     /// A store nothing else can reach, on a file nothing else will find.
     ///
