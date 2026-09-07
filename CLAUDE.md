@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 588 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 596 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 63 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -160,6 +160,17 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   never remove a file, never remove a row whose path still holds the file it describes
   (stale = nothing there, or a different inode/size/mtime), never carry hashes across a
   crash. `IndexStore.decide`'s doc comment is the whole decision table.
+- **"Something is at `dst`" is never "the file that moved is at `dst`".** Every reconcile
+  branch that writes to a destination first checks `destinationMatches` (the file's size
+  and mtime against the source's row) — `rename(2)`, `copyfile` with `COPYFILE_ALL` and
+  `clonefile` all preserve both, so it only rejects a stranger that arrived in the
+  plan/execute gap or a copy the crash left short. Without it a 999-byte stranger inherits
+  a 64-byte photo's `content_hash`. A destination that fails gets **no row at all**, not a
+  NULL-dimensioned one: `needsReindex` keys on size and mtime, so a row matching its file
+  is never re-read and its nulls would be permanent. Retention floors the age rule at one
+  batch (`rn > 1`) for the same reason ⌘Z exists — 31 idle days must not eat the last
+  batch. And the reconcile's `stat`s run off the calling thread on a bounded wait, because
+  the app opens its store on the main actor before the first window draws.
 - **`reconciled` is not `complete`, and undo knows the difference.** A `reconciled` row's
   outcome was reconstructed from two `stat`s after a crash, so `undoability(of:)` refuses
   the batch — as it refuses `in_flight` and `failed`. Only `skipped` is harmless enough to

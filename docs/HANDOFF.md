@@ -109,7 +109,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 588 tests, 69 suites.
+# Core: 596 tests, 72 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -163,7 +163,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 588 tests live. `App/` only wires it to views.
+where all the logic and all 596 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -588,12 +588,59 @@ all three are now done:
   hashes. Its test asserts both files are on disk, and the mutation that turns
   the branch back into "believe the row" fails it.
 
+  **"Something is at `dst`" is not "the file that moved is at `dst`".** Every
+  branch that would write to a destination first checks `destinationMatches` —
+  the file's `size` and `mtime` against the source's row — and writes nothing
+  when it fails. `rename(2)` preserves both, and so do `copyfile(3)` with
+  `COPYFILE_ALL` and `clonefile`, so the check only rejects two things, and both
+  are real: a **stranger** that arrived in the plan/execute gap (widened, after a
+  crash, to however long the app was shut), and a **copy the crash left short**.
+  Without it a 999-byte stranger inherited a 64-byte photo's `content_hash` — a
+  digest describing bytes it does not contain, on a row nothing re-hashes, in
+  the table the duplicate view deletes on. It is deliberately a *different* test
+  from `removalIfStale`'s, which also requires the inode: there the path is
+  unchanged so a new inode is evidence of a different file, while here the path
+  changed by construction and a cross-volume copy lands on a new inode by
+  definition. A destination that fails the check gets **no row at all** rather
+  than a row with NULL dimensions: `needsReindex` keys on `size` and `mtime`
+  alone, so a row whose facts match its file is never re-read and its nulls
+  would be permanent, while an unindexed path is indexed completely by the next
+  walk.
+
+  **Every correction is one transaction, so one collision is not one bad row.**
+  Two `in_flight` rows naming one destination — two copies of the same photo,
+  two crashed batches, one name — used to raise `UNIQUE(files.path)`, roll the
+  whole pass back and leave *everything* `in_flight` for a next open that failed
+  identically, forever. Destination claims are now deduped: the first wins, the
+  loser is marked `reconciled` with a conclusion naming the path and still gets
+  the correction that cannot collide (retiring its own stale source row).
+
   **Retention:** `IndexStore.journalRetentionDays` (30) and
   `journalRetentionBatches` (200), an AND-keep — a row survives only if its
   batch is inside both — run in the reconcile's write transaction and never
   touching an `in_flight` row. A malformed row (a `move`/`copy` with a NULL
   `dst`, which no `FileOperator` path produces) is left `in_flight` deliberately
   and is therefore never retired: it is the only record that it exists.
+
+  **The age rule is floored at one batch** (`rn > 1`). Thirty idle days is an
+  ordinary holiday, and without the floor the last batch went with them: come
+  back after 31 days and ⌘Z answers `noSuchBatch` for an operation the user
+  still remembers doing. The count rule needs no such floor — at `rn > 200`
+  there are by definition 200 newer batches to undo instead.
+
+  **The reconcile's `stat`s do not run on the calling thread.** `init` is
+  synchronous and the reconcile still finishes before it returns, but the app
+  opens its store on the **main actor** (`BrowserView.start` →
+  `BrowserModel(at:)`), the rows name whatever volume the library lives on, and
+  one `stat` on a spun-down external drive parks its thread for seconds — before
+  the first window draws. The work goes to a dispatch queue and `init` waits on
+  it for `IndexStore.reconcileBudget` (3 s; five thousand rows reconcile in
+  about 0.19 s warm, so this only bites on a drive that has to spin up). Past
+  the budget the run is **abandoned before its write transaction**, so nothing
+  partial lands afterwards: every row stays `in_flight`, the report says
+  `.deferred`, and the next open tries again. `JournalReconcileDisposition` also
+  distinguishes a run that threw from an empty journal, which the counts alone
+  could not.
 
   Two things worth knowing. **Undoing a trash leaves the restored photo without
   an index row** until the next tier 0 pass: the row was deleted when the file

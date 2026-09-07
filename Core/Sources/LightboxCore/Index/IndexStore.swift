@@ -110,6 +110,16 @@ public final class IndexStore: Sendable {
         ownedDirectory = nil
         pool = try Self.openPool(at: url)
         try Self.migrator.migrate(pool)
+        // Synchronous on purpose — the reconcile has to finish before anything
+        // can hold this store — but **its `stat`s do not run on this thread**.
+        // The app opens its store on the main actor (`BrowserView.start` →
+        // `BrowserModel(at:)`), the rows name whatever volume the library lives
+        // on, and one `stat` on a spun-down external drive parks its thread for
+        // seconds. `reconcileJournalAtOpen` hands the work to a dispatch queue
+        // and waits on it for `reconcileBudget`, then abandons it before its
+        // write. So this bounds how long a launch can block, and a run that
+        // outruns the bound leaves every row `in_flight` for the next open
+        // rather than landing half of itself afterwards.
         journalReconcileReport = Self.reconcileJournalAtOpen(in: pool)
     }
 

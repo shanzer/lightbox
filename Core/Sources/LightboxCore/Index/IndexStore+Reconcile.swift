@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import Synchronization
 
 /// Where the launch-time reconcile decided one `in_flight` photo actually is.
 ///
@@ -38,10 +39,53 @@ public enum JournalConclusion: Sendable, Equatable, Hashable {
     /// A `move` row whose `src` and `dst` both hold nothing. The journal names
     /// two paths and the filesystem has neither.
     case goneFromBoth
+    /// **Something is at `dst`, and it is not what the row was about.** Its
+    /// `size` or `mtime` does not match the `files` row the operation started
+    /// from, so it is either a stranger that arrived in the plan/execute gap —
+    /// the same gap `destinationNotReplaceable` exists for — or a copy the
+    /// crash left short.
+    ///
+    /// Nothing is carried onto it. That is the whole reason this case is
+    /// distinct from `happened`: rewriting the source's row onto a stranger
+    /// hands a 999-byte file a 64-byte file's `content_hash`, a digest
+    /// describing bytes it does not contain, on a row nothing will re-hash and
+    /// in the table the duplicate view deletes on. The source row is retired if
+    /// it is stale and the path is left for the walker to index properly.
+    case destinationDiffersFromTheSource
+    /// Two `in_flight` rows in one journal want to write the same `files` path,
+    /// and the earlier one won. Carries the path.
+    ///
+    /// One transaction carries every correction, so a second row claiming a
+    /// taken path is not one bad row — it is `UNIQUE(files.path)` rolling back
+    /// the *whole* pass, leaving every row `in_flight` for a next open that
+    /// would fail in exactly the same way. Forever. The loser is marked
+    /// `reconciled` with this conclusion rather than left to poison the run.
+    case destinationClaimedByAnotherRow(String)
     /// The row cannot be reasoned about: a `move` or `copy` with a NULL `dst`.
     /// Left `in_flight` and never retired — there is nothing to believe the
     /// filesystem *about* when the row names one of the two paths.
     case malformed
+}
+
+/// What became of one run of the reconcile itself, as opposed to what it found.
+///
+/// Separate from the counts because "the journal was empty" and "the write
+/// transaction threw" produce the same zeros, and a caller that cannot tell
+/// them apart cannot tell a clean launch from a repair that silently did not
+/// happen.
+public enum JournalReconcileDisposition: Sendable, Equatable {
+    /// There was nothing in `op_journal` at all.
+    case emptyJournal
+    /// It ran to completion.
+    case ran
+    /// It threw. **Every row is still `in_flight`** and the next open tries
+    /// again; the store opened anyway, because a store that will not open is an
+    /// app that will not launch.
+    case failed(String)
+    /// It did not finish inside `init`'s budget and was abandoned **before its
+    /// write transaction**, so nothing partial landed. Every row is still
+    /// `in_flight`. See `reconcileBudget`.
+    case deferred
 }
 
 /// What one run of the launch-time reconcile did.
@@ -58,10 +102,14 @@ public struct JournalReconcileReport: Sendable, Equatable {
     public let retired: Int
     /// What was concluded about each examined row, by `op_id`.
     public let conclusions: [Int64: JournalConclusion]
+    /// What became of the run itself.
+    public let disposition: JournalReconcileDisposition
 
-    public static let none = JournalReconcileReport(
-        examined: 0, reconciled: 0, unresolved: 0, corrections: 0, retired: 0,
-        conclusions: [:])
+    static func nothing(_ disposition: JournalReconcileDisposition) -> JournalReconcileReport {
+        JournalReconcileReport(examined: 0, reconciled: 0, unresolved: 0,
+                               corrections: 0, retired: 0, conclusions: [:],
+                               disposition: disposition)
+    }
 }
 
 // MARK: - Reconcile
@@ -130,10 +178,48 @@ extension IndexStore {
     /// what makes the report assignable to a `let` the whole app can read.
     /// See the type-level note on why it cannot throw.
     static func reconcileJournalAtOpen(in pool: DatabasePool,
-                                       now: Double = Date().timeIntervalSince1970)
+                                       now: Double = Date().timeIntervalSince1970,
+                                       budget: TimeInterval = reconcileBudget)
         -> JournalReconcileReport {
-        (try? reconcileJournal(in: pool, now: now)) ?? .none
+        let slot = ReconcileSlot()
+        let finished = DispatchSemaphore(value: 0)
+        // An ordinary dispatch queue, not the cooperative pool and not the
+        // calling thread. `stat` on a spun-down external drive parks a thread
+        // for seconds, and the calling thread here is the **main actor**: the
+        // app opens its store in `BrowserModel(at:)` before the first window
+        // draws. libdispatch replaces a blocked thread on one of these; the main
+        // thread has no replacement.
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let report = try reconcileJournal(in: pool, now: now,
+                                                  isAbandoned: slot.isAbandoned)
+                slot.finish(report)
+            } catch {
+                slot.finish(.nothing(.failed(String(describing: error))))
+            }
+            finished.signal()
+        }
+        guard finished.wait(timeout: .now() + budget) == .success else {
+            // Past the budget the run is abandoned rather than waited out, and
+            // `isAbandoned` is checked immediately **before the write
+            // transaction**, so nothing partial can land after `init` has
+            // returned. Every row stays `in_flight`, which is exactly the state
+            // the next open is built to resolve — the repair is deferred, never
+            // half-done.
+            slot.abandon()
+            return .nothing(.deferred)
+        }
+        return slot.report ?? .nothing(.deferred)
     }
+
+    /// How long `IndexStore.init` waits for the reconcile before opening anyway.
+    ///
+    /// Three seconds. A warm journal is nowhere near it — five thousand
+    /// `in_flight` rows reconcile in about 0.19 s on the boot volume — so this
+    /// only ever bites when the rows name a volume that has to spin up, and
+    /// there is nothing to lose by deferring that: the rows keep saying
+    /// `in_flight`, and `in_flight` already means "ask the filesystem".
+    static let reconcileBudget: TimeInterval = 3
 
     /// Runs the reconcile again, on a store that is already open. Tests reach
     /// for this with a fixed `now`; nothing in the app does.
@@ -151,17 +237,38 @@ extension IndexStore {
     /// retention delete go in one write transaction. Holding the writer while
     /// `stat`ing a sleeping external drive would park every window behind it.
     @discardableResult
-    static func reconcileJournal(in pool: DatabasePool, now: Double) throws
+    static func reconcileJournal(in pool: DatabasePool, now: Double,
+                                 isAbandoned: () -> Bool = { false }) throws
         -> JournalReconcileReport {
         let (rows, records, journalCount) = try readForReconcile(pool)
-        guard journalCount > 0 else { return .none }
+        guard journalCount > 0 else { return .nothing(.emptyJournal) }
 
         var mutations: [IndexMutation] = []
         var marks: [JournalMark] = []
         var conclusions: [Int64: JournalConclusion] = [:]
         var unresolved = 0
+        // **Every correction goes in one transaction, so one `UNIQUE(files.path)`
+        // is not one bad row — it rolls the whole pass back.** Every row then
+        // stays `in_flight` and the next open fails in exactly the same way,
+        // forever. Two `in_flight` rows naming one destination is enough to
+        // reach that: two moves interrupted onto one path, which the plan's own
+        // `claimedInBatch` rule cannot prevent across two crashed batches.
+        // The first claim wins; the loser is marked with a conclusion that names
+        // the path rather than left to poison the run.
+        var claimed: Set<String> = []
         for row in rows {
-            let decision = Self.decide(row, records: records, now: now)
+            var decision = Self.decide(row, records: records, now: now)
+            if let taken = Self.claim(&claimed, decision.mutations) {
+                // The loser still gets the correction that cannot collide:
+                // retire its own source row if the path it names is stale. Its
+                // destination is left for the walker, exactly as
+                // `destinationDiffersFromTheSource` leaves one — dropping the
+                // removal too would strand a row over a file that is gone.
+                decision = Decision(
+                    conclusion: .destinationClaimedByAnotherRow(taken),
+                    mutations: Self.removalIfStale(row.src, Self.statFacts(row.src),
+                                                   records))
+            }
             conclusions[row.opID] = decision.conclusion
             mutations.append(contentsOf: decision.mutations)
             if decision.conclusion == .malformed {
@@ -171,13 +278,15 @@ extension IndexStore {
             }
         }
 
+        guard !isAbandoned() else { return .nothing(.deferred) }
         let applied = try pool.write { db -> (Int, Int) in
             let corrections = try Self.apply(db, mutations: mutations, marks: marks)
             return (corrections, try Self.retireJournal(db, now: now))
         }
         return JournalReconcileReport(
             examined: rows.count, reconciled: marks.count, unresolved: unresolved,
-            corrections: applied.0, retired: applied.1, conclusions: conclusions)
+            corrections: applied.0, retired: applied.1, conclusions: conclusions,
+            disposition: .ran)
     }
 
     /// The `in_flight` rows, the `files` rows for every path they name, and how
@@ -270,27 +379,43 @@ extension IndexStore {
             case (true, false):
                 return Decision(conclusion: .neverHappened)
             case (false, true):
-                var decision = Decision(conclusion: .happened)
-                if records[dstPath] != nil {
-                    // Something already indexed the destination — a tier 0 pass
-                    // between the crash and this open. That row describes the
-                    // file better than the pre-move one does, so the correction
-                    // is to retire the source row, not to move it onto a path
-                    // that is taken.
-                    decision.mutations = removalIfStale(row.src, src, records)
-                } else if let record = records[row.src], let id = record.id {
-                    decision.mutations = [.move(id: id, fromPath: row.src,
-                                                to: URL(fileURLWithPath: dstPath))]
+                // Something is at `dst`. **That is not the same claim as "the
+                // file that moved is at `dst`"**, and rewriting the source's row
+                // onto whatever is there hands a stranger the source's
+                // `content_hash` — a digest describing bytes it does not
+                // contain, on a row nothing will re-hash.
+                guard let record = records[row.src], let facts = dst,
+                      destinationMatches(record, facts) else {
+                    return Decision(conclusion: .destinationDiffersFromTheSource,
+                                    mutations: removalIfStale(row.src, src, records))
                 }
-                return decision
+                guard records[dstPath] == nil else {
+                    // A tier 0 pass indexed the destination between the crash
+                    // and this open. That row was read from the file itself, so
+                    // it describes it better than the pre-move one does: retire
+                    // the source row rather than move it onto a taken path.
+                    return Decision(conclusion: .happened,
+                                    mutations: removalIfStale(row.src, src, records))
+                }
+                guard let id = record.id else { return Decision(conclusion: .happened) }
+                return Decision(conclusion: .happened,
+                                mutations: [.move(id: id, fromPath: row.src,
+                                                  to: URL(fileURLWithPath: dstPath))])
             case (true, true):
                 // **The row the issue calls out.** A `move` row plus a
                 // destination that exists is not permission to unlink the
                 // source: a cross-volume move is a copy then a delete, and this
                 // is what a crash between the two legs looks like. Both files
-                // stay; the index gains a row for the second one.
+                // stay, whatever else is decided below.
+                guard let source = records[row.src], let facts = dst,
+                      destinationMatches(source, facts) else {
+                    // A destination that is *not* the source's length is a copy
+                    // leg the crash interrupted. Nothing may be carried onto it
+                    // — see `insert`.
+                    return Decision(conclusion: .destinationDiffersFromTheSource)
+                }
                 var decision = Decision(conclusion: .copyDoneDeleteNot)
-                if records[dstPath] == nil, let source = records[row.src], let facts = dst {
+                if records[dstPath] == nil {
                     decision.mutations = [insert(source: source, at: dstPath,
                                                  facts: facts, now: now)]
                 }
@@ -305,8 +430,16 @@ extension IndexStore {
         case .copy:
             guard let dstPath else { return Decision(conclusion: .malformed) }
             guard let facts = dst else { return Decision(conclusion: .neverHappened) }
+            guard let source = records[row.src],
+                  destinationMatches(source, facts) else {
+                // Either nothing to derive a row from, or what is at `dst` is
+                // not this copy's output — a stranger, or a copy the crash left
+                // short. Both leave the path to the walker.
+                return Decision(conclusion: records[row.src] == nil
+                                ? .happened : .destinationDiffersFromTheSource)
+            }
             var decision = Decision(conclusion: .happened)
-            if records[dstPath] == nil, let source = records[row.src] {
+            if records[dstPath] == nil {
                 decision.mutations = [insert(source: source, at: dstPath,
                                              facts: facts, now: now)]
             }
@@ -361,6 +494,50 @@ extension IndexStore {
     /// hand-over; `size` and `mtime` catch the case where the same inode was
     /// rewritten in place, and are the same two columns tier 0 uses to decide a
     /// file is unchanged.
+    /// Records the `files` path each mutation would write, and returns the path
+    /// if one of them is already spoken for.
+    ///
+    /// Only writes to a *new* path can collide: `.remove` names a row that is
+    /// going, and two removals of one row are a second no-op `DELETE`. The set
+    /// is checked before it is added to, so a decision is taken whole or not at
+    /// all — a row that both moves and inserts must not have half of it applied.
+    private static func claim(_ claimed: inout Set<String>,
+                              _ mutations: [IndexMutation]) -> String? {
+        var wanted: [String] = []
+        for mutation in mutations {
+            switch mutation {
+            case .remove: continue
+            case .move(_, _, let destination): wanted.append(destination.path)
+            case .insertCopy(let insert): wanted.append(insert.destination.path)
+            }
+        }
+        if let taken = wanted.first(where: { claimed.contains($0) }) { return taken }
+        claimed.formUnion(wanted)
+        return nil
+    }
+
+    /// Whether the file now at a row's `dst` is the file the row was about.
+    ///
+    /// `size` and `mtime`, and **this is deliberately not the same test as
+    /// `removalIfStale`'s**: there the path is unchanged, so a changed inode is
+    /// itself evidence of a different file; here the path changed by
+    /// construction, and a cross-volume move copies the bytes to a new inode.
+    /// What every leg does preserve is length and modification time —
+    /// `rename(2)` touches neither, `copyfile(3)` with `COPYFILE_ALL` carries
+    /// the times across, and so does `clonefile`.
+    ///
+    /// It is doing two jobs at once, and both matter. A **stranger** that
+    /// arrived at the destination in the plan/execute gap — the same gap
+    /// `destinationNotReplaceable` exists for, widened to however long the app
+    /// was shut — fails on both fields. A **copy the crash left short** fails on
+    /// size, which is `verifyCopyLength`'s check asked after the fact.
+    private static func destinationMatches(
+        _ record: FileRecord,
+        _ facts: (size: Int64, mtime: Double, device: Int64, inode: Int64)
+    ) -> Bool {
+        record.size == facts.size && record.mtime == facts.mtime
+    }
+
     private static func removalIfStale(
         _ path: String,
         _ facts: (size: Int64, mtime: Double, device: Int64, inode: Int64)?,
@@ -376,6 +553,18 @@ extension IndexStore {
 
     /// A row for a destination a crash left behind, derived from the source's
     /// row and the destination's own `stat` — and **never carrying hashes**.
+    ///
+    /// **Only ever called for a destination that passed `destinationMatches`**,
+    /// which is what makes carrying the source's dimensions, capture time and
+    /// camera sound: the file at `dst` has the source's exact length and
+    /// modification time, and none of those fields can change when bytes are
+    /// copied. A destination that failed that test gets no row at all rather
+    /// than a row with NULL dimensions — `needsReindex` keys on `size` and
+    /// `mtime` alone, so a row whose facts match the file is never re-read, and
+    /// a NULL-dimensioned row would keep its nulls forever. A path with no row
+    /// is indexed completely by the next walk; a path with a wrong row is not.
+    /// Hashes stay NULL regardless: length is not byte identity, and the digest
+    /// is what the duplicate view deletes on.
     ///
     /// `volume_uuid` is left NULL rather than read: a `URLResourceValues` fetch
     /// is not a `stat`, and this runs at open with the writer about to be taken.
@@ -413,6 +602,13 @@ extension IndexStore {
     ///
     /// A batch is ranked by its newest row rather than its oldest, so a long
     /// batch is not aged out by the moment it started.
+    ///
+    /// **`rn > 1` floors the age rule at one batch.** Thirty idle days is an
+    /// ordinary holiday, and retention that takes the last batch with it turns
+    /// ⌘Z into `noSuchBatch` for an operation the user still remembers doing.
+    /// The age rule exists to bound the table, and one batch does not bound
+    /// anything. The count rule keeps no such floor: at `rn > 200` there are by
+    /// definition 200 newer batches to undo instead.
     static func retireJournal(_ db: Database, now: Double) throws -> Int {
         let cutoff = now - journalRetentionDays * 86_400
         try db.execute(sql: """
@@ -427,11 +623,29 @@ extension IndexStore {
                         FROM op_journal
                         GROUP BY batch_id
                     )
-                    WHERE last_touched < ? OR rn > ?
+                    WHERE (last_touched < ? AND rn > 1) OR rn > ?
               )
             """, arguments: [OpJournalState.inFlight.rawValue, cutoff,
                              journalRetentionBatches])
         return db.changesCount
+    }
+}
+
+/// The one value the reconcile's background thread and `init` share.
+///
+/// A `Mutex` cannot be captured by an escaping closure directly — it is
+/// non-copyable — so it lives inside a class, which is the shape the standard
+/// library documents for exactly this. No `@unchecked Sendable` anywhere: the
+/// `Mutex` is what makes the class Sendable.
+private final class ReconcileSlot: Sendable {
+    private let state = Mutex<(report: JournalReconcileReport?, abandoned: Bool)>(
+        (nil, false))
+
+    var report: JournalReconcileReport? { state.withLock { $0.report } }
+    func isAbandoned() -> Bool { state.withLock { $0.abandoned } }
+    func abandon() { state.withLock { $0.abandoned = true } }
+    func finish(_ report: JournalReconcileReport) {
+        state.withLock { if !$0.abandoned { $0.report = report } }
     }
 }
 
