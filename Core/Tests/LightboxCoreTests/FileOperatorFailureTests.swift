@@ -208,7 +208,18 @@ struct FileOperatorFailureTests {
         handle.withLock { $0 = task }
         installed.withLock { $0 = true }
 
-        await #expect(throws: CancellationError.self) { _ = try await task.value }
+        // The results of everything already finished travel out with the
+        // error: a cancelled batch has moved files and rewritten rows, and #7's
+        // summary sheet has to be able to say what it managed.
+        let completed = await #expect(throws: FileOperatorError.self) {
+            _ = try await task.value
+        }
+        guard case .cancelled(let done)? = completed else {
+            Issue.record("expected .cancelled, got \(String(describing: completed))")
+            return
+        }
+        #expect(done.count == 3)
+        #expect(done.allSatisfy { $0.outcome == .completed })
 
         let rows = try store.journalRows(batchID: plan.batchID)
         #expect(rows.count == 4)

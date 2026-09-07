@@ -50,7 +50,10 @@ struct FileOperatorCollisionTests {
         let plan = try await op.plan(kind: .move, sources: [first, second],
                                      destination: destination)
         #expect(plan.items[0].collisions.isEmpty)
-        #expect(plan.items[1].collisions == [destination.appendingPathComponent("IMG_0001.jpg")])
+        #expect(plan.items[1].collisions
+                == [FileOperationCollision(
+                    path: destination.appendingPathComponent("IMG_0001.jpg"),
+                    kind: .claimedInBatch)])
         #expect(plan.unresolvedCollisionIndices == [1])
         #expect(plan.hasUnresolvedCollisions)
     }
@@ -139,7 +142,13 @@ struct FileOperatorCollisionTests {
 
         let op = FileOperator(store: store)
         let plan = try await op.plan(kind: .move, sources: [source], destination: destination)
-        #expect(plan.items[0].collisions == [occupant])
+        defer {
+            for row in (try? store.journalRows(batchID: plan.batchID)) ?? [] {
+                row.trashURL.map { try? FileManager.default.removeItem(atPath: $0) }
+            }
+        }
+        #expect(plan.items[0].collisions
+                == [FileOperationCollision(path: occupant, kind: .occupied)])
         let results = try await op.execute(plan.resolvingCollision(at: 0, with: .replace))
         #expect(results[0].outcome == .completed)
 
@@ -326,7 +335,10 @@ struct FileOperatorCompanionTests {
 
         let op = FileOperator(store: store)
         let plan = try await op.plan(kind: .move, sources: [raw], destination: destination)
-        #expect(plan.items[0].collisions == [destination.appendingPathComponent("IMG_0001.xmp")])
+        #expect(plan.items[0].collisions
+                == [FileOperationCollision(
+                    path: destination.appendingPathComponent("IMG_0001.xmp"),
+                    kind: .occupied)])
         #expect(plan.hasUnresolvedCollisions)
 
         let results = try await op.execute(plan.resolvingAllCollisions(with: .rename))

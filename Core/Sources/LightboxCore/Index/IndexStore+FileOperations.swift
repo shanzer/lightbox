@@ -145,6 +145,23 @@ extension IndexStore {
         }
     }
 
+    /// Records where `trashItem` put a file, on its own, immediately.
+    ///
+    /// Its own transaction on purpose. Between `trashItem` returning and the
+    /// item's index transaction committing, this path is the **only** record of
+    /// where the photo went — the Trash renames on collision, so the name cannot
+    /// be derived from the original — and an index write that fails, or an
+    /// item-level rollback that discards the in-memory results, would lose it. A
+    /// row that says `in_flight` and names a Trash URL is recoverable; one that
+    /// says `in_flight` and names nothing is a photo the user has to go looking
+    /// for.
+    func recordTrashURL(opID: Int64, path: String) throws {
+        try pool.write { db in
+            try db.execute(sql: "UPDATE op_journal SET trash_url = ? WHERE op_id = ?",
+                           arguments: [path, opID])
+        }
+    }
+
     /// Marks journal rows without touching `files`. Used for the states that
     /// describe *not* having acted: `skipped` when a volume went away before an
     /// item's turn, `failed` when the filesystem refused.

@@ -45,6 +45,22 @@ public enum FileOperationKind: String, Sendable, Codable, Hashable, CaseIterable
 ///   because the volume went away before its turn. Nothing changed. Terminal.
 ///   (An item the user resolved to *skip* at collision time is never journalled
 ///   at all — the journal records intent, and there was none.)
+/// **Replace has its own rows.** The file a `replace` policy displaces is a
+/// photo the user did not select, and moving it aside is a filesystem mutation
+/// like any other, so it gets a row of its own in the same up-front
+/// transaction: `kind = .trash`, `src` = the displaced file's path, `dst` = the
+/// dot-prefixed stash it waits in. It reaches `complete` with `trash_url` set
+/// once the stash has gone to the Trash, `failed` once the file has been put
+/// back, and stays `in_flight` in between — which is the window a crash lands
+/// in. **A reader that finds such a row `in_flight` finds the photo at `dst`**;
+/// without that row the file would be an unreferenced dot-file and the next
+/// tier 0 pass would prune its index row.
+///
+/// **`trash_url` on a row that is not `complete`** is a forensic record of where
+/// a file briefly went during an attempt that was then undone, written the
+/// moment `trashItem` returned. It is not a claim that the file is still there:
+/// the row's `state` says what happened.
+///
 /// - `reconciled` — **written only by #6.** A row that was `in_flight` and has
 ///   since been resolved against the filesystem at launch. `FileOperator` never
 ///   writes it; it is defined here so both sides read one enumeration.
@@ -114,6 +130,12 @@ public enum FileOperationFailure: Error, Sendable, Equatable, Hashable {
     /// original's `content_hash` would be a permanently wrong digest on a file
     /// nothing would ever re-hash.
     case copyIncomplete
+    /// A rollback could not put things back. **This is the one failure that
+    /// does not mean "nothing changed"** — part of the item is at the
+    /// destination, or a replaced file is still in its stash, and the journal
+    /// rows are deliberately left `in_flight` because only the filesystem knows
+    /// what is where. The string names what could not be undone.
+    case rollbackIncomplete(String)
     /// A cross-volume move whose copy landed and whose source removal failed.
     /// **Both paths now exist.** The journal row is deliberately left
     /// `in_flight` for this case alone, because it is the one outcome the
@@ -158,6 +180,14 @@ public struct FileOperationResult: Sendable, Equatable {
 }
 
 public enum FileOperatorError: Error, Equatable, Sendable {
+    /// The batch was cancelled between two items.
+    ///
+    /// Carries the results of everything already finished, because a cancelled
+    /// batch has done real work: files moved, rows rewritten, journal rows
+    /// marked. Throwing a bare `CancellationError` would hand the summary sheet
+    /// nothing to show for it, and "what did it manage before I stopped it" is
+    /// the first question a user asks.
+    case cancelled(completed: [FileOperationResult])
     /// `move` and `copy` need somewhere to go.
     case destinationRequired
     /// `trash` and `delete` do not take a destination; passing one is a caller
@@ -175,10 +205,17 @@ public enum FileOperatorError: Error, Equatable, Sendable {
 enum FileOperationErrorMap {
     /// The POSIX code underneath a Foundation error, if there is one.
     ///
-    /// `FileManager` wraps its failures in `NSCocoaErrorDomain` and keeps the
-    /// real cause in `NSUnderlyingErrorKey`; `copyfile(3)` is surfaced here as
-    /// a bare `POSIXError`. Both are unwrapped in one place so the failure
-    /// taxonomy is derived from errno rather than from Cocoa's coarser codes.
+    /// `FileManager`'s path operations wrap their failures in
+    /// `NSCocoaErrorDomain` and keep the real cause in `NSUnderlyingErrorKey`;
+    /// `copyfile(3)` is surfaced here as a bare `POSIXError`. Both are unwrapped
+    /// in one place so the failure taxonomy is derived from errno.
+    ///
+    /// **`trashItem` is the exception, and it is why this cannot be the only
+    /// lookup.** It is implemented over Carbon File Manager, so it reports
+    /// `NSCocoaErrorDomain` with an `NSOSStatusErrorDomain` underlying error —
+    /// `-43 fnfErr`, `-5000 afpAccessDenied` — and never a POSIX one. Reading
+    /// only errno made every trash failure `.other`, which is a failure taxonomy
+    /// that does not classify the operation the user runs most.
     static func posixCode(_ error: any Error) -> Int32? {
         if let posix = error as? POSIXError { return posix.code.rawValue }
         let ns = error as NSError
@@ -186,6 +223,52 @@ enum FileOperationErrorMap {
         if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError,
            underlying.domain == NSPOSIXErrorDomain {
             return Int32(underlying.code)
+        }
+        return nil
+    }
+
+    /// The failure a Cocoa error code names, for the errors that carry no
+    /// errno. Codes are `CocoaError.Code` raw values, spelled numerically
+    /// because several of them have no symbol in the Swift overlay.
+    static func cocoaFailure(_ code: Int) -> FileOperationFailure? {
+        switch code {
+        case 4, 260: .sourceVanished          // fileNoSuchFile, fileReadNoSuchFile
+        case 257, 513: .permissionDenied      // fileReadNoPermission, fileWriteNoPermission
+        case 640: .diskFull                   // fileWriteOutOfSpace
+        case 642: .destinationReadOnly        // fileWriteVolumeReadOnly
+        case 516: .destinationNotReplaceable  // fileWriteFileExists
+        default: nil
+        }
+    }
+
+    /// The failure an OSStatus names. `trashItem` reports through these.
+    static func osStatusFailure(_ code: Int) -> FileOperationFailure? {
+        switch code {
+        case -43, -120: .sourceVanished           // fnfErr, dirNFErr
+        case -54, -49, -5000: .permissionDenied   // permErr, opWrErr, afpAccessDenied
+        case -34, -108: .diskFull                 // dskFulErr, memFullErr
+        case -44, -46: .destinationReadOnly       // wPrErr, vLckdErr
+        case -35, -36, -65: .volumeUnmounted      // nsvErr, ioErr, offLinErr
+        default: nil
+        }
+    }
+
+    /// Walks an error and its underlying chain looking for a domain this knows
+    /// how to classify. Nested because `trashItem` buries the OSStatus one level
+    /// down, and a `copyfile` failure surfaced through `FileManager` buries the
+    /// POSIX one just as deep.
+    static func domainFailure(_ error: any Error) -> FileOperationFailure? {
+        var current: NSError? = error as NSError
+        var depth = 0
+        while let ns = current, depth < 4 {
+            if ns.domain == NSCocoaErrorDomain, let mapped = cocoaFailure(ns.code) {
+                return mapped
+            }
+            if ns.domain == NSOSStatusErrorDomain, let mapped = osStatusFailure(ns.code) {
+                return mapped
+            }
+            current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
         }
         return nil
     }
