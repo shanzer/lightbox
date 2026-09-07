@@ -31,10 +31,17 @@ public enum FileOperationKind: String, Sendable, Codable, Hashable, CaseIterable
 /// - `in_flight` — the row was written and the filesystem was then touched, or
 ///   was about to be. **The outcome is unknown.** This is the only state that
 ///   needs the filesystem consulted: the reconcile re-`stat`s `src` and `dst`
-///   and believes what it finds. A batch that was cancelled, crashed, or threw
-///   leaves its un-attempted rows here, as does the one genuinely partial case
-///   the operator can reach — a cross-volume move whose copy landed and whose
-///   source removal failed.
+///   and believes what it finds.
+///
+///   Five things leave a row here, not one. A batch that was cancelled or
+///   crashed never reached its rows at all; and four failures reach them and
+///   decline to settle them, because in each the filesystem is ahead of the
+///   record — `sourceRemovalFailed` (copy landed, source still there),
+///   `rollbackIncomplete` (the undo could not, or must not, put something
+///   back — including a cross-volume move whose sources are already gone, so
+///   the copies at `dst` are the only copies), `indexWriteFailed` (files moved,
+///   rows did not), and `trashURLNotRecorded` (in the Trash, location unwritten).
+///   See `FileOperationFailure`.
 /// - `complete` — the filesystem operation succeeded *and* the index was
 ///   updated, in that order, with the mark written in the same transaction as
 ///   the index change. Undo may reverse it; the reconcile never re-examines it.
@@ -45,6 +52,12 @@ public enum FileOperationKind: String, Sendable, Codable, Hashable, CaseIterable
 ///   because the volume went away before its turn. Nothing changed. Terminal.
 ///   (An item the user resolved to *skip* at collision time is never journalled
 ///   at all — the journal records intent, and there was none.)
+///
+///   **On an aside row `failed` carries a third meaning**, alongside "the
+///   displacement was undone" and "nothing was attempted": *the occupant had
+///   already vanished by the time the item ran*, so nothing was staged and there
+///   is no stash at `dst`. All three agree on what matters — nothing changed,
+///   the row is terminal, and neither undo nor the reconcile acts on it.
 /// **Replace has its own rows.** The file a `replace` policy displaces is a
 /// photo the user did not select, and moving it aside is a filesystem mutation
 /// like any other, so it gets a row of its own in the same up-front
@@ -55,12 +68,23 @@ public enum FileOperationKind: String, Sendable, Codable, Hashable, CaseIterable
 /// in.
 ///
 /// **How to read an `in_flight` aside row: `stat` `dst` first, then fall back to
-/// `trash_url`.** The row covers two moments, and only the filesystem
-/// distinguishes them. Before the disposal the photo is at `dst`, the stash;
-/// after `trashItem` has returned but before the row could be settled it is at
-/// `trash_url` and `dst` is gone. Reading either field alone is wrong half the
-/// time — and without the row at all the file is an unreferenced dot-file whose
-/// index row the next tier 0 pass prunes.
+/// `trash_url`, then `src`.** The row covers three moments, and only the
+/// filesystem distinguishes them. Before the disposal the photo is at `dst`, the
+/// stash; after `trashItem` has returned but before the row could be settled it
+/// is at `trash_url` and `dst` is gone; and if the item was abandoned before
+/// staging ever ran, **neither `dst` nor `trash_url` holds anything and the file
+/// is still at `src`, untouched**. Reading any one field alone is wrong. Without
+/// the row at all the file would be an unreferenced dot-file whose index row the
+/// next tier 0 pass prunes.
+///
+/// **A plain `in_flight` `.trash` row — one with `dst` NULL — is a different
+/// row and reads differently.** Those come from a user's own trash operation,
+/// not from a replace, and they have no stash. The rule there: `stat` `src`; if
+/// it is still present nothing happened; if it is gone and `trash_url` is set
+/// the file is at that URL; **and if it is gone and `trash_url` is NULL the file
+/// is in the Trash under a name nothing can derive** — the Trash renames on
+/// collision — which is exactly the case `trashURLNotRecorded` reports and the
+/// reconcile cannot repair on its own.
 ///
 /// **`trash_url` on a row that is not `complete`** is where the file went, not a
 /// promise that it is still there. On a `failed` row it is forensic: the file
@@ -112,9 +136,26 @@ public enum FileOperationSkip: Sendable, Equatable, Hashable {
     case alreadyAtDestination
 }
 
-/// Why one item of a batch failed. Every case means the same thing about state:
-/// nothing on disk and nothing in the index changed — except
-/// `sourceRemovalFailed`, which says so itself.
+/// Why one item of a batch failed.
+///
+/// **Most cases mean "nothing changed": no file moved, no partial destination
+/// survives, no index row was touched, and the journal rows say `failed`.**
+/// Four do not, and each is a case where something on disk or in the index is
+/// ahead of the record. Every one of them leaves its journal rows `in_flight`
+/// instead, because `in_flight` is the only state that means "ask the
+/// filesystem":
+///
+/// - `sourceRemovalFailed` — a cross-volume move whose copy landed and whose
+///   source removal did not. Both paths exist.
+/// - `rollbackIncomplete` — the undo could not put something back, so part of
+///   the item is still at the destination, or a displaced file is still in its
+///   stash or already in the Trash. **Includes the case where undoing was
+///   refused on purpose**: once a cross-volume move has unlinked its sources,
+///   the copies are the only copies and removing them would be the loss rather
+///   than the undo.
+/// - `indexWriteFailed` — the filesystem work succeeded and the rows did not.
+/// - `trashURLNotRecorded` — a file reached the Trash and where it went could
+///   not be written down.
 public enum FileOperationFailure: Error, Sendable, Equatable, Hashable {
     /// The source was gone by the time the item ran. The realistic cause is the
     /// gap between planning and executing, which a pre-flight cannot close.

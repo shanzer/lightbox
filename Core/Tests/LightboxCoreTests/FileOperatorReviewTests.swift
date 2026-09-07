@@ -635,6 +635,18 @@ struct FileOperatorDisposalMarkTests {
             return
         }
 
+        // **The photo must still exist somewhere.** A cross-volume move unlinks
+        // its sources before the displaced files are disposed of, so an undo
+        // that removes the copies at that point removes the only remaining
+        // copy: source gone, destination gone, journal row `in_flight` naming
+        // two paths that hold nothing.
+        for name in ["IMG_0001.CR2", "IMG_0001.xmp"] {
+            let atSource = tree.root.appendingPathComponent("from/\(name)")
+            let atDestination = destination.appendingPathComponent(name)
+            #expect(exists(atSource) || exists(atDestination),
+                    "\(name) exists at neither its source nor its destination")
+        }
+
         let rows = try store.journalRows(batchID: plan.batchID)
         // The first occupant really did reach the Trash. Its row says so and
         // names where, despite the item as a whole being abandoned.
@@ -740,5 +752,167 @@ struct FileOperatorSwallowedFailureTests {
                                      destination: destination, includeCompanions: false)
         #expect(plan.items.count == 1)
         try tree.chmod("from", 0o755)
+    }
+}
+
+// MARK: - A cross-volume move must never lose its only copy
+
+/// A cross-volume move is a copy followed by unlinking the sources. Once those
+/// sources are gone the copies at the destination are **the only copies**, and
+/// nothing downstream may treat them as undoable work.
+///
+/// The route is ordinary: the app's whole reason to exist is a library on an
+/// external drive, so a move off that drive is cross-volume by default. The
+/// disposal that fails needs only a destination volume that cannot make a
+/// `.Trashes` — exFAT, an SMB share, a folder the user cannot write — or a
+/// `trashItem` that returns no URL, or a `SQLITE_BUSY` on the journal write.
+struct FileOperatorCrossVolumeLossTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    @Test func aCrossVolumeMoveKeepsItsOnlyCopyWhenDisposalFails() async throws {
+        let source = try tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try tree.directory("to")
+        let occupant = try tree.file("to/IMG_0001.jpg", bytes: 11)
+        let store = try IndexStore.inMemory()
+        try index(source, into: store)
+
+        // Two volumes over one real tree, so the cross-volume branch runs for
+        // real; the stash is removed between the copy and the disposal, which is
+        // the shape of every way disposal fails.
+        let stashBox = LockBox<URL?>(nil)
+        let op = FileOperator(store: store, volumeReader: { url in
+            VolumeIdentity(device: url.path.hasSuffix("/to") ? 2 : 1,
+                           uuid: url.path.hasSuffix("/to") ? "VOL-B" : "VOL-A")
+        }, copier: { source, target, _ in
+            try FileManager.default.copyItem(at: source, to: target)
+            if let doomed = stashBox.withLock({ $0 }) {
+                try? FileManager.default.removeItem(at: doomed)
+            }
+        })
+        let plan = try await op.plan(kind: .move, sources: [source], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        let resolved = plan.resolvingAllCollisions(with: .replace)
+        stashBox.withLock { $0 = resolved.items[0].replacements[0].stash }
+
+        let results = try await op.execute(resolved)
+        guard case .failed(.rollbackIncomplete(let detail)) = results[0].outcome else {
+            Issue.record("expected .rollbackIncomplete, got \(results[0].outcome)")
+            return
+        }
+        // The user's photo is somewhere. That is the whole assertion.
+        #expect(exists(destination.appendingPathComponent("IMG_0001.jpg")))
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.jpg")) == 64)
+        // And the failure says the rollback was *declined*, not merely that a
+        // file could not be removed. The two guards here are deliberately
+        // redundant — the state flag at the call site and the `stat` inside
+        // `rollbackMoves` — so this is what distinguishes them: only the flag
+        // knows, before trying anything, that there is nothing safe to undo.
+        #expect(detail.contains("the originals are gone"))
+        #expect(detail.contains(destination.path))
+        // Rows stay `in_flight` carrying both paths — the copy-landed,
+        // source-gone shape #6 already has to handle.
+        let rows = try store.journalRows(batchID: plan.batchID)
+        let move = try #require(rows.first { $0.kind == .move })
+        #expect(move.state == .inFlight)
+        #expect(move.src == source.path)
+        #expect(move.dst == destination.appendingPathComponent("IMG_0001.jpg").path)
+        #expect(occupant.lastPathComponent == "IMG_0001.jpg")
+    }
+
+    /// The structural backstop, tested where it lives: a non-rename rollback
+    /// removes a destination copy only while the source it came from is still
+    /// there. Once the source is gone the copy is the only copy, and removing it
+    /// is the loss, not the undo.
+    @Test func rollbackRefusesToRemoveACopyWhoseSourceIsGone() throws {
+        let destination = try tree.file("to/IMG_0001.jpg", bytes: 64)
+        let vanished = tree.root.appendingPathComponent("from/IMG_0001.jpg")
+
+        let problems = FileOperator.rollbackMoves([(from: vanished, to: destination)],
+                                                  byRename: false)
+        #expect(problems.count == 1)
+        #expect(problems.first?.contains("IMG_0001.jpg") == true)
+        #expect(exists(destination))
+        #expect(try bytes(destination) == 64)
+    }
+}
+
+// MARK: - I-A: `replace` never displaces a file this batch itself selected
+
+/// The plan's `claimedInBatch` rule handles the collisions a batch creates by
+/// *landing* a file somewhere. It does not handle the two cases where a batch
+/// collides with a file it merely **selected**, and in both of those the naive
+/// answer displaces one of the user's own chosen photos while reporting success.
+///
+/// Both are reachable with ordinary gestures, and the execute-time
+/// `batchSources` guard is the only thing that catches either.
+struct FileOperatorSelectedSourceReplaceTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// Copy a selection into a folder where one of the selected files already
+    /// lives, Replace, apply to all.
+    ///
+    /// `ownNames` — which excuses a file from colliding with itself — applies to
+    /// `move` only, and rightly: copying `to/IMG_0001.jpg` into `to/` *does*
+    /// meet an existing file, and Finder's answer is `IMG_0001 2.jpg`. So the
+    /// collision is real and `replace` is the wrong resolution for it, because
+    /// the "existing file" is the very file being copied. Without the guard the
+    /// source is moved into the stash and the copy then reports
+    /// `sourceVanished`.
+    @Test func copyingAFileIntoItsOwnFolderWithReplaceIsRefusedNotSelfDestroyed() async throws {
+        let destination = try tree.directory("to")
+        let inPlace = try tree.file("to/IMG_0001.jpg", bytes: 77)
+        let other = try tree.file("a/IMG_0002.jpg", bytes: 20)
+        let store = try IndexStore.inMemory()
+        try index(inPlace, into: store)
+        try index(other, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .copy, sources: [inPlace, other],
+                                     destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        // A copy meets itself as an ordinary occupant; nothing excuses it.
+        #expect(plan.items[0].collisions.map(\.kind) == [.occupied])
+
+        let results = try await op.execute(plan.resolvingAllCollisions(with: .replace))
+        #expect(results[0].outcome == .failed(.destinationNotReplaceable))
+        #expect(results[1].outcome == .completed)
+        // The selected file is still there, at full size, and still indexed.
+        #expect(try bytes(inPlace) == 77)
+        #expect(try store.record(atPath: inPlace.path) != nil)
+    }
+
+    /// Item 0 resolved `skip` claims no name, so item 1 meets item 0's *source*
+    /// as an ordinary on-disk occupant. Without the guard item 0's selected
+    /// photo is trashed, item 1 is written over it, and the batch reports
+    /// `completed`.
+    @Test func replaceOverASkippedItemsSourceIsRefused() async throws {
+        let destination = try tree.directory("to")
+        let selectedInPlace = try tree.file("to/IMG_0001.jpg", bytes: 77)
+        let incoming = try tree.file("a/IMG_0001.jpg", bytes: 20)
+        let store = try IndexStore.inMemory()
+        try index(selectedInPlace, into: store)
+        try index(incoming, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .copy, sources: [selectedInPlace, incoming],
+                                     destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        // Item 0 skips, so it claims nothing; item 1 then sees a real file on
+        // disk rather than a claim from the batch.
+        let resolved = plan
+            .resolvingCollision(at: 0, with: .skip)
+            .resolvingCollision(at: 1, with: .replace)
+        #expect(resolved.items[1].collisions.map(\.kind) == [.occupied])
+        #expect(resolved.items[1].effectiveResolution == .replace)
+
+        let results = try await op.execute(resolved)
+        #expect(results[0].outcome == .skipped(.collisionResolved))
+        #expect(results[1].outcome == .failed(.destinationNotReplaceable))
+        #expect(try bytes(selectedInPlace) == 77)
+        #expect(try store.count() == 2)
     }
 }

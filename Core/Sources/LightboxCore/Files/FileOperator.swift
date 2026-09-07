@@ -79,9 +79,13 @@ public actor FileOperator {
     /// Internal so the replacement machinery in `FileOperator+Replacements.swift`
     /// can reach it. Nothing outside `FileOperator` holds one.
     let store: IndexStore
-    private let volumeReader: @Sendable (URL) -> VolumeIdentity?
-    private let copier: Copying
-    private let clock: @Sendable () -> Double
+    // Internal, not private: `FileOperator`'s own extensions live in
+    // `FileOperator+Transfer.swift` and `FileOperator+Replacements.swift`, and
+    // Swift has no access level for "this type, across files". Nothing but
+    // `FileOperator` touches them.
+    let volumeReader: @Sendable (URL) -> VolumeIdentity?
+    let copier: Copying
+    let clock: @Sendable () -> Double
 
     public init(store: IndexStore,
                 volumeReader: @escaping @Sendable (URL) -> VolumeIdentity?
@@ -448,151 +452,6 @@ public actor FileOperator {
         }
     }
 
-    // MARK: Move and copy
-
-    private func performTransfer(_ item: PlannedItem, kind: FileOperationKind,
-                                 asideOps: [Int64],
-                                 batchSources: Set<String>) -> ItemExecution {
-        let files = item.files
-        guard let destinations = Self.destinations(of: item) else {
-            return .failure(.other("\(kind.rawValue) planned without a destination"))
-        }
-
-        var staged: [StagedReplacement] = []
-        switch prepareReplacements(item, asideOps: asideOps, batchSources: batchSources) {
-        case .failure(let execution): return execution
-        case .success(let prepared): staged = prepared
-        }
-
-        let sourceDirectory = item.source.deletingLastPathComponent()
-        let sameVolume = Self.onSameVolume(volumeReader(sourceDirectory),
-                                           volumeReader(destinations[0]
-                                               .deletingLastPathComponent()))
-        let isMove = kind == .move
-        // Within one volume a move is `rename(2)`. Across volumes — and for
-        // every copy — it is a copy, written out rather than left to `moveItem`
-        // precisely so the intermediate state is reachable: if the copy lands and
-        // the source removal does not, both paths exist and the journal has to be
-        // able to say so.
-        let byRename = isMove && sameVolume
-
-        var moved: [(from: URL, to: URL)] = []
-        for (source, destination) in zip(files, destinations) {
-            do {
-                if byRename {
-                    try FileManager.default.moveItem(at: source, to: destination)
-                } else {
-                    try copier(source, destination, sameVolume && !isMove)
-                    try Self.verifyCopyLength(source: source, destination: destination)
-                }
-                moved.append((source, destination))
-            } catch {
-                // A failed copy can leave a partial file; a failed `rename(2)`
-                // leaves nothing. Clear the one that just failed before undoing
-                // the ones that succeeded — and if it will not clear, say so: a
-                // partial file left at the destination under a row saying
-                // `failed` is the same lie every other swallowed cleanup told.
-                var cleanup: [String] = []
-                if !byRename, FileManager.default.fileExists(atPath: destination.path) {
-                    do {
-                        try FileManager.default.removeItem(at: destination)
-                    } catch {
-                        cleanup.append("a partial \(destination.lastPathComponent) is still "
-                                       + "at \(destination.path): \(error)")
-                    }
-                }
-                return undo(moved, staged: staged, byRename: byRename,
-                            extraProblems: cleanup,
-                            failing: FileOperationErrorMap.classify(error))
-            }
-        }
-
-        if isMove && !byRename {
-            for source in files {
-                do {
-                    try FileManager.default.removeItem(at: source)
-                } catch {
-                    // Deliberately not rolled back and deliberately not
-                    // journalled: the copy is good, the source is still there,
-                    // and deleting either one on a guess is how a photo gets
-                    // lost. The `in_flight` row is the correct record.
-                    return .failure(.sourceRemovalFailed, marksJournal: false)
-                }
-            }
-        }
-
-        var execution = ItemExecution()
-        // The displaced files go to the Trash now that the operation that took
-        // their place has succeeded — to the Trash rather than to `unlink`,
-        // because `replace` must be as undoable as `trash` is, and because a
-        // journal row naming a Trash URL is a row #6 already knows how to
-        // reverse.
-        switch disposeOfStash(staged) {
-        case .refused(let reason, let earned):
-            // The operation landed but a displaced file could not be disposed
-            // of. Nothing is lost — it is in its stash or in the Trash, and its
-            // row names where — but the operator cannot claim the item is
-            // settled. The marks already earned travel out with the failure.
-            return undoAfterDisposalFailure(moved, byRename: byRename,
-                                            marks: earned, reason: reason)
-        case .settled(let marks):
-            execution.asideMarks = marks
-        }
-
-        execution.mutations = Self.replacedRowRemovals(item.replacements, store: store)
-        for (offset, destination) in destinations.enumerated() {
-            let source = files[offset]
-            if isMove {
-                guard let row = try? store.record(atPath: source.path),
-                      let id = row.id else { continue }
-                execution.mutations.append(.move(id: id, fromPath: source.path,
-                                                 to: destination))
-            } else {
-                guard let row = try? store.record(atPath: source.path),
-                      let facts = Self.statFacts(destination) else { continue }
-                execution.mutations.append(.insertCopy(CopyInsert(
-                    source: row, destination: destination,
-                    size: facts.size, mtime: facts.mtime,
-                    device: facts.device, inode: facts.inode,
-                    volumeUUID: volumeReader(destination.deletingLastPathComponent())?.uuid,
-                    indexedAt: clock(),
-                    carryHashes: Self.hashesStillDescribe(row, at: source))))
-            }
-        }
-        return execution
-    }
-
-    /// Puts back what this item already did, and **says whether it managed to**.
-    ///
-    /// The `try?` this replaces was the quiet failure: a rollback that silently
-    /// did nothing left a file at the destination under a journal row saying
-    /// `failed`, and `failed` is defined to mean "nothing changed" — a claim the
-    /// reconcile is built never to re-examine. An item that could not be undone
-    /// reports `.rollbackIncomplete` and keeps its rows `in_flight` instead.
-    private func undo(_ moved: [(from: URL, to: URL)], staged: [StagedReplacement],
-                      byRename: Bool, extraProblems: [String] = [],
-                      failing reason: FileOperationFailure) -> ItemExecution {
-        var problems = extraProblems + Self.rollbackMoves(moved, byRename: byRename)
-        problems += Self.restore(staged, rollbackSucceeded: problems.isEmpty)
-        guard problems.isEmpty else {
-            return .failure(.rollbackIncomplete(problems.joined(separator: "; ")),
-                            marksJournal: false)
-        }
-        // Everything is back where it started, including any displaced file, so
-        // the aside genuinely did not happen either.
-        return .failure(reason)
-    }
-
-    private func undoAfterDisposalFailure(_ moved: [(from: URL, to: URL)],
-                                          byRename: Bool, marks: [JournalMark],
-                                          reason: FileOperationFailure) -> ItemExecution {
-        let problems = Self.rollbackMoves(moved, byRename: byRename)
-        let combined = (problems + ["displaced file not disposed of: \(reason)"])
-            .joined(separator: "; ")
-        return .failure(.rollbackIncomplete(combined), marksJournal: false,
-                        asideMarks: marks)
-    }
-
     /// Whether `row`'s hashes describe the bytes now at `source`.
     ///
     /// This is `setHashes(for:)`'s guard, read rather than written. `path` is
@@ -602,7 +461,7 @@ public actor FileOperator {
     /// on the row predate the bytes being copied. A false costs one re-hash. A wrong
     /// true writes a digest that describes different bytes onto a brand-new row
     /// that nothing will ever revisit — and the duplicate view deletes on those.
-    private static func hashesStillDescribe(_ row: FileRecord, at source: URL) -> Bool {
+    static func hashesStillDescribe(_ row: FileRecord, at source: URL) -> Bool {
         guard row.hashedAt != nil, let facts = statFacts(source) else { return false }
         return row.size == facts.size && row.mtime == facts.mtime
     }
@@ -667,9 +526,19 @@ public actor FileOperator {
             }
         }
         // Only now, with every file confirmed in the Trash, may a row go.
-        for file in item.files {
-            guard let row = try? store.record(atPath: file.path), let id = row.id else { continue }
-            execution.mutations.append(.remove(id: id, path: file.path))
+        do {
+            for file in item.files {
+                guard let row = try store.record(atPath: file.path),
+                      let id = row.id else { continue }
+                execution.mutations.append(.remove(id: id, path: file.path))
+            }
+        } catch {
+            // A read that threw is not "there is no row". The files are in the
+            // Trash and their rows are not gone, so the journal must not say
+            // `complete`; `in_flight` is the truth, and the trash URLs are
+            // already persisted.
+            return .failure(.indexWriteFailed(String(describing: error)),
+                            marksJournal: false)
         }
         return execution
     }
@@ -685,7 +554,10 @@ public actor FileOperator {
         // `removeItem` has returned without throwing.
         for file in item.files {
             do {
-                let row = try? store.record(atPath: file.path)
+                // Read first, and let a failed read throw: unlinking a photo
+                // whose row could not be looked up leaves the index describing
+                // a file that is gone, with nothing recorded to fix it.
+                let row = try store.record(atPath: file.path)
                 try FileManager.default.removeItem(at: file)
                 if let row, let id = row.id {
                     execution.mutations.append(.remove(id: id, path: file.path))
@@ -701,31 +573,10 @@ public actor FileOperator {
         return execution
     }
 
-    /// Undoes the transfers this item already made, returning what it could not
-    /// undo.
-    private static func rollbackMoves(_ moved: [(from: URL, to: URL)],
-                                      byRename: Bool) -> [String] {
-        var problems: [String] = []
-        for entry in moved.reversed() {
-            do {
-                if byRename {
-                    try FileManager.default.moveItem(at: entry.to, to: entry.from)
-                } else {
-                    // The source was never removed on this path — only the copy
-                    // needs undoing.
-                    try FileManager.default.removeItem(at: entry.to)
-                }
-            } catch {
-                problems.append("\(entry.to.lastPathComponent) is still at \(entry.to.path): "
-                                + "\(error)")
-            }
-        }
-        return problems
-    }
 
     // MARK: - Filesystem helpers
 
-    private static func destinations(of item: PlannedItem) -> [URL]? {
+    static func destinations(of item: PlannedItem) -> [URL]? {
         guard let destination = item.destination else { return nil }
         return [destination] + item.companionDestinations
     }
@@ -742,7 +593,7 @@ public actor FileOperator {
     /// Unknown on either side is treated as "not the same volume", which costs a
     /// copy where a clone would have done and is never wrong in the direction
     /// that matters.
-    private static func onSameVolume(_ source: VolumeIdentity?,
+    static func onSameVolume(_ source: VolumeIdentity?,
                                      _ destination: VolumeIdentity?) -> Bool {
         guard let source, let destination else { return false }
         return source.matches(destination)
@@ -756,7 +607,7 @@ public actor FileOperator {
     /// without it, a truncated copy would inherit the original's `content_hash`
     /// and become a file whose recorded digest describes bytes it does not
     /// contain, on a row nothing will ever re-hash.
-    private static func verifyCopyLength(source: URL, destination: URL) throws {
+    static func verifyCopyLength(source: URL, destination: URL) throws {
         guard let from = statFacts(source), let to = statFacts(destination) else {
             throw FileOperationCheckError.copyIncomplete
         }

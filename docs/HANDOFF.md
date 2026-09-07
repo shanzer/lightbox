@@ -109,7 +109,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 534 tests, 53 suites.
+# Core: 538 tests, 55 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -161,7 +161,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 534 tests live. `App/` only wires it to views.
+where all the logic and all 538 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -172,7 +172,7 @@ where all the logic and all 534 tests live. `App/` only wires it to views.
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
-| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Replacements}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results (§8) |
+| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Transfer,FileOperator+Replacements}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results (§8) |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
 | Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
 
@@ -279,7 +279,7 @@ row — which duplicate detection then deletes on.
 
 ## 7. Verify by hand on the mini
 
-Six things automated tests could not cover. **None done yet** as of the
+Seven things automated tests could not cover. **None done yet** as of the
 2026-09-06 update. In rough priority:
 
 1. **Re-run the 50k benchmark.** All current numbers are Intel, and the choice of
@@ -303,7 +303,19 @@ Six things automated tests could not cover. **None done yet** as of the
    ⌘N while tier 1 is hashing, open the same folder in the second window. Both
    windows should stay responsive, neither pass should fail, and
    `log stream --predicate 'process == "Lightbox"'` should show no `SQLITE_BUSY`.
-3. **Unplug the Seagate mid-hash, and replug it.** The unreachable-root guards
+3. **Move files off the Seagate and onto the boot volume, with a collision.**
+   The whole `FileOperator` cross-volume path — copy, then unlink the sources —
+   has only ever run against two *simulated* volumes over one real directory
+   tree, because a test cannot mount a second drive. That path is the one where
+   a photo has the fewest copies at any moment: between the copy landing and the
+   source being unlinked there are two, and immediately after there is one. Do
+   it for real, with a destination that already holds a same-named file so
+   `replace` runs too, and check `op_journal` afterwards — every row `complete`,
+   and every `trash_url` naming a file that is really in the Trash. Worth
+   repeating once onto an exFAT or SMB destination, where `.Trashes` cannot be
+   created and the disposal fails: nothing may be lost, and the rows should be
+   `in_flight` naming both paths.
+4. **Unplug the Seagate mid-hash, and replug it.** The unreachable-root guards
    were only ever tested against *simulated* unmounts. This is the one that lost
    the whole index twice during development, so it is worth doing for real.
    Issue #4 (volume UUID) landed the replug half of it in code and in tests, but
@@ -317,11 +329,11 @@ Six things automated tests could not cover. **None done yet** as of the
      the root, so there is no identity to match), but an unplug followed by a
      replug before the next batch does **not** — the UUID says it is the same
      volume, and continuing is correct. To see the abort, leave it unplugged.
-4. **⌘A with the search field focused.** Should select the field's text, not the
+5. **⌘A with the search field focused.** Should select the field's text, not the
    grid. Tests could only warn, never assert.
-5. **Cold folder open shows an empty grid** for the entire first index pass
+6. **Cold folder open shows an empty grid** for the entire first index pass
    (~180 s at 50k). Known, ugly, deferred — the grid has no "indexing…" state.
-6. **A real index pass over the Seagate, under the new executors.** #28 moved
+7. **A real index pass over the Seagate, under the new executors.** #28 moved
    `IndexCoordinator` and `MetadataWriter` off the cooperative pool onto serial
    dispatch queues of their own. `CooperativePoolTests` proves *where* the work
    runs; it says nothing about the GUI path. Open a large folder on the external
@@ -474,6 +486,29 @@ all three are now done:
   each call through `BlockingWork.run`, because hopping would add a suspension
   point per file and the item-level rollback argument is written in terms of
   what cannot interleave with what.
+
+  **A third of the same class, and the worst: a cross-volume move that lost the
+  photo outright.** A cross-volume move copies and then unlinks the sources, so
+  from that moment the copies at the destination are the *only* copies — but the
+  undo path was still a list of `(from, to)` pairs whose non-rename branch
+  removed every `to`. A failed stash disposal after the unlink therefore deleted
+  the destination copies with the sources already gone: both paths empty, the
+  journal row `in_flight` naming two files that no longer exist, no `trash_url`,
+  nothing to recover from. The shipped test for the disposal path drove exactly
+  this and passed, because it only checked journal marks. Reachable on the app's
+  most ordinary gesture — the library is on an external drive, so every move off
+  it is cross-volume — whenever the destination cannot make a `.Trashes`
+  (exFAT, SMB, an unwritable folder), `trashItem` returns no URL, or the journal
+  write hits `SQLITE_BUSY`.
+
+  Two deliberately redundant guards now, in `FileOperator+Transfer.swift`:
+  `TransferState.sourcesRemoved` makes the question askable at the call site, so
+  the undo is *declined* rather than attempted and the failure says the
+  originals are gone; and `rollbackMoves`' non-rename branch `stat`s the source
+  before removing a copy and refuses when it is absent. Either alone saves the
+  photo; the pair is kept because the flag is the kind of thing a refactor
+  forgets to thread through. **The test that matters asserts the photo exists at
+  its source *or* its destination** — not what the journal says.
 
   Owed: the Seagate live check. The batch was exercised over 50 real photos
   copied off `03_DEDUPED_ARCHIVE/2019` into a scratch directory on the boot

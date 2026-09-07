@@ -200,10 +200,14 @@ extension FileOperator {
     /// carries it: on a case-insensitive volume the destination being written
     /// may differ in case from the file that is actually there, and
     /// `record(atPath:)` matches exactly.
+    /// Throws rather than swallowing a failed read: "there is no row" and "the
+    /// index could not be asked" are different answers, and flattening them
+    /// leaves the journal saying `complete` with a stale row still naming the
+    /// path that was just written.
     static func replacedRowRemovals(_ replacements: [PlannedReplacement],
-                                    store: IndexStore) -> [IndexMutation] {
-        replacements.compactMap { replacement in
-            guard let row = try? store.record(atPath: replacement.occupant.path),
+                                    store: IndexStore) throws -> [IndexMutation] {
+        try replacements.compactMap { replacement in
+            guard let row = try store.record(atPath: replacement.occupant.path),
                   let id = row.id else { return nil }
             return .remove(id: id, path: replacement.occupant.path)
         }
