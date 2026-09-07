@@ -109,7 +109,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 477 tests, 36 suites.
+# Core: 534 tests, 53 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -161,7 +161,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 477 tests live. `App/` only wires it to views.
+where all the logic and all 534 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -172,7 +172,7 @@ where all the logic and all 477 tests live. `App/` only wires it to views.
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
-| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results (§8) |
+| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Replacements}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results (§8) |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
 | Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
 
@@ -449,6 +449,31 @@ all three are now done:
   directory as well as at the destination, and for `trash` and `delete` too —
   which had no check at all, so a permanent delete ran against whatever was
   mounted at the path.
+
+  **Two more of the same class, found by a second review.** A `replace` whose
+  occupant vanishes in the plan/execute gap made the staged list a *subset* of
+  the replacements, while the aside rows had been written one per replacement —
+  so from the first gap onwards every row was attributed to the wrong file: the
+  row for a photo that was never trashed acquired another photo's Trash URL,
+  and the one that really was trashed recorded nothing. `StagedReplacement`
+  carries the `op_id` alongside the replacement now, paired before any
+  filtering, so there is no offset left to get wrong. The same gap left the
+  vanished occupant's *index* row in place, still naming the exact path the
+  move was about to write, which turned a move that fully succeeded on disk
+  into `indexWriteFailed(UNIQUE files.path)`; removals are emitted for every
+  replacement whose row exists, staged or not. The lesson both times: **a
+  subset and a list written before it was known to be a subset must never be
+  zipped by index.**
+
+  `FileOperator` runs its body on its own `DispatchSerialQueue` through
+  `unownedExecutor`, like `IndexCoordinator` and `MetadataWriter` (#28). A
+  batch is the largest single lump of blocking work in Core — a `rename(2)` or
+  a `copyfile(3)` per file, a `trashItem` that talks to another process, two
+  `stat`s around each — and none of it may sit on a pool that is
+  `activeProcessorCount` wide and never grows. An executor rather than hopping
+  each call through `BlockingWork.run`, because hopping would add a suspension
+  point per file and the item-level rollback argument is written in terms of
+  what cannot interleave with what.
 
   Owed: the Seagate live check. The batch was exercised over 50 real photos
   copied off `03_DEDUPED_ARCHIVE/2019` into a scratch directory on the boot

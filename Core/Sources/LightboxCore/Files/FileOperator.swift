@@ -45,6 +45,37 @@ public actor FileOperator {
     public typealias ProgressHandler =
         @Sendable (_ completed: Int, _ total: Int, _ current: URL) -> Void
 
+    /// **Every filesystem call in this type is synchronous and blocking**, and
+    /// there are a lot of them: a `rename(2)` per file, a `copyfile(3)` that
+    /// runs for as long as the bytes take, a `trashItem` that talks to another
+    /// process, and a `stat` before and after each. On an external drive that
+    /// has gone to sleep, one of those parks a thread for seconds.
+    ///
+    /// The cooperative pool is exactly `activeProcessorCount` threads wide and
+    /// never grows, so a thread parked in file IO is a thread the process has
+    /// lost — three of them stalled CI about one run in two, which is issue #28.
+    /// `BlockingWork` carries the `sample` that showed it. A batch of 300 files
+    /// is the largest single lump of blocking work in Core, so this actor is the
+    /// last place that should be running on that pool.
+    ///
+    /// An executor rather than hopping each call through `BlockingWork.run`:
+    /// hopping would add a suspension point per file, and the item-level
+    /// rollback argument is written in terms of what cannot interleave with
+    /// what. The executor moves the whole body off the pool and introduces no
+    /// new reentrancy at all.
+    private let queue = BlockingWork.serialQueue(BlockingWork.fileOperatorLabel)
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        queue.asUnownedSerialExecutor()
+    }
+
+    /// Test seam for #28: the queue this actor's body actually ran on.
+    ///
+    /// Asserted on rather than trusted, because an executor is the kind of thing
+    /// a later refactor drops without noticing — and its absence shows up only
+    /// as an intermittently stalled CI job on a machine nobody is watching.
+    func currentQueueLabel() -> String { BlockingWork.currentQueueLabel }
+
     /// Internal so the replacement machinery in `FileOperator+Replacements.swift`
     /// can reach it. Nothing outside `FileOperator` holds one.
     let store: IndexStore

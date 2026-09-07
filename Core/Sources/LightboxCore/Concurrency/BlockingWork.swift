@@ -49,6 +49,9 @@ enum BlockingWork {
     /// The label of the queue `MetadataWriter` runs its body on.
     static let metadataWriterLabel = "com.lightbox.metadata-writer"
 
+    /// The label of the queue `FileOperator` runs its body on.
+    static let fileOperatorLabel = "com.lightbox.file-operator"
+
     /// The label of the shared queue `run(_:)` hops onto.
     static let runLabel = "com.lightbox.blocking-work"
 

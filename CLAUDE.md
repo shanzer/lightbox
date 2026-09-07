@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 477 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 534 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 63 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -132,9 +132,9 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
 - **Blocking work never runs on the cooperative pool.** That pool is exactly
   `activeProcessorCount` threads wide and never grows, so a thread parked in file IO,
   in SQLite's busy wait, or in a pipe read from exiftool is a thread the process has
-  lost. Three of those stalled the CI job about one run in two (#28). `IndexCoordinator`
-  and `MetadataWriter` therefore run their bodies on their own `DispatchSerialQueue`
-  through `unownedExecutor`; blocking work that is *not* actor-isolated — the hashing
+  lost. Three of those stalled the CI job about one run in two (#28). `IndexCoordinator`,
+  `MetadataWriter` and `FileOperator` therefore run their bodies on their own
+  `DispatchSerialQueue` through `unownedExecutor`; blocking work that is *not* actor-isolated — the hashing
   pass's task-group children — hops through `BlockingWork.run`. Anything new in Core
   that blocks belongs behind one of those two, and `CooperativePoolTests` fails if it
   does not. Reproduce a narrowed pool with

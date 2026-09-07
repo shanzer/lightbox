@@ -108,6 +108,33 @@ struct CooperativePoolTests {
         #expect(label == BlockingWork.metadataWriterLabel)
     }
 
+    /// A batch is the largest single lump of blocking work in Core: a
+    /// `rename(2)` or a `copyfile(3)` per file, a `trashItem` that talks to
+    /// another process, and a `stat` on each side of every one — 300 times over,
+    /// against a drive that may have spun down. None of it may sit on the
+    /// cooperative pool.
+    ///
+    /// The label is read from inside a real batch rather than from an idle
+    /// actor, so what is asserted is where the filesystem work ran and not
+    /// merely where a getter did.
+    @Test func fileOperationsRunOffTheCooperativePool() async throws {
+        let store = try IndexStore.inMemory()
+        let source = try tree.file("from/IMG_0001.jpg", bytes: 16)
+        let destination = try tree.directory("to")
+        let labels = LockBox(Set<String>())
+
+        let op = FileOperator(store: store, copier: { source, target, _ in
+            labels.withLock { _ = $0.insert(BlockingWork.currentQueueLabel) }
+            try FileManager.default.copyItem(at: source, to: target)
+        })
+        let plan = try await op.plan(kind: .copy, sources: [source],
+                                     destination: destination)
+        _ = try await op.execute(plan)
+
+        #expect(await op.currentQueueLabel() == BlockingWork.fileOperatorLabel)
+        #expect(labels.withLock { $0 } == [BlockingWork.fileOperatorLabel])
+    }
+
     // MARK: - The stall itself
 
     /// Blocks in every hash until released, so a test can park as many threads
