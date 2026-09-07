@@ -172,7 +172,7 @@ where all the logic and all 477 tests live. `App/` only wires it to views.
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
-| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan, companion files, `op_journal` ordering, per-item results (§8) |
+| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results (§8) |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
 | Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
 
@@ -409,6 +409,46 @@ all three are now done:
   holds whatever the walker was given. Companion URLs are therefore built by
   appending *names* to the source's own directory URL. The symptom of getting
   this wrong is quiet: the `.xmp` moves and its row stays behind.
+
+  **Two things an adversarial review found, both of which lost a photo, and
+  both of which the code now refuses.** First, a collision carries its *kind*:
+  `occupied` (a real file is on disk) or `claimedInBatch` (an earlier item of
+  this same batch is going there). `replace` is only meaningful against the
+  first — against the second the "existing file" it would displace is a photo
+  the batch itself moved there moments ago, and honouring it destroyed one of
+  the user's own selected files while reporting `complete` for both. Two
+  same-named photos from two folders, Move, Replace, apply to all, was enough.
+  `replace` now degrades to `rename` wherever any claim is the batch's own, and
+  `PlannedItem.effectiveResolution` records that so the sheet can stop saying
+  "already exists at the destination" about a path nothing occupies. Second,
+  the file `replace` displaces gets its **own journal row** — it is a mutation
+  of a photo the user did not even select — written in the same up-front
+  transaction, with both its path and its stash path decided at plan time so
+  the row can exist before the file moves. It goes to the Trash rather than
+  being unlinked, which makes `replace` as undoable as `trash` and lets #6
+  reverse it by a rule it already needs.
+
+  **`try?` on a rollback is not a rollback.** Every undo path now reports what
+  it could not put back, and an item whose rollback was incomplete is
+  `.rollbackIncomplete` with its rows left `in_flight`. Swallowing it produced
+  the one genuinely unrecoverable record: a file at the destination under a row
+  saying `failed`, which means "nothing changed" and which the reconcile is
+  defined never to re-examine. Relatedly, putting a displaced file back never
+  deletes what is at its original path — after a failed rollback that may be
+  the user's own file, and clearing it to make room is the loss the guard
+  exists to prevent.
+
+  **`trashItem` reports OSStatus, never errno.** It is Carbon-backed and
+  surfaces `NSCocoaErrorDomain` over `NSOSStatusErrorDomain` (`-43 fnfErr`,
+  `-5000 afpAccessDenied`), so a failure taxonomy that reads only `errno`
+  classified every trash failure as `.other` — on the operation users run most.
+  errno is still consulted first; the Cocoa and OSStatus domains are walked
+  after it.
+
+  **Volume checks compare identity, not presence**, per distinct source
+  directory as well as at the destination, and for `trash` and `delete` too —
+  which had no check at all, so a permanent delete ran against whatever was
+  mounted at the path.
 
   Owed: the Seagate live check. The batch was exercised over 50 real photos
   copied off `03_DEDUPED_ARCHIVE/2019` into a scratch directory on the boot
