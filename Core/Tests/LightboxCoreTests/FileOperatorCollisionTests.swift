@@ -320,6 +320,11 @@ struct FileOperatorCompanionTests {
         let results = try await op.execute(plan)
         #expect(results.allSatisfy { $0.outcome == .completed })
         #expect(try store.journalRows(batchID: plan.batchID).count == 2)
+        // Handled once each means both landed and neither stayed.
+        #expect(try bytes(destination.appendingPathComponent("IMG_0003.CR2")) == 40)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0003.jpg")) == 30)
+        #expect(!exists(raw))
+        #expect(!exists(jpeg))
     }
 
     /// **A companion whose own destination collides is a collision on the
@@ -373,7 +378,12 @@ struct FileOperatorCompanionTests {
         #expect(!exists(raw))
         #expect(!exists(sidecar))
         #expect(rows.count == 2)
-        // Every row carries where its file went; that is what undo restores from.
+        // Every row carries where its file went; that is what undo restores
+        // from — so check each named file is really there.
         #expect(rows.allSatisfy { $0.state == .complete && $0.trashURL != nil })
+        for row in rows {
+            let url = try #require(row.trashURL)
+            #expect(exists(URL(fileURLWithPath: url)))
+        }
     }
 }

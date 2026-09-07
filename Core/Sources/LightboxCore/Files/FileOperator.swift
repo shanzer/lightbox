@@ -646,6 +646,8 @@ public actor FileOperator {
 /// Failures this type detects itself rather than receiving from the system.
 enum FileOperationCheckError: Error {
     case copyIncomplete
+    /// A copy's destination could not be `stat`ed after it landed.
+    case destinationUnstatable
 }
 
 extension FileOperationErrorMap {

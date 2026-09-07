@@ -90,6 +90,9 @@ struct FileOperatorIntraBatchCollisionTests {
         #expect(try bytes(destination.appendingPathComponent("IMG_0001.jpg")) == 10)
         #expect(try bytes(destination.appendingPathComponent("IMG_0001 2.jpg")) == 20)
         #expect(try store.count() == 4)
+        // A copy leaves its sources alone.
+        #expect(try bytes(first) == 10)
+        #expect(try bytes(second) == 20)
     }
 
     /// The sheet must be able to say something true. "Already exists at the
@@ -298,6 +301,12 @@ struct FileOperatorReplacementJournalTests {
         #expect(exists(stash))
         #expect(try bytes(stash) == 11)
         #expect(try store.record(atPath: occupant.path) != nil)
+        // The sources never moved — this failed before the removal loop — and
+        // the RAW's copy is still at the destination, which is what the
+        // `in_flight` rows claim.
+        #expect(try bytes(raw) == 48)
+        #expect(try bytes(tree.root.appendingPathComponent("from/IMG_0001.xmp")) == 6)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.CR2")) == 48)
 
         try tree.chmod("to", 0o755)
     }
@@ -372,6 +381,9 @@ struct FileOperatorTrashURLTests {
         let rows = try store.journalRows(batchID: plan.batchID)
         let rawRow = try #require(rows.first { $0.src == raw.path })
         #expect(rawRow.state == .failed)
+        // `failed` means the file came back, so the Trash URL must now name
+        // nothing: it is a record of where it briefly was, not where it is.
+        #expect(!exists(URL(fileURLWithPath: try #require(rawRow.trashURL))))
         // `failed` means nothing changed, and it does not: the file is back.
         // The URL is the forensic record of where it briefly went, written at
         // the one moment it could have been lost.
@@ -412,6 +424,17 @@ struct FileOperatorReplaceCaseTests {
             scope: .folder(path: destination.path, recursive: false))).first)
         #expect(survivor.id != occupantID)
         #expect(survivor.contentHash == "hash-IMG_0001.jpg")
+
+        // Where the bytes actually are: the source moved, the destination holds
+        // it, the displaced file is recoverable from the Trash, and no stash is
+        // left in the folder.
+        #expect(!exists(source))
+        #expect(try bytes(occupant) == 20)
+        let rows = try store.journalRows(batchID: plan.batchID)
+        let asideURL = try #require(rows.first { $0.kind == .trash }?.trashURL)
+        #expect(try bytes(URL(fileURLWithPath: asideURL)) == 10)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path)
+                .filter { $0.hasPrefix(".lightbox-replaced-") }.isEmpty)
     }
 }
 
@@ -550,6 +573,11 @@ struct FileOperatorVanishedOccupantTests {
         #expect(rawAside.state == .failed)
         // The file that *was* trashed says so, and says where.
         #expect(xmpAside.state == .complete)
+        // Both files really moved.
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.CR2")) == 48)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.xmp")) == 6)
+        #expect(!exists(raw))
+        #expect(!exists(tree.root.appendingPathComponent("from/IMG_0001.xmp")))
         let trashed = try #require(xmpAside.trashURL)
         // The bytes at that URL are the ones that row is about, which is the
         // whole failure: 12 was the xmp's, 11 the RAW's.
@@ -696,7 +724,12 @@ struct FileOperatorSwallowedFailureTests {
             return
         }
         #expect(detail.contains("IMG_0001.jpg"))
-        // Rows stay `in_flight`, because something really is at the destination.
+        // Rows stay `in_flight` because something really is at the destination —
+        // so assert that it really is, and that the source is untouched. An
+        // `in_flight` row over an empty destination would be the opposite bug.
+        #expect(exists(source))
+        #expect(try bytes(source) == 64)
+        #expect(exists(destination.appendingPathComponent("IMG_0001.jpg")))
         #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.inFlight])
         try tree.chmod("to", 0o755)
     }
@@ -804,11 +837,13 @@ struct FileOperatorCrossVolumeLossTests {
         // The user's photo is somewhere. That is the whole assertion.
         #expect(exists(destination.appendingPathComponent("IMG_0001.jpg")))
         #expect(try bytes(destination.appendingPathComponent("IMG_0001.jpg")) == 64)
-        // And the failure says the rollback was *declined*, not merely that a
-        // file could not be removed. The two guards here are deliberately
-        // redundant — the state flag at the call site and the `stat` inside
-        // `rollbackMoves` — so this is what distinguishes them: only the flag
-        // knows, before trying anything, that there is nothing safe to undo.
+        // What actually saves the photo on *this* path is the `stat` inside
+        // `rollbackMoves`: the disposal failure reaches `abandon` directly, so
+        // `TransferState.sourcesRemoved` is not consulted here. The flag governs
+        // the other path — a source-removal failure part way through the unlink
+        // loop — and that has its own test. Both are asserted rather than
+        // assumed, because a redundant guard nothing exercises is one that gets
+        // deleted as dead.
         #expect(detail.contains("the originals are gone"))
         #expect(detail.contains(destination.path))
         // Rows stay `in_flight` carrying both paths — the copy-landed,
@@ -880,9 +915,13 @@ struct FileOperatorSelectedSourceReplaceTests {
         let results = try await op.execute(plan.resolvingAllCollisions(with: .replace))
         #expect(results[0].outcome == .failed(.destinationNotReplaceable))
         #expect(results[1].outcome == .completed)
-        // The selected file is still there, at full size, and still indexed.
+        // The selected file is still there, at full size, and still indexed —
+        // and nothing was left set aside.
         #expect(try bytes(inPlace) == 77)
         #expect(try store.record(atPath: inPlace.path) != nil)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path)
+                .filter { $0.hasPrefix(".lightbox-replaced-") }.isEmpty)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0002.jpg")) == 20)
     }
 
     /// Item 0 resolved `skip` claims no name, so item 1 meets item 0's *source*
@@ -913,6 +952,228 @@ struct FileOperatorSelectedSourceReplaceTests {
         #expect(results[0].outcome == .skipped(.collisionResolved))
         #expect(results[1].outcome == .failed(.destinationNotReplaceable))
         #expect(try bytes(selectedInPlace) == 77)
+        #expect(try bytes(incoming) == 20)
         #expect(try store.count() == 2)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path)
+                .filter { $0.hasPrefix(".lightbox-replaced-") }.isEmpty)
+    }
+}
+
+// MARK: - C1: the cleanup may only remove what this attempt created
+
+/// `copyfileCopy` passes `COPYFILE_EXCL`, so a destination that is occupied
+/// makes the copy fail with `EEXIST` — and a destination can become occupied
+/// between the plan and the batch, which is the same gap the design already
+/// documents for sources. The catch then saw a file at the destination and
+/// removed it. **It was not a partial copy; it was somebody's photo, arrived a
+/// second ago, and it was unlinked rather than trashed** under a row saying
+/// `failed`, which means nothing changed.
+struct FileOperatorGapArrivalTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    @Test func aFileArrivingAtTheDestinationInTheGapIsNeverDeleted() async throws {
+        let source = try tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try tree.directory("to")
+        let store = try IndexStore.inMemory()
+        try index(source, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .copy, sources: [source], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        #expect(plan.items[0].collisions.isEmpty)
+        // Somebody else puts a file there after the plan was made.
+        let newcomer = try tree.file("to/IMG_0001.jpg", bytes: 99)
+
+        let results = try await op.execute(plan)
+        // Refused, and named as what it is: there is a file there and this batch
+        // was never told it could displace it.
+        #expect(results[0].outcome == .failed(.destinationNotReplaceable))
+        // The newcomer is untouched. This is the whole assertion.
+        #expect(exists(newcomer))
+        #expect(try bytes(newcomer) == 99)
+        #expect(try bytes(source) == 64)
+        #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.failed])
+    }
+
+    /// The same gap on a cross-volume move, where the source is unlinked after
+    /// the copy: the newcomer must survive *and* so must the source, since the
+    /// copy never landed.
+    @Test func aCrossVolumeMoveOntoAGapArrivalKeepsBothFiles() async throws {
+        let source = try tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try tree.directory("to")
+        let store = try IndexStore.inMemory()
+        try index(source, into: store)
+
+        let op = FileOperator(store: store, volumeReader: { url in
+            VolumeIdentity(device: url.path.hasSuffix("/to") ? 2 : 1,
+                           uuid: url.path.hasSuffix("/to") ? "VOL-B" : "VOL-A")
+        })
+        let plan = try await op.plan(kind: .move, sources: [source], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        let newcomer = try tree.file("to/IMG_0001.jpg", bytes: 99)
+
+        let results = try await op.execute(plan)
+        #expect(results[0].outcome == .failed(.destinationNotReplaceable))
+        #expect(try bytes(newcomer) == 99)
+        #expect(try bytes(source) == 64)
+        #expect(try store.record(atPath: source.path) != nil)
+    }
+}
+
+// MARK: - I1/I3: a partially unlinked cross-volume move keeps its copies
+
+/// Makes a file un-removable without touching its directory, so a batch can be
+/// stopped between one source removal and the next. `chflags(2)` rather than
+/// `chmod`, because the permission that governs unlinking lives on the *parent*
+/// and sealing that would stop the first removal too.
+private func setImmutable(_ url: URL, _ immutable: Bool) {
+    _ = url.withUnsafeFileSystemRepresentation { path in
+        chflags(path, immutable ? UInt32(UF_IMMUTABLE) : 0)
+    }
+}
+
+struct FileOperatorPartialSourceRemovalTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// The branch where `sourcesRemoved` is true: the RAW's source is already
+    /// gone when the sidecar's removal is refused. **The copies at the
+    /// destination are now the only copy of the RAW**, so nothing may roll them
+    /// back — and the displaced occupant, never disposed of, stays findable at
+    /// the stash its journal row names.
+    @Test func aHalfUnlinkedCrossVolumeMoveKeepsItsCopiesAndItsStash() async throws {
+        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
+        let sidecar = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        let destination = try tree.directory("to")
+        let occupant = try tree.file("to/IMG_0001.CR2", bytes: 11)
+        let store = try IndexStore.inMemory()
+        try index(raw, into: store)
+        try index(occupant, into: store)
+        // The sidecar cannot be unlinked; the RAW can. So the removal loop gets
+        // exactly one file in before it is stopped.
+        setImmutable(sidecar, true)
+        // `copyfile(3)` with `COPYFILE_ALL` carries the flag onto the copy, so
+        // both have to be cleared or the tree cannot be removed.
+        defer {
+            setImmutable(sidecar, false)
+            setImmutable(destination.appendingPathComponent("IMG_0001.xmp"), false)
+        }
+
+        let op = FileOperator(store: store, volumeReader: { url in
+            VolumeIdentity(device: url.path.hasSuffix("/to") ? 2 : 1,
+                           uuid: url.path.hasSuffix("/to") ? "VOL-B" : "VOL-A")
+        })
+        let plan = try await op.plan(kind: .move, sources: [raw], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        let resolved = plan.resolvingAllCollisions(with: .replace)
+        let stash = resolved.items[0].replacements[0].stash
+
+        let results = try await op.execute(resolved)
+        #expect(results[0].outcome == .failed(.sourceRemovalFailed))
+
+        // The RAW exists only at the destination now. Removing it would have
+        // been the loss.
+        #expect(!exists(raw))
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.CR2")) == 48)
+        #expect(try bytes(sidecar) == 6)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.xmp")) == 6)
+
+        // The displaced occupant was never disposed of, and its row still points
+        // at where it is.
+        #expect(try bytes(stash) == 11)
+        let rows = try store.journalRows(batchID: plan.batchID)
+        let aside = try #require(rows.first { $0.src == occupant.path })
+        #expect(aside.state == .inFlight)
+        #expect(aside.dst == stash.path)
+        #expect(aside.trashURL == nil)
+        // Every row of the item stays `in_flight`: both paths hold something.
+        #expect(rows.filter { $0.kind == .move }.allSatisfy { $0.state == .inFlight })
+    }
+}
+
+// MARK: - I2: `abandon` describes where the files really are
+
+struct FileOperatorAbandonWordingTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// A **copy** whose disposal fails has not touched its originals, and the
+    /// message must not claim otherwise — "the originals are gone" sent a user
+    /// looking for files that were never moved.
+    @Test func aCopyWhoseDisposalFailsSaysTheOriginalsAreUntouched() async throws {
+        let source = try tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try tree.directory("to")
+        _ = try tree.file("to/IMG_0001.jpg", bytes: 11)
+        let store = try IndexStore.inMemory()
+        try index(source, into: store)
+
+        let stashBox = LockBox<URL?>(nil)
+        let op = FileOperator(store: store, copier: { source, target, _ in
+            try FileManager.default.copyItem(at: source, to: target)
+            if let doomed = stashBox.withLock({ $0 }) {
+                try? FileManager.default.removeItem(at: doomed)
+            }
+        })
+        let plan = try await op.plan(kind: .copy, sources: [source], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        let resolved = plan.resolvingAllCollisions(with: .replace)
+        stashBox.withLock { $0 = resolved.items[0].replacements[0].stash }
+
+        let results = try await op.execute(resolved)
+        guard case .failed(.rollbackIncomplete(let detail)) = results[0].outcome else {
+            Issue.record("expected .rollbackIncomplete, got \(results[0].outcome)")
+            return
+        }
+        #expect(detail.contains("the originals are untouched"))
+        #expect(!detail.contains("the originals are gone"))
+        #expect(try bytes(source) == 64)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.jpg")) == 64)
+    }
+
+    /// The three wordings, directly. A same-volume move offers no seam between
+    /// the `rename(2)` and the disposal, so its branch cannot be reached end to
+    /// end — and an unchecked description is one that drifts back to claiming
+    /// the originals are gone.
+    @Test func abandonDescribesWhereTheFilesActuallyAre() async throws {
+        let store = try IndexStore.inMemory()
+        let op = FileOperator(store: store)
+        let from = tree.root.appendingPathComponent("from/IMG_0001.jpg")
+        let to = tree.root.appendingPathComponent("to/IMG_0001.jpg")
+
+        func detail(_ state: TransferState) async -> String {
+            let execution = await op.abandon(state, marks: [], reason: .diskFull)
+            guard case .failed(.rollbackIncomplete(let text)) = execution.outcome else {
+                return "unexpected: \(execution.outcome)"
+            }
+            return text
+        }
+
+        var unlinked = TransferState(byRename: false)
+        unlinked.moved = [(from: from, to: to)]
+        unlinked.sourcesRemoved = true
+        let gone = await detail(unlinked)
+        #expect(gone.contains("the originals are gone"))
+        #expect(gone.contains(to.deletingLastPathComponent().path))
+
+        var renamed = TransferState(byRename: true)
+        renamed.moved = [(from: from, to: to)]
+        let moved = await detail(renamed)
+        #expect(moved.contains("no longer at their"))
+        #expect(!moved.contains("the originals are gone"))
+
+        var copied = TransferState(byRename: false)
+        copied.moved = [(from: from, to: to)]
+        let untouched = await detail(copied)
+        #expect(untouched.contains("the originals are untouched"))
+        #expect(!untouched.contains("the originals are gone"))
+
+        // `sourceRemovalFailed` already names this exact state, so it is
+        // reported as itself rather than wrapped in a second description.
+        let passthrough = await op.abandon(unlinked, marks: [], reason: .sourceRemovalFailed)
+        #expect(passthrough.outcome == .failed(.sourceRemovalFailed))
     }
 }

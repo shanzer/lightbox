@@ -24,6 +24,7 @@ private func index(_ url: URL, into store: IndexStore) throws -> Int64 {
 }
 
 private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+private func bytes(_ url: URL) throws -> Int { try Data(contentsOf: url).count }
 
 /// A copier that hands every call to `body`, so a test can stage the errno the
 /// real filesystem will not produce on demand.
@@ -73,6 +74,9 @@ struct FileOperatorFailureTests {
         #expect(rows.first { $0.src == source.path }?.state == .failed)
         #expect(rows.first { $0.src == survivor.path }?.state == .complete)
         #expect(try store.record(atPath: source.path) != nil)
+        // The survivor really landed, and is no longer where it was.
+        #expect(!exists(survivor))
+        #expect(try bytes(destination.appendingPathComponent("IMG_0002.jpg")) == 32)
     }
 
     /// A destination the user cannot write into. `chmod 0o500` is a real
@@ -130,6 +134,7 @@ struct FileOperatorFailureTests {
         let results = try await op.execute(plan)
 
         #expect(results[0].outcome == .failed(.diskFull))
+        #expect(exists(source))
         #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
         #expect(try store.count() == 1)
         #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.failed])
@@ -149,6 +154,10 @@ struct FileOperatorFailureTests {
         let plan = try await op.plan(kind: .copy, sources: [source], destination: destination)
         let results = try await op.execute(plan)
         #expect(results[0].outcome == .failed(.destinationReadOnly))
+        // `failed` means nothing changed, so check that it did not: the source
+        // is where it was and the destination is still empty.
+        #expect(exists(source))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
     }
 
     /// The case external drives make routine. Once the volume stops answering,
@@ -172,6 +181,9 @@ struct FileOperatorFailureTests {
 
         #expect(results[0].outcome == .completed)
         #expect(results.dropFirst().allSatisfy { $0.outcome == .skipped(.volumeUnmounted) })
+        // Item 0 really landed before the volume went.
+        #expect(!exists(sources[0]))
+        #expect(exists(destination.appendingPathComponent("IMG_0000.jpg")))
         // Not attempted: the three sources are still where they were.
         for source in sources.dropFirst() { #expect(exists(source)) }
         let rows = try store.journalRows(batchID: plan.batchID)
@@ -297,12 +309,12 @@ struct FileOperatorFailureTests {
         #expect(try store.record(atPath: raw.path) != nil)
     }
 
-    /// The one outcome the operator will not describe. A cross-volume move
-    /// whose copy landed and whose source removal failed leaves both paths
-    /// present; marking that `complete` or `failed` would both be lies, so the
-    /// row stays `in_flight` for the reconcile to settle against the
-    /// filesystem.
-    @Test func aCrossVolumeMoveThatCannotRemoveItsSourceStaysInFlight() async throws {
+    /// A cross-volume move whose **first** source removal fails has unlinked
+    /// nothing, so its copies are still ordinary undoable work: the copy comes
+    /// back off the destination and the world is exactly as it started. That is
+    /// what `TransferState.sourcesRemoved` decides — see the sibling test where
+    /// it is true and the copies must be left alone.
+    @Test func aCrossVolumeMoveThatCannotRemoveItsFirstSourceRollsBackCleanly() async throws {
         let source = try tree.file("locked/IMG_0001.jpg", bytes: 48)
         let destination = try tree.directory("to")
         let store = try IndexStore.inMemory()
@@ -318,12 +330,12 @@ struct FileOperatorFailureTests {
         try tree.chmod("locked", 0o500)
 
         let results = try await op.execute(plan)
-        #expect(results[0].outcome == .failed(.sourceRemovalFailed))
+        #expect(results[0].outcome == .failed(.permissionDenied))
+        // Nothing was unlinked, so nothing is stranded: the source is where it
+        // was and the destination is empty again.
         #expect(exists(source))
-        #expect(exists(destination.appendingPathComponent("IMG_0001.jpg")))
-        #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.inFlight])
-        // The index still describes the source, which is the truth about the
-        // path it names; the reconcile is what decides the rest.
+        #expect(!exists(destination.appendingPathComponent("IMG_0001.jpg")))
+        #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.failed])
         #expect(try store.record(atPath: source.path) != nil)
     }
 

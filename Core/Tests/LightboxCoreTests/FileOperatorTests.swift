@@ -127,6 +127,10 @@ struct FileOperatorMoveTests {
 
         let moved = destination.appendingPathComponent("IMG_0001 2.jpg")
         #expect(exists(moved))
+        #expect(!exists(source))
+        // The file that forced the rename is untouched.
+        #expect(try Data(contentsOf: destination.appendingPathComponent("IMG_0001.jpg"))
+                .count == 8)
         let row = try #require(try store.record(atPath: moved.path))
         #expect(row.name == "IMG_0001 2.jpg")
         #expect(try store.ftsMatchRowIDs("\"IMG_0001 2.jpg\"") == [record.id!])
@@ -233,6 +237,7 @@ struct FileOperatorCopyTests {
         let results = try await op.execute(plan)
         #expect(results[0].outcome == .failed(.copyIncomplete))
 
+        #expect(exists(source))
         #expect(!exists(destination.appendingPathComponent("IMG_0001.jpg")))
         #expect(try store.count() == 1)
         #expect(try journalStates(store, plan.batchID) == [.failed])

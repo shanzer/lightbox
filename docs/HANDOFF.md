@@ -109,14 +109,16 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 538 tests, 55 suites.
+# Core: 543 tests, 58 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
-Verified on the mini, 2026-09-06, on the rewritten `main`:
+Verified on the mini, 2026-09-06, on the rewritten `main`. **Pre-phase-2
+counts** — this table is a record of that day's run and is deliberately not
+updated; the live counts are in §4 and in `CLAUDE.md`:
 
 | | Intel iMac | M4 mini |
 |---|---|---|
@@ -161,7 +163,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 538 tests live. `App/` only wires it to views.
+where all the logic and all 543 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -501,14 +503,26 @@ all three are now done:
   (exFAT, SMB, an unwritable folder), `trashItem` returns no URL, or the journal
   write hits `SQLITE_BUSY`.
 
-  Two deliberately redundant guards now, in `FileOperator+Transfer.swift`:
-  `TransferState.sourcesRemoved` makes the question askable at the call site, so
-  the undo is *declined* rather than attempted and the failure says the
-  originals are gone; and `rollbackMoves`' non-rename branch `stat`s the source
-  before removing a copy and refuses when it is absent. Either alone saves the
-  photo; the pair is kept because the flag is the kind of thing a refactor
-  forgets to thread through. **The test that matters asserts the photo exists at
-  its source *or* its destination** — not what the journal says.
+  Two guards now, in `FileOperator+Transfer.swift`, and they cover **different**
+  paths rather than being redundant — the first draft of this claimed otherwise
+  and was wrong. `rollbackMoves`' non-rename branch `stat`s the source before
+  removing a copy and refuses when it is absent; that is what saves the photo
+  when a *disposal* failure abandons the item, because that path reaches
+  `abandon` directly. `TransferState.sourcesRemoved` governs the other path, a
+  source-removal failure part way through the unlink loop: if nothing has been
+  unlinked yet the copies are ordinary undoable work and come back off the
+  destination, and once anything has been unlinked they are the only copies and
+  the undo declines. Each has its own test and its own mutation. **The tests that
+  matter assert the photo exists at its source *or* its destination** — not what
+  the journal says, which is how the original bug shipped green.
+
+  A third file-losing path in the same function: `copyfileCopy` passes
+  `COPYFILE_EXCL`, so a destination occupied by a file that *arrived in the
+  plan/execute gap* fails with `EEXIST` — and the cleanup, seeing a file at the
+  destination, unlinked it. Not trashed, and under a row saying `failed`.
+  Whether the destination pre-existed is now read **before** the attempt, and
+  the gap arrival is reported as `destinationNotReplaceable` and left alone.
+  "There is a file here now" never means "we created it".
 
   Owed: the Seagate live check. The batch was exercised over 50 real photos
   copied off `03_DEDUPED_ARCHIVE/2019` into a scratch directory on the boot

@@ -56,6 +56,16 @@ extension FileOperator {
         var state = TransferState(byRename: isMove && sameVolume)
 
         for (source, destination) in zip(files, destinations) {
+            // **Read before the attempt, because afterwards it is unanswerable.**
+            // `copyfileCopy` passes `COPYFILE_EXCL` and `moveItem` refuses an
+            // occupied path, so a copy that fails with `EEXIST` leaves a file at
+            // the destination that this batch did not put there — one that
+            // arrived in the plan/execute gap, the same gap the design already
+            // documents for sources. "There is a file here now" is not "we
+            // created it", and cleaning up on that reading unlinks a stranger's
+            // photo, permanently, under a row saying nothing changed.
+            let destinationPreexisted = !state.byRename
+                && FileManager.default.fileExists(atPath: destination.path)
             do {
                 if state.byRename {
                     try FileManager.default.moveItem(at: source, to: destination)
@@ -65,13 +75,20 @@ extension FileOperator {
                 }
                 state.moved.append((source, destination))
             } catch {
-                // A failed copy can leave a partial file; a failed `rename(2)`
-                // leaves nothing. Clear the one that just failed before undoing
-                // the ones that succeeded — and if it will not clear, say so: a
-                // partial file left at the destination under a row saying
-                // `failed` is the same lie every other swallowed cleanup told.
                 var cleanup: [String] = []
-                if !state.byRename, FileManager.default.fileExists(atPath: destination.path) {
+                var reason = FileOperationErrorMap.classify(error)
+                if destinationPreexisted {
+                    // Not ours. Say what actually happened — something is in the
+                    // way that the plan never offered a resolution for — and
+                    // leave it exactly where it is.
+                    reason = .destinationNotReplaceable
+                } else if !state.byRename,
+                          FileManager.default.fileExists(atPath: destination.path) {
+                    // This attempt created it, so this attempt clears it. A
+                    // partial copy left behind under a row saying `failed` is
+                    // the same lie every other swallowed cleanup told, so a
+                    // removal that will not happen is reported rather than
+                    // dropped.
                     do {
                         try FileManager.default.removeItem(at: destination)
                     } catch {
@@ -79,8 +96,7 @@ extension FileOperator {
                                        + "at \(destination.path): \(error)")
                     }
                 }
-                return undo(state, staged: staged, extraProblems: cleanup,
-                            failing: FileOperationErrorMap.classify(error))
+                return undo(state, staged: staged, extraProblems: cleanup, failing: reason)
             }
         }
 
@@ -92,11 +108,17 @@ extension FileOperator {
                     // still tells the undo that *some* source is gone.
                     state.sourcesRemoved = true
                 } catch {
-                    // Deliberately not rolled back and deliberately not
-                    // journalled: the copy is good, the source is still there,
-                    // and deleting either one on a guess is how a photo gets
-                    // lost. The `in_flight` row is the correct record.
-                    return .failure(.sourceRemovalFailed, marksJournal: false)
+                    // Through `undo`, so `sourcesRemoved` governs a live
+                    // decision rather than being bookkeeping. The two branches
+                    // are genuinely different: if nothing has been unlinked yet
+                    // the copies are still undoable and this is an ordinary
+                    // failure that leaves the world as it started; once anything
+                    // has been unlinked they are the only copies of it, and
+                    // `undo` declines rather than removing them.
+                    return undo(state, staged: staged,
+                                failing: state.sourcesRemoved
+                                    ? .sourceRemovalFailed
+                                    : FileOperationErrorMap.classify(error))
                 }
             }
         }
@@ -113,8 +135,7 @@ extension FileOperator {
             // of. The item is not settled — but by now the sources of a
             // cross-volume move are already gone, so this must not be treated as
             // undoable work.
-            return abandon(state, marks: earned,
-                           because: "displaced file not disposed of: \(reason)")
+            return abandon(state, marks: earned, reason: reason)
         case .settled(let marks):
             execution.asideMarks = marks
         }
@@ -128,8 +149,15 @@ extension FileOperator {
                     execution.mutations.append(.move(id: id, fromPath: source.path,
                                                      to: destination))
                 } else {
-                    guard let row = try store.record(atPath: source.path),
-                          let facts = Self.statFacts(destination) else { continue }
+                    guard let row = try store.record(atPath: source.path) else { continue }
+                    guard let facts = Self.statFacts(destination) else {
+                        // The copy landed — `verifyCopyLength` already `stat`ed
+                        // it — so a `stat` that fails now is the filesystem
+                        // going away underneath, not an absent row. Skipping it
+                        // would mark the journal `complete` for a file with no
+                        // index row at all.
+                        throw FileOperationCheckError.destinationUnstatable
+                    }
                     execution.mutations.append(.insertCopy(CopyInsert(
                         source: row, destination: destination,
                         size: facts.size, mtime: facts.mtime,
@@ -159,11 +187,18 @@ extension FileOperator {
     /// `failed`, and `failed` is defined to mean "nothing changed" — a claim the
     /// reconcile is built never to re-examine. An item that could not be undone
     /// reports `.rollbackIncomplete` and keeps its rows `in_flight` instead.
+    ///
+    /// **The `sourcesRemoved` branch is the one that saves a photo**, and it is
+    /// reached from the source-removal loop, not from the copy loop: by the time
+    /// a cross-volume move is unlinking, its copies are the only copies, and
+    /// rolling them back would delete the file. It is a live decision — the
+    /// other caller, the copy loop, runs before anything has been unlinked and
+    /// takes the ordinary path.
     func undo(_ state: TransferState, staged: [StagedReplacement],
               extraProblems: [String] = [],
               failing reason: FileOperationFailure) -> ItemExecution {
         guard !state.sourcesRemoved else {
-            return abandon(state, marks: [], because: String(describing: reason))
+            return abandon(state, marks: [], reason: reason)
         }
         var problems = extraProblems + Self.rollbackMoves(state.moved, byRename: state.byRename)
         problems += Self.restore(staged, rollbackSucceeded: problems.isEmpty)
@@ -176,21 +211,49 @@ extension FileOperator {
         return .failure(reason)
     }
 
-    /// Stops, without undoing anything, because undoing would destroy the file.
+    /// Stops without undoing anything, and says where everything is.
     ///
-    /// Reached once a cross-volume move has unlinked its sources: the copies at
-    /// the destination are the only copies, so the correct response to a later
-    /// failure is to leave them exactly where they are and say so. The rows stay
-    /// `in_flight` carrying both paths — the copy-landed, source-gone shape #6
-    /// already has to handle — and the message names the directory to look in,
-    /// rather than describing a rollback that must not happen.
-    private func abandon(_ state: TransferState, marks: [JournalMark],
-                         because reason: String) -> ItemExecution {
-        let directory = state.moved.first?.to.deletingLastPathComponent().path ?? "the destination"
+    /// Two callers, and they arrive for different reasons. From the
+    /// source-removal loop, because a cross-volume move has already unlinked
+    /// something and the copies are now the only copies. From the disposal
+    /// failure, because the displaced occupant is already in its stash or in the
+    /// Trash, so putting the transfer back would leave the destination holding
+    /// nothing at all — worse than leaving it holding the new file.
+    ///
+    /// The rows stay `in_flight` carrying both paths — the shape #6 already has
+    /// to handle — and **the message describes where the files actually are**,
+    /// which is not the same sentence in all three cases: a copy leaves its
+    /// originals untouched, a same-volume move leaves them renamed to the
+    /// destination, and only a cross-volume move that has unlinked leaves the
+    /// destination holding the last copy.
+    /// Internal so the three wordings can be asserted directly. A same-volume
+    /// move offers no seam between the `rename(2)` and the disposal — no
+    /// injected closure is called in between — so the branch that describes it
+    /// is unreachable end to end, and a description nothing checks is a
+    /// description that drifts.
+    func abandon(_ state: TransferState, marks: [JournalMark],
+                 reason: FileOperationFailure) -> ItemExecution {
+        // `sourceRemovalFailed` already means exactly what this function
+        // produces — copy landed, source did not go, both paths exist — so it
+        // is reported as itself rather than wrapped in a second description of
+        // the same state.
+        if case .sourceRemovalFailed = reason {
+            return .failure(.sourceRemovalFailed, marksJournal: false, asideMarks: marks)
+        }
+        let directory = state.moved.first?.to.deletingLastPathComponent().path
+            ?? "the destination"
         let names = state.moved.map(\.to.lastPathComponent).joined(separator: ", ")
-        return .failure(.rollbackIncomplete(
-            "\(reason); the originals are gone and \(names) are now only at \(directory)"),
-            marksJournal: false, asideMarks: marks)
+        let fate: String
+        if state.sourcesRemoved {
+            fate = "the originals are gone and \(names) are now only at \(directory)"
+        } else if state.byRename {
+            fate = "\(names) have been moved to \(directory) and are no longer at their "
+                 + "original paths"
+        } else {
+            fate = "\(names) have been copied to \(directory); the originals are untouched"
+        }
+        return .failure(.rollbackIncomplete("\(reason); \(fate)"),
+                        marksJournal: false, asideMarks: marks)
     }
 
     /// Undoes the transfers this item already made, returning what it could not
