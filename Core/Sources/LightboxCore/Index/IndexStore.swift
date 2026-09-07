@@ -598,6 +598,10 @@ public final class IndexStore: Sendable {
         try pool.writeWithoutTransaction { db in try db.execute(sql: sql, arguments: arguments) }
     }
 
+    /// Reads on one of the pool's *reader* connections, not the writer that
+    /// `testExecute` uses, so a connection-scoped pragma set through one is not
+    /// visible through the other. `journal_mode` is a property of the file and
+    /// reads the same either way; `foreign_keys` is per-connection and does not.
     func testFetchOne<T: DatabaseValueConvertible>(sql: String, arguments: StatementArguments = []) throws -> T? {
         try pool.read { db in try T.fetchOne(db, sql: sql, arguments: arguments) }
     }
