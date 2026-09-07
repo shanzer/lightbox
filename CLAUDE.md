@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 341 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 364 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 57 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -109,8 +109,19 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   lands on another photo's row, and duplicate detection deletes on it. Not optional.
 - **Motion photos and chunk-flood files are guarded and tested.** Any new format parser
   needs both: strip trailing data past EOI/IEND, and coalesce ranges before reading.
-- **`st_dev` is a mount-time id**, not a volume identity — it changes on replug. Phase 2
-  adds a volume-UUID column; until then don't lean on it.
+- **`st_dev` is a mount-time id**, not a volume identity — it changes on replug. Since
+  schema v2 the identity is `files.volume_uuid` (`VolumeIdentity`), and `device` is kept
+  only for inode uniqueness and for rows written before v2. The reconcile's matching rule
+  is on `IndexStore.deleteRows`: **a row is prunable if its `volume_uuid` equals the
+  root's, or its `volume_uuid` is NULL and its `device` equals the root's `st_dev`.** A
+  root with no UUID therefore prunes only the NULL rows; a stamped row is never matched by
+  a nameless root, and `volume_uuid` is written only through `COALESCE` so a nil read can
+  never erase one. `indexTier0` reads the identity **twice** — before the walk and after —
+  and gates both the stamp and the delete on them matching; collapsing that to a single
+  post-walk read lets a mid-walk swap brand real rows with an impostor's UUID, which no
+  later pass can undo. Don't reintroduce a device-only comparison as "simpler", don't
+  "simplify" the COALESCE away, and don't drop either read; all three are the ghost-rows
+  bug.
 - **GRDB is on a `DatabasePool` in WAL mode, with a 5 s busy timeout.** Readers take a
   snapshot and never wait for a writer; the timeout is there for writer-versus-writer,
   which SQLite serialises whatever the journal mode. All DB configuration goes in

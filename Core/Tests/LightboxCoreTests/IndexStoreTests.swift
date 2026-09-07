@@ -4,13 +4,13 @@ import GRDB
 @testable import LightboxCore
 
 private func sampleRecord(path: String, size: Int64 = 100, mtime: Double = 1_700_000_000,
-                          device: Int64 = 1) -> FileRecord {
+                          device: Int64 = 1, volumeUUID: String? = nil) -> FileRecord {
     FileRecord(
         id: nil, path: path,
         parentDir: (path as NSString).deletingLastPathComponent,
         name: (path as NSString).lastPathComponent,
         ext: (path as NSString).pathExtension.lowercased(),
-        size: size, mtime: mtime, device: device, inode: 42,
+        size: size, mtime: mtime, device: device, inode: 42, volumeUUID: volumeUUID,
         width: 200, height: 200,
         captureTime: nil, captureOffset: nil,
         cameraMake: nil, cameraModel: nil, orientation: 1,
@@ -36,6 +36,61 @@ struct IndexStoreTests {
         #expect(tables.contains("analysis"))
         #expect(tables.contains("saved_searches"))
         #expect(tables.contains("op_journal"))
+    }
+
+    /// v2 is the first migration to run against a populated `index.sqlite`, so
+    /// it is tested against one: a real v1 database with rows in it, opened
+    /// through the initializer the app uses. Nothing may be lost, and the new
+    /// column arrives empty because no row can name a UUID for a volume that
+    /// may not even be mounted.
+    @Test func migratingAPopulatedV1IndexKeepsEveryRowAndLeavesTheVolumeUnknown() throws {
+        let url = tree.root.appendingPathComponent("v1/index.sqlite")
+        try makeV1Index(at: url) { db in
+            for i in 0..<5 { try insertV1Row(db, path: "/lib/img\(i).jpg", device: 7) }
+            try insertV1Row(db, path: "/lib/hashed.jpg", device: 7,
+                            contentHash: "abc123", hashedAt: 1_700_000_100)
+        }
+
+        let store = try IndexStore(url: url)
+        #expect(try store.count() == 6)
+        #expect(try store.ftsRowCount() == 6)
+        for i in 0..<5 {
+            let row = try #require(try store.record(atPath: "/lib/img\(i).jpg"))
+            #expect(row.volumeUUID == nil)
+            #expect(row.device == 7)
+        }
+        // The row with hashes is the one a botched migration would show first:
+        // its columns are the expensive ones to recompute.
+        let hashed = try #require(try store.record(atPath: "/lib/hashed.jpg"))
+        #expect(hashed.contentHash == "abc123")
+        #expect(hashed.hashedAt == 1_700_000_100)
+        #expect(hashed.volumeUUID == nil)
+
+        let hasColumn: Int = try #require(try store.testFetchOne(
+            sql: "SELECT count(*) FROM pragma_table_info('files') WHERE name = 'volume_uuid'"))
+        #expect(hasColumn == 1)
+        // Closed explicitly: the tree is unlinked when this suite instance is
+        // released, and unlinking a file SQLite still has open is a client API
+        // violation even where it happens to work.
+        try store.close()
+    }
+
+    /// Until a pass stamps them, v1 rows have to keep reconciling exactly as
+    /// they did before the column existed — that is the whole point of the
+    /// NULL half of the matching rule.
+    @Test func aMigratedV1RowIsStillPrunableByItsDeviceAlone() throws {
+        let url = tree.root.appendingPathComponent("v1/index.sqlite")
+        try makeV1Index(at: url) { db in
+            try insertV1Row(db, path: "/lib/a.jpg", device: 7)
+            try insertV1Row(db, path: "/lib/b.jpg", device: 8)
+        }
+
+        let store = try IndexStore(url: url)
+        #expect(try store.deleteRows(under: "/lib", keeping: [],
+                                     onDevice: 7, onVolume: "VOL-A") == 1)
+        #expect(try store.record(atPath: "/lib/a.jpg") == nil)
+        #expect(try store.record(atPath: "/lib/b.jpg") != nil)
+        try store.close()
     }
 
     @Test func upsertInsertsThenUpdatesKeepingTheSameRowID() throws {
@@ -231,6 +286,67 @@ struct IndexStoreTests {
         #expect(try store.count() == 1)
     }
 
+    /// The half of the matching rule that `device` alone cannot express: a
+    /// replug renumbers `st_dev`, so two rows can share a device id and still
+    /// be from different filesystems. The UUID decides.
+    @Test func deleteRowsRestrictedToAVolumeIgnoresTheDeviceWhenAUUIDIsPresent() throws {
+        let store = try IndexStore.inMemory()
+        // Same device id on every row, so only the UUID can tell them apart.
+        _ = try store.upsert(sampleRecord(path: "/lib/mine.jpg", device: 3, volumeUUID: "VOL-A"))
+        _ = try store.upsert(sampleRecord(path: "/lib/theirs.jpg", device: 3, volumeUUID: "VOL-B"))
+        _ = try store.upsert(sampleRecord(path: "/lib/sub/mine2.jpg", device: 3, volumeUUID: "VOL-A"))
+
+        #expect(try store.deleteRows(under: "/lib", keeping: [],
+                                     onDevice: 3, onVolume: "VOL-A") == 2)
+        #expect(try store.record(atPath: "/lib/theirs.jpg") != nil)
+        #expect(try store.count() == 1)
+        #expect(try store.ftsRowCount() == 1)
+    }
+
+    /// The converse, and the reason a row from a replugged drive is reachable
+    /// at all: a matching UUID prunes even though the stored `device` is a
+    /// mount id that no longer exists.
+    @Test func deleteRowsMatchesAVolumeWhoseDeviceIDHasChanged() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", device: 111, volumeUUID: "VOL-A"))
+        #expect(try store.deleteRows(under: "/lib", keeping: [],
+                                     onDevice: 222, onVolume: "VOL-A") == 1)
+        #expect(try store.count() == 0)
+    }
+
+    /// The pre-migration case, spelled out: a row with no UUID falls back to
+    /// `device`, and one with a UUID is never matched by `device` alone.
+    @Test func deleteRowsFallsBackToTheDeviceOnlyForRowsWithNoVolume() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/pre.jpg", device: 3, volumeUUID: nil))
+        _ = try store.upsert(sampleRecord(path: "/lib/other.jpg", device: 9, volumeUUID: nil))
+        _ = try store.upsert(sampleRecord(path: "/lib/stamped.jpg", device: 3, volumeUUID: "VOL-B"))
+
+        #expect(try store.deleteRows(under: "/lib", keeping: [],
+                                     onDevice: 3, onVolume: "VOL-A") == 1)
+        #expect(try store.record(atPath: "/lib/pre.jpg") == nil)
+        #expect(try store.record(atPath: "/lib/other.jpg") != nil)   // wrong device
+        #expect(try store.record(atPath: "/lib/stamped.jpg") != nil) // wrong volume
+    }
+
+    /// A root on a filesystem that publishes no UUID (SMB, some FAT). The rule
+    /// has to collapse cleanly to what it was before schema v2 rather than
+    /// matching nothing.
+    @Test func aRootWithNoUUIDStillPrunesByDeviceAlone() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", device: 3, volumeUUID: nil))
+        _ = try store.upsert(sampleRecord(path: "/lib/b.jpg", device: 9, volumeUUID: nil))
+        _ = try store.upsert(sampleRecord(path: "/lib/c.jpg", device: 3, volumeUUID: "VOL-A"))
+
+        #expect(try store.deleteRows(under: "/lib", keeping: [],
+                                     onDevice: 3, onVolume: nil) == 1)
+        #expect(try store.record(atPath: "/lib/a.jpg") == nil)
+        #expect(try store.record(atPath: "/lib/b.jpg") != nil)
+        // Not this one: it is stamped as belonging to a volume that does
+        // publish a UUID, so a nameless volume is not it.
+        #expect(try store.record(atPath: "/lib/c.jpg") != nil)
+    }
+
     /// Omitting the device keeps the old meaning: every row in scope.
     @Test func deleteRowsWithoutADeviceStillCoversEveryVolume() throws {
         let store = try IndexStore.inMemory()
@@ -238,6 +354,119 @@ struct IndexStoreTests {
         _ = try store.upsert(sampleRecord(path: "/lib/b.jpg", device: 2))
         #expect(try store.deleteRows(under: "/lib", keeping: []) == 2)
         #expect(try store.count() == 0)
+    }
+
+    /// The backfill. A v1 row keeps NULL until a pass walks its file, and only
+    /// the paths the walk actually saw may be stamped.
+    @Test func setVolumeStampsOnlyThePathsItIsGiven() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/walked.jpg", device: 111, volumeUUID: nil))
+        _ = try store.upsert(sampleRecord(path: "/lib/unwalked.jpg", device: 111, volumeUUID: nil))
+
+        let volume = VolumeIdentity(device: 3, uuid: "VOL-A")
+        #expect(try store.setVolume(volume, forPaths: ["/lib/walked.jpg"]) == 1)
+
+        let walked = try #require(try store.record(atPath: "/lib/walked.jpg"))
+        #expect(walked.volumeUUID == "VOL-A")
+        #expect(walked.device == 3)          // the mount id is refreshed with it
+        let unwalked = try #require(try store.record(atPath: "/lib/unwalked.jpg"))
+        #expect(unwalked.volumeUUID == nil)
+        #expect(unwalked.device == 111)
+
+        // Idempotent: a steady-state pass must not dirty a page.
+        #expect(try store.setVolume(volume, forPaths: ["/lib/walked.jpg"]) == 0)
+    }
+
+    /// The stamp must not disturb anything else on the row — in particular the
+    /// hashes, which cost a full read to recompute. `files_au_invalidate` fires
+    /// on `size` and `mtime`, and this write touches neither.
+    @Test func setVolumeLeavesTheRestOfTheRowAlone() throws {
+        let store = try IndexStore.inMemory()
+        var record = sampleRecord(path: "/lib/a.jpg")
+        record.contentHash = "abc"
+        record.hashedAt = 1_700_000_100
+        _ = try store.upsert(record)
+
+        _ = try store.setVolume(VolumeIdentity(device: 3, uuid: "VOL-A"),
+                                forPaths: ["/lib/a.jpg"])
+        let row = try #require(try store.record(atPath: "/lib/a.jpg"))
+        #expect(row.contentHash == "abc")
+        #expect(row.hashedAt == 1_700_000_100)
+        #expect(row.size == 100)
+        #expect(row.mtime == 1_700_000_000)
+    }
+
+    /// A nil UUID refreshes the device and leaves a known identity alone.
+    ///
+    /// "This filesystem published no UUID" is not the claim "this file is not on
+    /// the volume its row names", and one pass whose resource-value read came
+    /// back nil must not wipe the column on every row it walked — by the
+    /// matching rule a NULL row is *less* protected than a stamped one, so the
+    /// wipe would reinstate the replug bug it was added to fix.
+    @Test func setVolumeWithNoUUIDPreservesAKnownOneAndStillRefreshesTheDevice() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/known.jpg", device: 111, volumeUUID: "VOL-A"))
+        _ = try store.upsert(sampleRecord(path: "/lib/blank.jpg", device: 111, volumeUUID: nil))
+
+        #expect(try store.setVolume(VolumeIdentity(device: 3, uuid: nil),
+                                    forPaths: ["/lib/known.jpg", "/lib/blank.jpg"]) == 2)
+
+        let known = try #require(try store.record(atPath: "/lib/known.jpg"))
+        #expect(known.volumeUUID == "VOL-A")     // preserved, not erased
+        #expect(known.device == 3)               // st_dev is always readable, so always refreshed
+        let blank = try #require(try store.record(atPath: "/lib/blank.jpg"))
+        #expect(blank.volumeUUID == nil)         // nothing to preserve, nothing invented
+        #expect(blank.device == 3)
+
+        // And still idempotent: with the device now current, a repeat changes
+        // nothing rather than rewriting the same values.
+        #expect(try store.setVolume(VolumeIdentity(device: 3, uuid: nil),
+                                    forPaths: ["/lib/known.jpg", "/lib/blank.jpg"]) == 0)
+    }
+
+    /// The same guarantee on the other writer. `upsert` refreshes the whole
+    /// identity of a re-indexed file, and a nil UUID there is the same
+    /// unreliable read it is in `setVolume`.
+    @Test func upsertWithNoUUIDPreservesAKnownOneAndStillRefreshesTheDevice() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", size: 100,
+                                          device: 111, volumeUUID: "VOL-A"))
+        // The file's bytes changed, so tier 0 re-upserts it — this time from a
+        // pass whose volume reported no UUID.
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", size: 999,
+                                          device: 3, volumeUUID: nil))
+
+        let row = try #require(try store.record(atPath: "/lib/a.jpg"))
+        #expect(row.volumeUUID == "VOL-A")
+        #expect(row.device == 3)
+        #expect(row.size == 999)                 // the rest of the row did update
+    }
+
+    /// The converse, so preservation is not mistaken for "the column is
+    /// write-once": a real UUID replaces whatever was there.
+    @Test func aRealUUIDStillOverwritesTheStoredOne() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", device: 111, volumeUUID: "VOL-A"))
+        #expect(try store.setVolume(VolumeIdentity(device: 3, uuid: "VOL-B"),
+                                    forPaths: ["/lib/a.jpg"]) == 1)
+        #expect(try store.record(atPath: "/lib/a.jpg")?.volumeUUID == "VOL-B")
+
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", device: 3, volumeUUID: "VOL-C"))
+        #expect(try store.record(atPath: "/lib/a.jpg")?.volumeUUID == "VOL-C")
+    }
+
+    /// More paths than fit in one statement's bound variables. The chunking is
+    /// an implementation detail the caller must not have to know about.
+    @Test func setVolumeStampsMorePathsThanOneStatementCanBind() throws {
+        let store = try IndexStore.inMemory()
+        let paths = (0..<1200).map { "/lib/img\($0).jpg" }
+        for path in paths { _ = try store.upsert(sampleRecord(path: path, device: 111)) }
+
+        #expect(try store.setVolume(VolumeIdentity(device: 3, uuid: "VOL-A"),
+                                    forPaths: paths) == 1200)
+        for path in [paths.first!, paths[700], paths.last!] {
+            #expect(try store.record(atPath: path)?.volumeUUID == "VOL-A")
+        }
     }
 
     @Test func deleteRowsInFolderNormalizesATrailingSlash() throws {

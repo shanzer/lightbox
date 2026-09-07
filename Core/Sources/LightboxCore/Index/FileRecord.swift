@@ -17,6 +17,10 @@ public struct FileRecord: Codable, Sendable, Hashable, FetchableRecord, MutableP
     public var mtime: Double
     public var device: Int64
     public var inode: Int64
+    /// The volume this file was seen on, or nil for a row written before
+    /// schema v2 or walked on a filesystem that publishes no UUID. Stable
+    /// across the replug that renumbers `device`; see `VolumeIdentity`.
+    public var volumeUUID: String?
     public var width: Int?
     public var height: Int?
     public var captureTime: Double?
@@ -34,6 +38,7 @@ public struct FileRecord: Codable, Sendable, Hashable, FetchableRecord, MutableP
     public enum CodingKeys: String, CodingKey {
         case id, path, name, ext, size, mtime, device, inode, width, height, orientation, phash
         case parentDir = "parent_dir"
+        case volumeUUID = "volume_uuid"
         case captureTime = "capture_time"
         case captureOffset = "capture_offset"
         case cameraMake = "camera_make"
@@ -49,7 +54,12 @@ public struct FileRecord: Codable, Sendable, Hashable, FetchableRecord, MutableP
     public var captureDate: Date? { captureTime.map(Date.init(timeIntervalSince1970:)) }
 
     /// The record for a freshly walked file, before metadata or hashes are read.
-    public init(entry: WalkEntry, indexedAt: Double) {
+    ///
+    /// `volume` is read once per pass from the scan's root rather than per
+    /// entry: every file the walk produced is by construction on the volume
+    /// answering there, and `volumeUUIDString` is a resource-value read this
+    /// has no reason to pay 50,000 times.
+    public init(entry: WalkEntry, volume: VolumeIdentity, indexedAt: Double) {
         self.id = nil
         self.path = entry.url.path
         self.parentDir = entry.url.deletingLastPathComponent().path
@@ -59,18 +69,20 @@ public struct FileRecord: Codable, Sendable, Hashable, FetchableRecord, MutableP
         self.mtime = entry.mtime.timeIntervalSince1970
         self.device = entry.device
         self.inode = entry.inode
+        self.volumeUUID = volume.uuid
         self.indexedAt = indexedAt
     }
 
     public init(id: Int64?, path: String, parentDir: String, name: String, ext: String,
-                size: Int64, mtime: Double, device: Int64, inode: Int64, width: Int?, height: Int?,
+                size: Int64, mtime: Double, device: Int64, inode: Int64,
+                volumeUUID: String? = nil, width: Int?, height: Int?,
                 captureTime: Double?, captureOffset: String?, cameraMake: String?,
                 cameraModel: String?, orientation: Int?, contentHash: String?,
                 imageHash: String?, imageHashKind: String?, phash: String?,
                 hashedAt: Double?, indexedAt: Double) {
         self.id = id; self.path = path; self.parentDir = parentDir; self.name = name
         self.ext = ext; self.size = size; self.mtime = mtime; self.device = device
-        self.inode = inode
+        self.inode = inode; self.volumeUUID = volumeUUID
         self.width = width; self.height = height; self.captureTime = captureTime
         self.captureOffset = captureOffset; self.cameraMake = cameraMake
         self.cameraModel = cameraModel; self.orientation = orientation

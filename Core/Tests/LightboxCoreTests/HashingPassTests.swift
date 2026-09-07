@@ -54,9 +54,24 @@ private struct StubMetadata: MetadataReading {
 }
 
 private func coordinator(_ store: IndexStore, hasher: any FileHashing,
-                         grayscale: any GrayscaleRendering = StubGray()) -> IndexCoordinator {
-    IndexCoordinator(store: store, walker: Walker(), metadata: StubMetadata(),
-                     hasher: hasher, grayscale: grayscale, concurrency: 2)
+                         grayscale: any GrayscaleRendering = StubGray(),
+                         volumeReader: (@Sendable (URL) -> VolumeIdentity?)? = nil)
+    -> IndexCoordinator {
+    guard let volumeReader else {
+        return IndexCoordinator(store: store, walker: Walker(), metadata: StubMetadata(),
+                                hasher: hasher, grayscale: grayscale, concurrency: 2)
+    }
+    return IndexCoordinator(store: store, walker: Walker(), metadata: StubMetadata(),
+                            hasher: hasher, grayscale: grayscale, concurrency: 2,
+                            volumeReader: volumeReader)
+}
+
+/// Yields each identity in turn and then repeats the last, so a test can say
+/// only what changes. The pass reads the volume once at the start and twice per
+/// batch, so a swap staged this way lands mid-pass without any timing.
+private func volumesInTurn(_ volumes: [VolumeIdentity?]) -> @Sendable (URL) -> VolumeIdentity? {
+    let remaining = LockBox(volumes)
+    return { _ in remaining.withLock { $0.count > 1 ? $0.removeFirst() : $0.first ?? nil } }
 }
 
 /// Runs tier 0 over an existing tree. Kept separate from fixture creation: a
@@ -573,6 +588,70 @@ struct HashingPassTests {
         let resumed = try await c.runHashingPass(root: tree.root, onProgress: nil)
         #expect(resumed.completed == 5)
         #expect(resumed.failed == 0)
+        #expect(try store.countMissingHashes(under: tree.root.path) == 0)
+    }
+
+    /// The other half of that guard, and the half a moved root cannot reach:
+    /// *something else answers*. A stale mount point, a share remounted over
+    /// the same path, or a different drive taking the departed one's place all
+    /// leave a perfectly readable directory where the library used to be — so
+    /// "does the root still resolve?" says yes and is the wrong question.
+    ///
+    /// It matters here more than anywhere because marking an attempt is almost
+    /// irreversible: `hashed_at` is written whether or not hashing worked, and
+    /// only a change of size or mtime re-queues a row. A pass that kept going
+    /// against an impostor would stamp every file in the library as attempted
+    /// while hashing the wrong bytes or none at all, and no later pass would
+    /// revisit them.
+    @Test func aRootAnsweredByADifferentVolumeMidPassWritesNothing() async throws {
+        let store = try IndexStore.inMemory()
+        try await seedTier0(tree, store, count: 5)
+        #expect(try store.countMissingHashes(under: tree.root.path) == 5)
+
+        let real = VolumeIdentity(device: 16, uuid: "REAL-VOLUME")
+        // Same `st_dev` as the real one, so only the UUID distinguishes them —
+        // which is the case a device-only comparison waves through.
+        let impostor = VolumeIdentity(device: 16, uuid: "IMPOSTOR")
+
+        let calls = LockBox<[String]>([])
+        let c = coordinator(store, hasher: CountingHasher(calls: calls),
+                            volumeReader: volumesInTurn([real, impostor]))
+        await #expect(throws: IndexCoordinatorError.rootUnreadable(tree.root.path)) {
+            try await c.runHashingPass(root: tree.root, onProgress: nil)
+        }
+
+        // Every row still queued, and none marked as attempted.
+        #expect(try store.countMissingHashes(under: tree.root.path) == 5)
+        for i in 0..<5 {
+            let row = try #require(try store.record(atPath: path("img\(i).jpg")))
+            #expect(row.hashedAt == nil)
+            #expect(row.contentHash == nil)
+        }
+
+        // The guard, not a broken fixture: on a volume that stays itself the
+        // same pass drains the queue.
+        let resumed = try await coordinator(store, hasher: CountingHasher(calls: LockBox([])),
+                                            volumeReader: volumesInTurn([real]))
+            .runHashingPass(root: tree.root, onProgress: nil)
+        #expect(resumed.completed == 5)
+        #expect(try store.countMissingHashes(under: tree.root.path) == 0)
+    }
+
+    /// A replug is not an impostor. The UUID is a property of the filesystem
+    /// and `st_dev` is a property of the mount, so the same drive coming back
+    /// on a fresh device id is still the volume the pass started against and
+    /// the work must carry on rather than abort.
+    @Test func aReplugMidPassIsNotTreatedAsADifferentVolume() async throws {
+        let store = try IndexStore.inMemory()
+        try await seedTier0(tree, store, count: 5)
+
+        let before = VolumeIdentity(device: 16, uuid: "SEAGATE")
+        let after = VolumeIdentity(device: 42, uuid: "SEAGATE")   // same drive, new mount
+        let progress = try await coordinator(store, hasher: CountingHasher(calls: LockBox([])),
+                                             volumeReader: volumesInTurn([before, after]))
+            .runHashingPass(root: tree.root, onProgress: nil)
+
+        #expect(progress.completed == 5)
         #expect(try store.countMissingHashes(under: tree.root.path) == 0)
     }
 

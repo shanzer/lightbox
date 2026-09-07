@@ -86,11 +86,13 @@ another window's writes. WAL keeps two sidecars — `index.sqlite-wal` and
 together.
 
 **`files`** — `id`, `path` (unique), `parent_dir`, `name`, `ext`, `size`,
-`mtime`, `inode`, `width`, `height`, `capture_time`, `capture_offset`,
-`camera_make`, `camera_model`, `orientation`, `content_hash`, `image_hash`,
-`image_hash_kind`, `phash`, `hashed_at`, `indexed_at`.
+`mtime`, `device`, `inode`, `volume_uuid`, `width`, `height`, `capture_time`,
+`capture_offset`, `camera_make`, `camera_model`, `orientation`, `content_hash`,
+`image_hash`, `image_hash_kind`, `phash`, `hashed_at`, `indexed_at`.
 
-**`files_fts`** — FTS5 external-content table over `name` and `ocr_text`.
+**`files_fts`** — a standalone FTS5 table over `name` and `ocr_text`, not an
+external-content one: it stores its own copy of the text, keyed by `rowid` =
+`files.id`, and is kept in step by `upsert` and by the `files_ad` trigger.
 
 **`analysis`** — `file_id`, `ocr_text`, `text_coverage` (union area of OCR
 bounding boxes as a fraction of the frame), `top_labels` (JSON),
@@ -102,6 +104,63 @@ bounding boxes as a fraction of the frame), `top_labels` (JSON),
 
 **`op_journal`** — `op_id`, `batch_id`, `kind`, `src`, `dst`, `trash_url`,
 `timestamp`, `state`.
+
+### Volume identity
+
+*(Amended: schema v2.)* A row records which volume it was seen on, so a walk of
+a path is never taken as evidence about rows that came from a different
+filesystem — a stale mount point, a share that mounts empty, or a drive back
+with a fresh filesystem otherwise reads as "every file here was deleted" from a
+clean, complete, zero-entry pass.
+
+Two columns, because neither id is sufficient alone:
+
+- **`volume_uuid`** — `URLResourceValues.volumeUUIDString`, read from the scan's
+  root once *before* the walk and once *after*, with the two required to agree
+  before anything is written. It is a property of the filesystem, assigned when
+  it is created, and it survives unmounts, reboots and replugs. This is the
+  identity.
+- **`device`** — `st_dev`, assigned at *mount* time and renumbered when a drive
+  comes back. It cannot be the identity, and is kept because an inode is unique
+  only within a volume and because rows written before v2 have nothing else.
+
+**The matching rule for the reconcile's delete: a row is prunable if its
+`volume_uuid` equals the root's, or its `volume_uuid` is NULL and its `device`
+equals the root's `st_dev`.** The second clause is the pre-migration case.
+
+A filesystem that publishes no UUID (SMB, some FAT) binds NULL, so the first
+clause cannot hold and the rule collapses to the `st_dev` comparison **for rows
+that carry no UUID; a row already stamped with one is never matched by a
+nameless root.** That asymmetry is the safe direction — a row naming a volume is
+making a claim a nameless root cannot answer — and it is why `volume_uuid` is
+only ever written through `COALESCE`, by both the stamp and the upsert: a pass
+whose UUID read came back nil refreshes `device` but must not erase an identity
+an earlier pass established, which would demote the row into the weaker case.
+
+**Both reads are load-bearing, and neither may be dropped for the other.** The
+pre-walk read is what makes the walk's results attributable — read the volume
+only afterwards and a drive swapped out mid-walk hands the *impostor's*
+identity to rows that came off the real one, which is unrecoverable: a later
+pass on the real volume would match them by neither UUID nor device and could
+never prune them. The post-walk read is what makes those results trustworthy.
+So the identity is captured before the walk, re-read after it, and the stamp
+and the delete are both gated on the two matching. The per-entry upserts run
+before that gate and are deliberately not covered: rows written from an
+impostor describe paths the real volume does not have, so the next clean pass
+reconciles or re-stamps them.
+
+The tier 1 hashing pass guards its writes with the same identity, comparing the
+UUID where one exists and `st_dev` where it does not — so a root that has become
+a *different* volume aborts the pass, not merely one that has gone away. That
+distinction matters because `hashed_at` records an attempt: a pass that kept
+going against an impostor would mark the whole library attempted and no later
+pass would revisit it.
+
+v2 adds the column nullable and backfills nothing: no row can name a UUID for a
+volume that may not be mounted. Each tier 0 pass instead stamps the rows whose
+files it actually walked — not the whole path scope, because a row the walk
+could not look at is not evidence of anything. A volume whose UUID *changes* (a
+reformat) is out of scope; that is a new library.
 
 ### Staleness
 
