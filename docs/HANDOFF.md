@@ -106,7 +106,7 @@ cd ~/src/lightbox
 # Core: 469 tests, 34 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 61 tests.
+# App: builds the SwiftUI target and runs its 63 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 

@@ -27,7 +27,14 @@ enum LaunchEnvironment {
     /// not part of any contract: `XCTestConfigurationFilePath` is the classic
     /// one, `XCTestBundlePath` and `XCTestSessionIdentifier` are what recent
     /// Xcodes set. Recognising any of them means a toolchain that drops one
-    /// does not silently re-open the user's index. `LIGHTBOX_TEST_HOST=1` is
+    /// does not silently re-open the user's index.
+    ///
+    /// **`!= nil` and not a non-empty check.** Under Xcode 26 the test host is
+    /// launched with `XCTestConfigurationFilePath` set to the *empty string* —
+    /// present, carrying no path. `environment["…"] != nil` sees that;
+    /// `environment["…"]?.isEmpty == false`, or any truthiness test, would
+    /// not, and the guard would silently stop working on the toolchain this
+    /// was written for. `eachXCTestVariableIsRecognisedOnItsOwn` pins it. `LIGHTBOX_TEST_HOST=1` is
     /// the explicit opt-in for a harness that sets none of them — a UI-test
     /// runner, or a CI smoke launch — and needs no scheme or project edit to
     /// use, which matters because `project.pbxproj` here is hand-written.

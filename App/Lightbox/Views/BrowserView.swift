@@ -6,10 +6,20 @@ struct BrowserView: View {
     @State private var loadError: String?
 
     /// The index this window is to open, or nil when this launch must not open
-    /// one — see `LaunchEnvironment`. Resolved once, as a stored property, so
-    /// the branch that renders the inert scene and the branch that builds the
-    /// model cannot disagree about which launch this is.
-    private let launchIndexURL = LaunchEnvironment.launchIndexURL()
+    /// one — see `LaunchEnvironment`. A stored property rather than a call in
+    /// `start()`, so the branch that renders the inert scene and the branch
+    /// that builds the model cannot disagree about which launch this is.
+    ///
+    /// Not private, and injected through the initialiser's default rather than
+    /// hardcoded here, so a test can read back what the view resolved. That is
+    /// the only way to catch the mutation that matters: pinning this to
+    /// `IndexStore.defaultURL` leaves every test of `LaunchEnvironment` itself
+    /// green while the test host opens the user's index again.
+    let launchIndexURL: URL?
+
+    init(launchIndexURL: URL? = LaunchEnvironment.launchIndexURL()) {
+        self.launchIndexURL = launchIndexURL
+    }
 
     var body: some View {
         Group {
