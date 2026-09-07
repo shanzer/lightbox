@@ -115,9 +115,11 @@ clean, complete, zero-entry pass.
 
 Two columns, because neither id is sufficient alone:
 
-- **`volume_uuid`** — `URLResourceValues.volumeUUIDString`, read once per pass
-  from the scan's root. It is a property of the filesystem, assigned when it is
-  created, and it survives unmounts, reboots and replugs. This is the identity.
+- **`volume_uuid`** — `URLResourceValues.volumeUUIDString`, read from the scan's
+  root once *before* the walk and once *after*, with the two required to agree
+  before anything is written. It is a property of the filesystem, assigned when
+  it is created, and it survives unmounts, reboots and replugs. This is the
+  identity.
 - **`device`** — `st_dev`, assigned at *mount* time and renumbered when a drive
   comes back. It cannot be the identity, and is kept because an inode is unique
   only within a volume and because rows written before v2 have nothing else.
@@ -135,8 +137,24 @@ only ever written through `COALESCE`, by both the stamp and the upsert: a pass
 whose UUID read came back nil refreshes `device` but must not erase an identity
 an earlier pass established, which would demote the row into the weaker case.
 
+**Both reads are load-bearing, and neither may be dropped for the other.** The
+pre-walk read is what makes the walk's results attributable — read the volume
+only afterwards and a drive swapped out mid-walk hands the *impostor's*
+identity to rows that came off the real one, which is unrecoverable: a later
+pass on the real volume would match them by neither UUID nor device and could
+never prune them. The post-walk read is what makes those results trustworthy.
+So the identity is captured before the walk, re-read after it, and the stamp
+and the delete are both gated on the two matching. The per-entry upserts run
+before that gate and are deliberately not covered: rows written from an
+impostor describe paths the real volume does not have, so the next clean pass
+reconciles or re-stamps them.
+
 The tier 1 hashing pass guards its writes with the same identity, comparing the
-UUID where one exists and `st_dev` where it does not.
+UUID where one exists and `st_dev` where it does not — so a root that has become
+a *different* volume aborts the pass, not merely one that has gone away. That
+distinction matters because `hashed_at` records an attempt: a pass that kept
+going against an impostor would mark the whole library attempted and no later
+pass would revisit it.
 
 v2 adds the column nullable and backfills nothing: no row can name a UUID for a
 volume that may not be mounted. Each tier 0 pass instead stamps the rows whose

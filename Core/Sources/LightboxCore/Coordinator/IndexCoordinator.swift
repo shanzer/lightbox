@@ -136,6 +136,22 @@ public actor IndexCoordinator {
         // would no longer match those rows by UUID or by device, and they could
         // never be pruned again. Ghosts, with no way back short of a rebuild.
         //
+        // **What the gate covers, and what it deliberately does not.** It
+        // covers the two writes that are hard to undo: the volume stamp and the
+        // reconcile's delete. It does *not* cover the per-entry upserts below,
+        // which run before it — so on a real mid-walk swap, files collected
+        // from the impostor are already in the index, carrying the real
+        // volume's UUID, when this throws.
+        //
+        // That is left alone rather than fixed, because it is recoverable and
+        // the alternatives are not. Those rows describe paths that do not exist
+        // on the real volume, so the next clean pass reconciles them away by
+        // the ordinary rule; and if the impostor turns out to be the permanent
+        // occupant, the next pass's `setVolume` re-stamps them to whatever is
+        // actually there. Nothing is stranded, and nothing needs a rebuild.
+        // Buffering a whole pass's upserts to make them atomic would cost a
+        // 50k-row transaction to protect against a swap nobody has performed.
+        //
         // Re-checking afterwards is what makes them trustworthy. On a long pass
         // the volume can go away or be replaced while the walk runs, and a
         // reconcile is only evidence if the thing that answered at the start is

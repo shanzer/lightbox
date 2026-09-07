@@ -505,7 +505,7 @@ struct IndexCoordinatorTests {
     /// the damage would be silent and permanent, because a later pass on the
     /// real volume would then match those rows by neither UUID nor device and
     /// could never prune them again. Ghosts with no way back but a rebuild.
-    @Test func aVolumeSwappedDuringTheWalkStampsNothingAndDeletesNothing() async throws {
+    @Test func aVolumeSwappedDuringTheWalkWritesNoVolumeStampAndDeletesNothing() async throws {
         let doomed = try tree.file("gone.jpg")
         try tree.file("stays.jpg")
         let store = try IndexStore.inMemory()
@@ -531,6 +531,10 @@ struct IndexCoordinatorTests {
         for name in ["gone.jpg", "stays.jpg"] {                            // nothing re-stamped
             #expect(try store.record(atPath: path(name))?.volumeUUID == "REAL-VOLUME")
         }
+        // "WritesNoVolumeStamp", not "WritesNothing": the gate sits after the
+        // per-entry upserts, so rows for files the walk collected can already
+        // be in the index when it throws. Deliberate, and recoverable — see the
+        // note on `indexTier0`.
 
         // And the proof that the guard, not a broken fixture, is what stopped
         // it: the same pass on a stable volume prunes the row.
