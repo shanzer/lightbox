@@ -456,4 +456,183 @@ struct IndexStoreTests {
         #expect(try one.count() == 200)
         #expect(try two.count() == 200)
     }
+
+    // MARK: - Write-ahead logging
+
+    /// The journal mode is the whole mechanism behind "readers never block on
+    /// the writer", and it is a property of the *file*, not of the process, so
+    /// a store that quietly opened in `delete` mode would still pass every
+    /// behavioural test on an uncontended run and only show up as a stall in
+    /// front of a user. Assert it directly.
+    @Test func aFileBackedStoreOpensInWALMode() throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let store = try IndexStore(url: url)
+        let mode: String? = try store.testFetchOne(sql: "PRAGMA journal_mode")
+        #expect(mode == "wal")
+    }
+
+    /// `inMemory()` shares `makeConfiguration()` with the file-backed store so
+    /// the 299 tests exercise the database production runs. That equivalence is
+    /// worth asserting rather than assuming, now that the in-memory store is
+    /// backed by a temporary file for the pool's sake.
+    @Test func theInMemoryStoreOpensInWALModeToo() throws {
+        let store = try IndexStore.inMemory()
+        let mode: String? = try store.testFetchOne(sql: "PRAGMA journal_mode")
+        #expect(mode == "wal")
+    }
+
+    /// The point of the pool: a read does not queue behind a write on the same
+    /// store. One `IndexStore` per window means a window's own search would
+    /// otherwise wait for its own tier 1 hash batch — a `DatabaseQueue`
+    /// serialises every access through one connection, whoever asked.
+    ///
+    /// The probe write is one long statement rather than a held transaction
+    /// because `writeWithoutTransaction` is the only unwrapped write the store
+    /// exposes, and leaving a `BEGIN` dangling in it is exactly what GRDB's
+    /// `allowsUnsafeTransactions` forbids.
+    @Test func aReadDoesNotWaitForAWriteInFlightOnTheSameStore() async throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let store = try IndexStore(url: url)
+        try store.testExecute(sql: "CREATE TABLE slow_probe (x INTEGER)")
+
+        let finished = LockBox(false)
+        // Counted in the CTE and written once, rather than inserting millions
+        // of rows: the statement has to occupy the connection for about a
+        // second, not fill the temporary directory to prove it.
+        let probe = """
+            WITH RECURSIVE counter(i) AS (
+                SELECT 1 UNION ALL SELECT i + 1 FROM counter WHERE i < 12000000
+            )
+            INSERT INTO slow_probe (x) SELECT max(i) FROM counter
+            """
+        let writing = Task.detached {
+            try? store.testExecute(sql: probe)
+            finished.withLock { $0 = true }
+        }
+        // Long enough that the write is certainly under way, short enough that
+        // it is certainly not done — the guard below checks the second half.
+        try await Task.sleep(for: .milliseconds(200))
+
+        let started = Date()
+        _ = try store.count()
+        let readTook = Date().timeIntervalSince(started)
+        let stillWriting = finished.withLock { !$0 }
+
+        #expect(stillWriting, "the probe write finished before the read; it proves nothing")
+        #expect(readTook < 0.05, "the read waited \(readTook)s for the in-flight write")
+
+        // Awaited rather than abandoned: the probe holds the store, and the
+        // store holds a file in `tree`, which the suite removes the moment this
+        // returns.
+        await writing.value
+    }
+
+    /// The two-window soak. A second `IndexStore` on the same file reads
+    /// continuously while the first writes batches for several seconds; not one
+    /// read may fail. A busy timeout bounds `SQLITE_BUSY` here, it does not
+    /// remove it — under WAL the reader never contends for the write lock at
+    /// all.
+    @Test func sustainedWritesInOneStoreNeverMakeAnotherStoresReadsFail() async throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let writerStore = try IndexStore(url: url)
+        let readerStore = try IndexStore(url: url)
+        let deadline = Date().addingTimeInterval(3)
+        let query = SearchQuery(scope: .everywhere, predicate: .all)
+
+        async let writing: Int = Task.detached {
+            var written = 0
+            while Date() < deadline {
+                for _ in 0..<50 {
+                    _ = try writerStore.upsert(sampleRecord(path: "/w/\(written).jpg"))
+                    written += 1
+                }
+            }
+            return written
+        }.value
+
+        // Errors are collected rather than thrown so the writer is never left
+        // running against a store the test has already walked away from, and
+        // so the report names every failure rather than the first.
+        let failures = LockBox<[String]>([])
+        let counts = LockBox<[Int]>([])
+        async let reading: Void = Task.detached {
+            while Date() < deadline {
+                do {
+                    let n = try readerStore.count()
+                    counts.withLock { $0.append(n) }
+                    _ = try readerStore.search(query)
+                    _ = try readerStore.facets(for: query)
+                } catch {
+                    failures.withLock { $0.append("\(error)") }
+                }
+            }
+        }.value
+
+        let written = try await writing
+        await reading
+
+        #expect(failures.withLock { $0 }.isEmpty,
+                "reads failed while the other store wrote: \(failures.withLock { $0 })")
+        let observed = counts.withLock { $0 }
+        #expect(observed.count > 10, "the reader only managed \(observed.count) reads")
+        // A snapshot is a snapshot: counts may repeat, but they must never go
+        // backwards, and the last one must not exceed what was actually written.
+        #expect(observed == observed.sorted(), "the reader saw counts go backwards")
+        #expect((observed.last ?? 0) <= written)
+        #expect(try readerStore.count() == written)
+    }
+
+    /// WAL puts two sidecars next to the database, and the in-memory store is
+    /// now a real file. A test store that leaked all three into the temporary
+    /// directory on every one of the 299 tests would be a slow, invisible mess.
+    @Test func theInMemoryStoreRemovesItsBackingFilesWhenItIsReleased() throws {
+        // A function rather than a `do` block: the store is released when the
+        // call returns, which is a language guarantee, where the end of a
+        // lexical scope is only usually one.
+        func makeAndDiscard() throws -> URL {
+            let store = try IndexStore.inMemory()
+            _ = try store.upsert(sampleRecord(path: "/a/b.jpg"))
+            #expect(FileManager.default.fileExists(atPath: store.fileURL.path))
+            return store.fileURL
+        }
+        let url = try makeAndDiscard()
+
+        for suffix in ["", "-wal", "-shm"] {
+            #expect(!FileManager.default.fileExists(atPath: url.path + suffix),
+                    "left \(url.lastPathComponent + suffix) behind")
+        }
+        #expect(!FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path))
+    }
+
+    /// "Delete the index and it rebuilds" is a documented guarantee, and users
+    /// delete the file they can see — leaving `index.sqlite-wal` behind, which
+    /// no Finder window ever showed them. A write-ahead log replayed into a
+    /// brand-new database would be a silently wrong index, and the store has no
+    /// code guarding against it: SQLite discards a log whose database is
+    /// missing or zero-length rather than recovering from it, which was
+    /// confirmed against a 12 KB log holding five rows that did not come back.
+    ///
+    /// So this test pins a guarantee the app leans on and does not implement.
+    /// If a future SQLite or GRDB ever recovers that log instead, deleting the
+    /// index by hand starts producing an index nobody wrote, and this is the
+    /// only thing that would say so.
+    @Test func aStaleWriteAheadLogBesideAMissingDatabaseIsDiscarded() throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let walURL = URL(fileURLWithPath: url.path + "-wal")
+        let store = try IndexStore(url: url)
+        for i in 0..<5 { _ = try store.upsert(sampleRecord(path: "/a/\(i).jpg")) }
+        // Captured while the connection is open, because closing it checkpoints
+        // the log into the database and removes it.
+        let staleLog = try Data(contentsOf: walURL)
+        #expect(!staleLog.isEmpty)
+        try store.close()
+
+        // The mistake being modelled: the user deletes `index.sqlite` and
+        // leaves the sidecar, which their Finder window never showed them.
+        try FileManager.default.removeItem(at: url)
+        try staleLog.write(to: walURL)
+
+        let reopened = try IndexStore(url: url)
+        #expect(try reopened.count() == 0)
+    }
 }

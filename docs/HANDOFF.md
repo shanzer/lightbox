@@ -95,7 +95,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 299 tests, 20 suites.
+# Core: 305 tests, 20 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 57 tests.
@@ -122,10 +122,26 @@ Runtime state is **not** in the repo: `~/Library/Application
 Support/Lightbox/index.sqlite`. Deleting it is always safe — the app detects a
 corrupt or missing index at launch and rebuilds.
 
+Since the move to WAL, the index is **three** files, not one:
+
+```
+~/Library/Application Support/Lightbox/index.sqlite
+~/Library/Application Support/Lightbox/index.sqlite-wal
+~/Library/Application Support/Lightbox/index.sqlite-shm
+```
+
+Delete the whole set. Deleting only `index.sqlite` is the shape of mistake that
+silently corrupts a WAL database elsewhere, and it is safe here only because
+SQLite discards a write-ahead log whose database is missing or zero-length
+rather than replaying it into the replacement — verified against a 12 KB log
+holding rows that did not come back, and pinned by
+`aStaleWriteAheadLogBesideAMissingDatabaseIsDiscarded`. `IndexStore.rebuild(at:)`,
+the corrupt-index recovery path, removes all three itself.
+
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 299 tests live. `App/` only wires it to views.
+where all the logic and all 305 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -202,11 +218,14 @@ Five things automated tests could not cover. **None done yet** as of the
    Benchmarks are off unless `LIGHTBOX_BENCH=1`, so a normal `swift test`
    never pays for them.
 2. **⌘N with a folder already scanning.** Least-tested path in the app. Each
-   window builds its own `IndexStore` on the same `index.sqlite`, and GRDB's
-   default busy mode is `.immediateError` — so two windows scanning at once can
-   take `SQLITE_BUSY` mid-pass. Nothing is lost when it happens (the guards in
-   §6 and a single-transaction delete see to that), but it fails visibly. The
-   real fix is `DatabasePool` + WAL — see §8.
+   window builds its own `IndexStore` on the same `index.sqlite`. The fix
+   landed — `DatabasePool` + WAL, so readers never wait for a writer, with the
+   5 s busy timeout left covering writer-versus-writer only — and is covered by
+   a two-store soak test and a read-during-write latency test in
+   `IndexStoreTests`. What is still owed is the live check: open a large folder,
+   ⌘N while tier 1 is hashing, open the same folder in the second window. Both
+   windows should stay responsive, neither pass should fail, and
+   `log stream --predicate 'process == "Lightbox"'` should show no `SQLITE_BUSY`.
 3. **Unplug the Seagate mid-hash.** The unreachable-root guards were only ever
    tested against *simulated* unmounts. This is the one that lost the whole
    index twice during development, so it is worth doing for real.
@@ -223,10 +242,13 @@ already being computed.
 
 Two things belong at the *front* of phase 2 rather than in a backlog:
 
-- **`DatabasePool` + WAL.** Fixes item 7.2, and removes read-behind-write stalls
-  generally. A busy timeout alone bounds `SQLITE_BUSY` but does not eliminate
-  it. All configuration goes in `IndexStore.makeConfiguration()` and nowhere
-  else.
+- ~~**`DatabasePool` + WAL.**~~ **Done** (issue #3). Readers no longer block on
+  the writer, in their own window or another's; the busy timeout stays for
+  writer-versus-writer, which no journal mode avoids. All configuration is still
+  in `IndexStore.makeConfiguration()` and nowhere else. Two consequences worth
+  carrying forward: the index is now three files (§4), and `IndexStore.inMemory()`
+  is a private temporary file rather than a true in-memory database, because a
+  pool cannot be one.
 - **A volume-UUID column.** `st_dev` is currently used as the device identity,
   but it is a *mount-time* id — it changes across reboots and replugs, which
   matters a great deal for a library that lives on an external Seagate. This is

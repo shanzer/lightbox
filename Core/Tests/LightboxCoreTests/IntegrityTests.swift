@@ -151,6 +151,11 @@ struct IntegrityTests {
     /// A rebuild must also clear the SQLite sidecars, or a fresh database can
     /// inherit a write-ahead log or shared-memory file left over from the
     /// corrupt one — the exact failure mode `rebuild(at:)` exists to avoid.
+    ///
+    /// The index is a WAL database, so the rebuilt store immediately makes its
+    /// own `-wal` and `-shm`. What has to be true afterwards is that the
+    /// *stale* ones are gone, not that no sidecar exists: asserting absence
+    /// would be asserting that the replacement never opened.
     @Test func rebuildRemovesTheWriteAheadLogAndSharedMemorySidecars() throws {
         let tree = try TempTree()
         let url = tree.root.appendingPathComponent("index.sqlite")
@@ -158,13 +163,18 @@ struct IntegrityTests {
 
         let walURL = URL(fileURLWithPath: url.path + "-wal")
         let shmURL = URL(fileURLWithPath: url.path + "-shm")
-        try Data([0xFF]).write(to: walURL)
-        try Data([0xFF]).write(to: shmURL)
+        let stale = Data([0xFF])
+        try stale.write(to: walURL)
+        try stale.write(to: shmURL)
 
-        _ = try IndexStore.rebuild(at: url)
+        let rebuilt = try IndexStore.rebuild(at: url)
 
-        #expect(!FileManager.default.fileExists(atPath: walURL.path))
-        #expect(!FileManager.default.fileExists(atPath: shmURL.path))
+        // Absent or replaced, either is a pass; still holding the stale byte
+        // is the failure this test exists for.
+        #expect((try? Data(contentsOf: walURL)) != stale)
+        #expect((try? Data(contentsOf: shmURL)) != stale)
+        #expect(try rebuilt.count() == 0)
+        #expect(rebuilt.checkIntegrity() == .ok)
     }
 }
 

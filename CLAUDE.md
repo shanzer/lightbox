@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 299 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 305 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 57 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -111,10 +111,13 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   needs both: strip trailing data past EOI/IEND, and coalesce ranges before reading.
 - **`st_dev` is a mount-time id**, not a volume identity — it changes on replug. Phase 2
   adds a volume-UUID column; until then don't lean on it.
-- **GRDB is on a rollback-journal `DatabaseQueue` with a 5 s busy timeout.** That bounds
-  `SQLITE_BUSY` but does not eliminate it: two windows scanning the same index can still
-  hit it. All DB configuration goes in `IndexStore.makeConfiguration()` and nowhere else.
-  Phase 2 moves to `DatabasePool` + WAL.
+- **GRDB is on a `DatabasePool` in WAL mode, with a 5 s busy timeout.** Readers take a
+  snapshot and never wait for a writer; the timeout is there for writer-versus-writer,
+  which SQLite serialises whatever the journal mode. All DB configuration goes in
+  `IndexStore.makeConfiguration()` and nowhere else. Two consequences: the index is
+  three files (`index.sqlite`, `-wal`, `-shm`) and they are deleted together, and
+  `IndexStore.inMemory()` is a private temporary file — a pool cannot be in-memory —
+  removed when the store is released.
 - **Swift 6.3.3 times out on dense bit-twiddling one-liners** that 6.3.2 accepted. Split
   into named steps; don't fight the type checker.
 - **`width>=1920` costs 474 ms at 50k.** That is row materialisation, not a missing index.
