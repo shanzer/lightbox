@@ -130,13 +130,19 @@ Since the move to WAL, the index is **three** files, not one:
 ~/Library/Application Support/Lightbox/index.sqlite-shm
 ```
 
-Delete the whole set. Deleting only `index.sqlite` is the shape of mistake that
-silently corrupts a WAL database elsewhere, and it is safe here only because
-SQLite discards a write-ahead log whose database is missing or zero-length
-rather than replaying it into the replacement — verified against a 12 KB log
-holding rows that did not come back, and pinned by
-`aStaleWriteAheadLogBesideAMissingDatabaseIsDiscarded`. `IndexStore.rebuild(at:)`,
-the corrupt-index recovery path, removes all three itself.
+**Quit the app, then delete the whole set.** Deleting only `index.sqlite` is the
+shape of mistake that silently corrupts a WAL database elsewhere. What has been
+tested is the narrow case: the app quit, a crash-shaped `-wal`/`-shm` pair left
+on disk, `index.sqlite` removed by hand. SQLite discards a log whose database is
+missing or zero-length rather than replaying it into the replacement, so that
+case rebuilds empty and clean — pinned, with a control leg showing the same log
+does replay when its database is there, by
+`aStaleWriteAheadLogBesideAMissingDatabaseIsDiscarded`.
+
+Nothing has been tested about deleting any of it *while a window is open*, and
+nothing should be: a live connection holds the file it is writing to. Quit
+first. `IndexStore.rebuild(at:)`, the corrupt-index recovery path, removes all
+three itself and does not depend on any of this.
 
 ## 5. What exists
 

@@ -60,6 +60,17 @@ public final class IndexStore: Sendable {
         // itself, which is why nothing here sets `journalMode`; leaving it at
         // `.default` is what asks for that.
         //
+        // That hands one setting to GRDB rather than to this function, and the
+        // "here and nowhere else" rule is only honest if it is named: GRDB's
+        // `setUpWALMode()` also issues `PRAGMA synchronous = NORMAL`. Under WAL
+        // that trades an fsync per commit for the possibility of losing the
+        // last few commits to a power cut or a kernel panic — it cannot corrupt
+        // the file, because a torn WAL frame fails its checksum and is ignored.
+        // For a derived cache whose worst case is "rescan the folder" that is
+        // the right trade, and it is the reason a rebuild is a one-button
+        // operation rather than a repair tool. Anything that ever stores
+        // something *not* recomputable from the filesystem has to revisit it.
+        //
         // The busy timeout is still needed, for the one case WAL does not fix:
         // two *writers*. SQLite allows exactly one at a time whatever the
         // journal mode, so two windows scanning at once still serialise, and
@@ -78,6 +89,14 @@ public final class IndexStore: Sendable {
         return config
     }
 
+    /// Opens, or creates, the index at `url`.
+    ///
+    /// Write access is required even to open one for reading: activating WAL
+    /// writes the journal-mode change and the `-wal` and `-shm` files beside
+    /// the database. A read-only file, or one on a read-only or WAL-hostile
+    /// volume (some network mounts), therefore throws here rather than opening.
+    /// The app's own index lives in Application Support on the boot volume, but
+    /// this initializer is public and takes any URL.
     public init(url: URL) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)

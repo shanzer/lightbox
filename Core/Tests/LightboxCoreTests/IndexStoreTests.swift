@@ -505,7 +505,11 @@ struct IndexStoreTests {
             )
             INSERT INTO slow_probe (x) SELECT max(i) FROM counter
             """
-        let writing = Task.detached {
+        // A plain thread, not a `Task`: the probe is a second of synchronous
+        // SQLite work, and parking a cooperative-pool thread on that starves
+        // every other suite running in parallel. Same reason
+        // `aWriteWaitsForAnotherConnectionsLockRatherThanFailingBusy` uses one.
+        Thread.detachNewThread {
             try? store.testExecute(sql: probe)
             finished.withLock { $0 = true }
         }
@@ -521,10 +525,25 @@ struct IndexStoreTests {
         #expect(stillWriting, "the probe write finished before the read; it proves nothing")
         #expect(readTook < 0.05, "the read waited \(readTook)s for the in-flight write")
 
-        // Awaited rather than abandoned: the probe holds the store, and the
+        // Joined rather than abandoned: the probe holds the store, and the
         // store holds a file in `tree`, which the suite removes the moment this
-        // returns.
-        await writing.value
+        // returns. Polled rather than waited on, so nothing blocks here either.
+        try await Self.waitUntil(finished, "the probe write never finished")
+    }
+
+    /// Polls `flag` until it is set, yielding rather than blocking, and records
+    /// an issue if it never is. The tests below hand long synchronous work to
+    /// plain threads; this is how they join one without a blocking wait.
+    private static func waitUntil(_ flag: LockBox<Bool>, _ message: String,
+                                  timeout: Duration = .seconds(120)) async throws {
+        let giveUp = ContinuousClock.now + timeout
+        while flag.withLock({ !$0 }) {
+            guard ContinuousClock.now < giveUp else {
+                Issue.record(Comment(rawValue: message))
+                return
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
     }
 
     /// The two-window soak. A second `IndexStore` on the same file reads
@@ -539,23 +558,33 @@ struct IndexStoreTests {
         let deadline = Date().addingTimeInterval(3)
         let query = SearchQuery(scope: .everywhere, predicate: .all)
 
-        async let writing: Int = Task.detached {
-            var written = 0
-            while Date() < deadline {
-                for _ in 0..<50 {
-                    _ = try writerStore.upsert(sampleRecord(path: "/w/\(written).jpg"))
-                    written += 1
-                }
-            }
-            return written
-        }.value
-
-        // Errors are collected rather than thrown so the writer is never left
-        // running against a store the test has already walked away from, and
-        // so the report names every failure rather than the first.
+        // Errors are collected rather than thrown, so a failure on either side
+        // names every occurrence instead of the first, and neither thread is
+        // left running against a store the test has already walked away from.
         let failures = LockBox<[String]>([])
         let counts = LockBox<[Int]>([])
-        async let reading: Void = Task.detached {
+        let written = LockBox(0)
+        let writerDone = LockBox(false)
+        let readerDone = LockBox(false)
+
+        // Plain threads: three seconds of synchronous SQLite each. On the
+        // cooperative pool that is two of its threads parked for the duration,
+        // which the rest of the suite is running on.
+        Thread.detachNewThread {
+            while Date() < deadline {
+                for _ in 0..<50 {
+                    do {
+                        let n = written.withLock { $0 }
+                        _ = try writerStore.upsert(sampleRecord(path: "/w/\(n).jpg"))
+                        written.withLock { $0 += 1 }
+                    } catch {
+                        failures.withLock { $0.append("write: \(error)") }
+                    }
+                }
+            }
+            writerDone.withLock { $0 = true }
+        }
+        Thread.detachNewThread {
             while Date() < deadline {
                 do {
                     let n = try readerStore.count()
@@ -563,23 +592,26 @@ struct IndexStoreTests {
                     _ = try readerStore.search(query)
                     _ = try readerStore.facets(for: query)
                 } catch {
-                    failures.withLock { $0.append("\(error)") }
+                    failures.withLock { $0.append("read: \(error)") }
                 }
             }
-        }.value
+            readerDone.withLock { $0 = true }
+        }
 
-        let written = try await writing
-        await reading
+        try await Self.waitUntil(writerDone, "the writing thread never finished")
+        try await Self.waitUntil(readerDone, "the reading thread never finished")
+        let total = written.withLock { $0 }
 
         #expect(failures.withLock { $0 }.isEmpty,
-                "reads failed while the other store wrote: \(failures.withLock { $0 })")
+                "a store failed while the other one wrote: \(failures.withLock { $0 })")
         let observed = counts.withLock { $0 }
         #expect(observed.count > 10, "the reader only managed \(observed.count) reads")
+        #expect(total > 500, "the writer only managed \(total) upserts")
         // A snapshot is a snapshot: counts may repeat, but they must never go
         // backwards, and the last one must not exceed what was actually written.
         #expect(observed == observed.sorted(), "the reader saw counts go backwards")
-        #expect((observed.last ?? 0) <= written)
-        #expect(try readerStore.count() == written)
+        #expect((observed.last ?? 0) <= total)
+        #expect(try readerStore.count() == total)
     }
 
     /// WAL puts two sidecars next to the database, and the in-memory store is
@@ -605,33 +637,55 @@ struct IndexStoreTests {
     }
 
     /// "Delete the index and it rebuilds" is a documented guarantee, and users
-    /// delete the file they can see — leaving `index.sqlite-wal` behind, which
-    /// no Finder window ever showed them. A write-ahead log replayed into a
-    /// brand-new database would be a silently wrong index, and the store has no
-    /// code guarding against it: SQLite discards a log whose database is
-    /// missing or zero-length rather than recovering from it, which was
-    /// confirmed against a 12 KB log holding five rows that did not come back.
+    /// delete the file they can see — leaving `index.sqlite-wal` and
+    /// `index.sqlite-shm` behind, which no Finder window ever showed them. A
+    /// write-ahead log replayed into a brand-new database would be a silently
+    /// wrong index, and the store has no code guarding against it: SQLite
+    /// discards a log whose database is missing or zero-length rather than
+    /// recovering from it.
     ///
     /// So this test pins a guarantee the app leans on and does not implement.
     /// If a future SQLite or GRDB ever recovers that log instead, deleting the
     /// index by hand starts producing an index nobody wrote, and this is the
-    /// only thing that would say so.
+    /// only thing that would say so. It runs both legs — same log, database
+    /// present and absent — because "the rows did not come back" is worth
+    /// nothing unless the same bytes are shown putting them back.
     @Test func aStaleWriteAheadLogBesideAMissingDatabaseIsDiscarded() throws {
         let url = tree.root.appendingPathComponent("index.sqlite")
         let walURL = URL(fileURLWithPath: url.path + "-wal")
+        let shmURL = URL(fileURLWithPath: url.path + "-shm")
+
+        // All three files as a crash would have left them: rows committed to
+        // the log, nothing checkpointed into the database yet. Captured while
+        // the connection is open, because closing it checkpoints and then
+        // removes the sidecars.
         let store = try IndexStore(url: url)
         for i in 0..<5 { _ = try store.upsert(sampleRecord(path: "/a/\(i).jpg")) }
-        // Captured while the connection is open, because closing it checkpoints
-        // the log into the database and removes it.
-        let staleLog = try Data(contentsOf: walURL)
-        #expect(!staleLog.isEmpty)
+        let crash = (database: try Data(contentsOf: url),
+                     wal: try Data(contentsOf: walURL),
+                     shm: try Data(contentsOf: shmURL))
         try store.close()
 
-        // The mistake being modelled: the user deletes `index.sqlite` and
-        // leaves the sidecar, which their Finder window never showed them.
-        try FileManager.default.removeItem(at: url)
-        try staleLog.write(to: walURL)
+        func restore(database: Bool) throws {
+            try? FileManager.default.removeItem(at: url)
+            if database { try crash.database.write(to: url) }
+            try crash.wal.write(to: walURL)
+            try crash.shm.write(to: shmURL)
+        }
 
+        // The control leg, and the whole reason this test is not vacuous:
+        // replayed against the database it belongs to, this log does bring the
+        // five rows back. So the log is valid, recoverable, and not empty, and
+        // the discard below is SQLite refusing an *orphan* rather than failing
+        // to read anything.
+        try restore(database: true)
+        let recovered = try IndexStore(url: url)
+        #expect(try recovered.count() == 5)
+        try recovered.close()
+
+        // The mistake being modelled: the user deletes `index.sqlite` and
+        // leaves the two sidecars their Finder window never showed them.
+        try restore(database: false)
         let reopened = try IndexStore(url: url)
         #expect(try reopened.count() == 0)
     }
