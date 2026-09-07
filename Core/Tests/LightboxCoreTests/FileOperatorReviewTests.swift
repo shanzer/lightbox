@@ -432,7 +432,11 @@ struct FileOperatorRestoreGuardTests {
 
         let problems = FileOperator.restore([replacement], rollbackSucceeded: false)
         #expect(problems.count == 1)
-        #expect(problems[0].contains("IMG_0001.jpg"))
+        // `first`, not `[0]`: a subscript here traps rather than fails, and a
+        // test that crashes the process takes the rest of the suite's output
+        // with it — which is exactly how a surviving mutation looks like a
+        // passing one.
+        #expect(problems.first?.contains("IMG_0001.jpg") == true)
         // The user's photo is untouched and the displaced one is still where the
         // journal says it is.
         #expect(try bytes(occupied) == 77)
