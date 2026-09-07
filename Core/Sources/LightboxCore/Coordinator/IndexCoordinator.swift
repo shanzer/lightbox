@@ -49,6 +49,31 @@ public enum IndexCoordinatorError: Error, Equatable, Sendable {
 /// nothing, deletes nothing, and touches no path, so it cannot make a live set
 /// stale or a delete wrong.
 public actor IndexCoordinator {
+    /// This actor's body runs on a dispatch queue of its own, not on the
+    /// cooperative pool.
+    ///
+    /// `indexTier0` is a *synchronous* actor method that walks a tree and reads
+    /// metadata out of every changed file, and every `store` call underneath it
+    /// is synchronous SQLite with a five-second busy timeout. All of that
+    /// blocks whichever thread it lands on, for as long as the filesystem takes
+    /// — and on the cooperative pool a blocked thread is a thread the pool has
+    /// lost, because that pool is only `activeProcessorCount` wide and never
+    /// grows. Three of those on the three-core CI runner and the whole process
+    /// stops: issue #28. `BlockingWork` carries the `sample` that showed it.
+    ///
+    /// A custom executor rather than an `await` around each blocking call,
+    /// deliberately. Every `await` added inside this actor is a new suspension
+    /// point and therefore a new place another caller may interleave — and this
+    /// type's correctness argument, the reconcile invariant above and the
+    /// hashing gate below, is written entirely in terms of what may interleave
+    /// with what. Changing the executor changes *where* the body runs and
+    /// nothing about *when*.
+    private let queue = BlockingWork.serialQueue(BlockingWork.indexCoordinatorLabel)
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        queue.asUnownedSerialExecutor()
+    }
+
     private let store: IndexStore
     private let walker: Walker
     private let metadata: any MetadataReading
@@ -424,7 +449,12 @@ public actor IndexCoordinator {
                 let record = work[next]
                 next += 1
                 group.addTask { [hasher, grayscale] in
-                    Self.hash(record, hasher: hasher, grayscale: grayscale)
+                    // Off the cooperative pool: `hash` reads whole files and
+                    // decodes images, and a child task doing that on a pool
+                    // thread is a pool thread lost for the duration. See
+                    // `BlockingWork` and #28.
+                    await BlockingWork.run { Self.hash(record, hasher: hasher,
+                                                       grayscale: grayscale) }
                 }
             }
             while let result = await group.next() {
@@ -433,7 +463,8 @@ public actor IndexCoordinator {
                     let record = work[next]
                     next += 1
                     group.addTask { [hasher, grayscale] in
-                        Self.hash(record, hasher: hasher, grayscale: grayscale)
+                        await BlockingWork.run { Self.hash(record, hasher: hasher,
+                                                           grayscale: grayscale) }
                     }
                 }
             }

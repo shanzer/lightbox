@@ -24,7 +24,10 @@ private struct BlockingMetadataReader: MetadataReading {
         let count = reads.withLock { $0 += 1; return $0 }
         // `DispatchSemaphore.wait` is banned from async contexts; this is the
         // synchronous read the coordinator performs, so it is legal here — and
-        // holding it is the whole point.
+        // holding it is the whole point. Since #28 the coordinator's body runs
+        // on its own `DispatchSerialQueue`, so parking here costs a dispatch
+        // thread rather than a cooperative one. This exact frame is what the
+        // `sample` of the stalled CI job caught; see `CooperativePoolTests`.
         if count == 1 { release.wait() }
         return ImageMetadata(width: 640, height: 480)
     }

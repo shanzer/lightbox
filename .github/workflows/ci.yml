@@ -22,10 +22,16 @@ jobs:
   core:
     name: core tests
     runs-on: macos-26
+    # A stalled job blocks every PR, and a hung `swift test` reports nothing until
+    # someone notices and cancels it — #28 burned twelve and ten minutes that way. The
+    # root cause is fixed (blocking work no longer runs on the cooperative pool; see
+    # `BlockingWork`), so this is the backstop, not the fix: the suite is ~10 s locally
+    # and ~2 min here, so anything past ten minutes is a hang, and a hang should fail.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-xcode
-      # 469 tests, 34 suites. Benchmarks are gated on LIGHTBOX_BENCH=1 and skip here.
+      # 473 tests, 35 suites. Benchmarks are gated on LIGHTBOX_BENCH=1 and skip here.
       - name: swift test
         working-directory: Core
         run: swift test
@@ -33,6 +39,8 @@ jobs:
   app:
     name: app tests
     runs-on: macos-26
+    # Same backstop as above.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-xcode

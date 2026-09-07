@@ -53,6 +53,33 @@ import Foundation
 /// never opened for writing. Everything else — JPEG, PNG, WebP, HEIC, TIFF,
 /// GIF, PSD — is edited in place.
 public actor MetadataWriter {
+    /// This actor's body runs on a dispatch queue of its own, not on the
+    /// cooperative pool.
+    ///
+    /// Every write here forks exiftool and then blocks in `poll(2)` on its
+    /// pipes for up to `ExiftoolRunner.commandTimeout` — two minutes. A
+    /// cooperative-pool thread parked for two minutes is a thread the pool has
+    /// permanently lost, and that pool is only `activeProcessorCount` wide:
+    /// three of these on the three-core CI runner and nothing else in the
+    /// process can run. That is issue #28; `BlockingWork` carries the sample.
+    ///
+    /// The bounded waits added in #18 and #21 keep this from being *unbounded*,
+    /// but a bounded two-minute park still starves a three-wide pool. The bound
+    /// and the executor are answers to different halves of the same problem.
+    private let queue = BlockingWork.serialQueue(BlockingWork.metadataWriterLabel)
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        queue.asUnownedSerialExecutor()
+    }
+
+    /// Test seam for #28: the queue this actor's body actually ran on.
+    ///
+    /// Asserted on rather than trusted, because the executor is the kind of
+    /// thing a later refactor removes without noticing — and its absence shows
+    /// up only as an intermittently stalled CI job on a machine nobody is
+    /// looking at.
+    func currentQueueLabel() -> String { BlockingWork.currentQueueLabel }
+
     /// Whether exiftool can be used at all. Resolved at first use and cached,
     /// so a batch of 500 files does not fork 500 `-ver` probes.
     ///

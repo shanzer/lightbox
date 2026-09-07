@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 469 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 473 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 63 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -129,6 +129,17 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   three files (`index.sqlite`, `-wal`, `-shm`) and they are deleted together, and
   `IndexStore.inMemory()` is a private temporary file — a pool cannot be in-memory —
   removed when the store is released.
+- **Blocking work never runs on the cooperative pool.** That pool is exactly
+  `activeProcessorCount` threads wide and never grows, so a thread parked in file IO,
+  in SQLite's busy wait, or in a pipe read from exiftool is a thread the process has
+  lost. Three of those stalled the CI job about one run in two (#28). `IndexCoordinator`
+  and `MetadataWriter` therefore run their bodies on their own `DispatchSerialQueue`
+  through `unownedExecutor`; blocking work that is *not* actor-isolated — the hashing
+  pass's task-group children — hops through `BlockingWork.run`. Anything new in Core
+  that blocks belongs behind one of those two, and `CooperativePoolTests` fails if it
+  does not. Reproduce a narrowed pool with
+  `env LIBDISPATCH_COOPERATIVE_POOL_STRICT=1 swift test`, and `sample <pid> 5` if it
+  hangs — the sample *is* the diagnosis.
 - **Swift 6.3.3 times out on dense bit-twiddling one-liners** that 6.3.2 accepted. Split
   into named steps; don't fight the type checker.
 - **`width>=1920` costs 474 ms at 50k.** That is row materialisation, not a missing index.

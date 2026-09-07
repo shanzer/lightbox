@@ -29,7 +29,11 @@ private struct GatedHasher: FileHashing {
         let ordinal = calls.withLock { $0.append(url.lastPathComponent); return $0.count }
         // `DispatchSemaphore.wait` is banned from async contexts; this is the
         // synchronous hash the coordinator performs inside a task-group child,
-        // so it is legal here — and holding it is the whole point.
+        // so it is legal here — and holding it is the whole point. Since #28
+        // that child runs on `BlockingWork`'s queue rather than the cooperative
+        // pool, so parking here costs a dispatch thread the workqueue will
+        // replace. Before that fix, three of these at once emptied the pool on
+        // the CI runner and the job never finished.
         if ordinal == 1 { release.wait() }
         return FileHashes(contentHash: "c-\(url.lastPathComponent)",
                           imageHash: "i-\(url.lastPathComponent)",

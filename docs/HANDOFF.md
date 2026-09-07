@@ -103,7 +103,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 469 tests, 34 suites.
+# Core: 473 tests, 35 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -155,7 +155,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 469 tests live. `App/` only wires it to views.
+where all the logic and all 473 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -167,6 +167,21 @@ where all the logic and all 469 tests live. `App/` only wires it to views.
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
+| Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
+
+**Blocking work is kept off the cooperative pool.** Swift's pool is exactly
+`activeProcessorCount` threads wide and never grows, so a thread parked in file
+IO, in SQLite's busy wait, or in a pipe read from exiftool is a thread the
+process has lost — on the three-core CI runner three of those stalled the whole
+job about one run in two (#28). `IndexCoordinator` and `MetadataWriter` run
+their bodies on their own `DispatchSerialQueue` through `unownedExecutor`, which
+moves *where* the body runs without adding a suspension point, and so without
+changing what may interleave with what. The hashing pass's task-group children
+are not actor-isolated, so they hop through `BlockingWork.run` instead.
+`CooperativePoolTests` asserts both, and reproduces the stall itself with more
+blocked hashes than the machine has cores. To see it by hand:
+`env LIBDISPATCH_COOPERATIVE_POOL_STRICT=1 swift test` narrows the pool to one
+thread; if it hangs, `sample <pid> 5` names the parked frame outright.
 
 The App target is hosted in the app itself, so `xcodebuild test` runs
 `LightboxApp.main()` before a single test does. `App/Lightbox/LaunchEnvironment.swift`
@@ -257,7 +272,7 @@ row — which duplicate detection then deletes on.
 
 ## 7. Verify by hand on the mini
 
-Five things automated tests could not cover. **None done yet** as of the
+Six things automated tests could not cover. **None done yet** as of the
 2026-09-06 update. In rough priority:
 
 1. **Re-run the 50k benchmark.** All current numbers are Intel, and the choice of
@@ -299,6 +314,14 @@ Five things automated tests could not cover. **None done yet** as of the
    grid. Tests could only warn, never assert.
 5. **Cold folder open shows an empty grid** for the entire first index pass
    (~180 s at 50k). Known, ugly, deferred — the grid has no "indexing…" state.
+6. **A real index pass over the Seagate, under the new executors.** #28 moved
+   `IndexCoordinator` and `MetadataWriter` off the cooperative pool onto serial
+   dispatch queues of their own. `CooperativePoolTests` proves *where* the work
+   runs; it says nothing about the GUI path. Open a large folder on the external
+   drive, watch progress advance, then pause and resume tier 1 mid-pass and
+   confirm the counts pick up where they left off and the window stays
+   responsive throughout. Executor changes are exactly the kind that a unit
+   suite passes and a real window reveals.
 
 ## 8. Deferred, and what I'd do first in phase 2
 
