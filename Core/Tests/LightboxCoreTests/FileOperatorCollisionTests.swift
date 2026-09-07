@@ -346,9 +346,16 @@ struct FileOperatorCompanionTests {
 
         let op = FileOperator(store: store)
         let plan = try await op.plan(kind: .trash, sources: [raw], destination: nil)
+        // Registered before the batch runs: see `emptyTrash` in
+        // FileOperatorTests.swift for why cleanup must not depend on it
+        // succeeding.
+        defer {
+            for row in (try? store.journalRows(batchID: plan.batchID)) ?? [] {
+                row.trashURL.map { try? FileManager.default.removeItem(atPath: $0) }
+            }
+        }
         let results = try await op.execute(plan)
         let rows = try store.journalRows(batchID: plan.batchID)
-        defer { for row in rows { row.trashURL.map { try? FileManager.default.removeItem(atPath: $0) } } }
 
         #expect(results[0].outcome == .completed)
         #expect(!exists(raw))

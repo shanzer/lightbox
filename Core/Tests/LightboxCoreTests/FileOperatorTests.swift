@@ -49,11 +49,19 @@ private func journalStates(_ store: IndexStore, _ batchID: String) throws -> [Op
 
 private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
 
-/// Removes whatever `trashItem` produced, so a test run does not accumulate
-/// files in the developer's Trash.
-private func emptyFromTrash(_ results: [FileOperationResult]) {
-    for url in results.compactMap(\.trashURL) {
-        try? FileManager.default.removeItem(at: url)
+/// Removes whatever a batch put in the Trash, so a test run does not
+/// accumulate files in the developer's Trash.
+///
+/// Driven off the journal rather than off the results, and registered before
+/// the batch runs rather than after: every trashed file has a `trash_url` row
+/// whatever the batch then does, whereas a result carries one only for an item
+/// that completed. A test whose cleanup depends on the thing under test
+/// succeeding leaks precisely when the code is broken — which is exactly when
+/// the suite is being run over and over.
+private func emptyTrash(of store: IndexStore, batchID: String) {
+    for row in (try? store.journalRows(batchID: batchID)) ?? [] {
+        guard let path = row.trashURL else { continue }
+        try? FileManager.default.removeItem(atPath: path)
     }
 }
 
@@ -271,8 +279,8 @@ struct FileOperatorRemovalTests {
 
         let op = FileOperator(store: store)
         let plan = try await op.plan(kind: .trash, sources: [source], destination: nil)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
         let results = try await op.execute(plan)
-        defer { emptyFromTrash(results) }
 
         #expect(results[0].outcome == .completed)
         let trashURL = try #require(results[0].trashURL)
