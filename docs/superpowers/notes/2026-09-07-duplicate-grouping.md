@@ -196,11 +196,71 @@ threshold of 12, invisible to both exact hashes.
    measures the exact tier over *real* hash distributions and a real
    `image_hash` index rather than synthetic rows. Until it runs, the exact
    tier's 500 ms budget is confirmed only against generated data.
-2. **The live check over the real library.** Spot-checking groups by eye is the
-   only thing that catches a wrong row assignment, and a wrong row assignment
-   here is a deleted photograph. Not done: the library on `/Volumes/rockit88`
-   was deliberately not touched by this work.
+2. ~~The live check over the real library.~~ Done the same day; see
+   [Live run over the real archive](#live-run-over-the-real-archive) below.
 3. **The near tier's result cost at a realistic clustering.** Synthetic uniform
    hashes produce few matches. A library with a thousand near-identical burst
    frames produces a large match set, and the fetch-and-assemble step after the
    scan is linear in that set, not in `n`.
+
+## Live run over the real archive
+
+Run on 2026-09-07 on the M4 mini against the whole of
+`/Volumes/rockit88/03_DEDUPED_ARCHIVE/photos` (an external drive, read-only),
+into a throwaway index under the scratchpad, with the PR #20 code. The
+grouping algorithm is unchanged on `main`; the later single-snapshot read and
+the 100,000 ceiling do not change the output at this size.
+
+| | |
+|---|---|
+| rows | 26,372 (tier 0: 323.8 s, 5 corrupt files failed the metadata read; tier 1: 1,383 s, 0 failures, ~19 files/s over 136 GB) |
+| `report(for:)` | **0.32 s** |
+| exact groups | 106, of which 80 have more than one `content_hash` sub-group |
+| near groups | 5,078 (8,499 matches) |
+| `nearTierSkipped` | nil |
+
+`image_hash` was NULL on 4,345 rows: 4,323 by rule (NEF, TIF, DNG, PSD have
+none) and 18 that have a rule but refused — 16 extension-misnamed files
+(`.HEIC` that is JPEG, `.jpg` that is JPEG 2000 or PNG) and 2 JPEGs with no
+EOI marker. All safe refusals; #26 decides whether to sniff magic bytes.
+
+Near-tier distance histogram over all 8,499 matches:
+
+| d | 0 | 2 | 4 | 6 | 8 | 10 | 12 |
+|---|---|---|---|---|---|---|---|
+| matches | 2,728 | 1,279 | 677 | 705 | 768 | 893 | 1,449 |
+
+Only even distances occur, and that is arithmetic, not a bug: a
+median-threshold 64-bit pHash has exactly 32 bits set, so two of them differ by
+`64 - 2·|A ∩ B|` bits. 73.6 % of near groups lie entirely inside one
+`YYYY-MM-DD` folder; 26 % span dates, 1,228 of them across years.
+
+Four groups were inspected by eye, by the coordinating agent and not only the
+one that ran the harness:
+
+- **An exact group** with one `image_hash` and three `content_hash`es
+  (`low_confidence/2025-11-24`): the same photograph three times. The byte
+  differences are exactly the sizes of the embedded EXIF thumbnails
+  (278,079 − 276,680 = 15,292 − 13,893). True positive, and the case
+  `image_hash` exists for.
+- **Near, d = 2**: a vintage scan and its retouched restoration. True positive.
+- **Near, d = 12, one day-folder**: three different frames of one parrot on
+  one perch. Same session, not duplicates; the visible distance is what tells
+  the user.
+- **Near, d = 12, across 2011/2017/2020 and NEF/JPEG/PNG**: the seed matched
+  three unrelated photographs. Two of the three matches are a genuine
+  JPEG/PNG duplicate of each other (identical `phash`, d = 0), which no exact
+  group can ever contain because the two rules hash different bytes. A
+  transitive cluster would have fused all four into one "duplicate set"; the
+  star shape keeps each match against the seed with its own distance.
+
+No exact group contained two visibly different photographs. The 12-bit bucket
+does admit unrelated photographs, and it is the second-largest bucket. Whether
+the threshold stays at 12 (HANDOFF §6, set against a measured 0–4 bit
+cross-tool divergence), drops, or becomes adjustable in the duplicate view
+(#11) is an open product decision recorded on #10; the view should at least
+sort by distance ascending and show it as a first-class column.
+
+Still owed after this run: item 1 above (the 50k fixture library) and item 3
+(result cost under realistic clustering — this archive is already deduplicated,
+so its match set is small).
