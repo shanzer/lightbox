@@ -489,12 +489,17 @@ Four deliberate constraints:
    that means something different on every machine. The editor requires the
    zone rather than assuming wall-clock is sufficient.
 2. **RAW gets a sidecar, not an in-place write.** Everything else — JPEG, HEIC,
-   TIFF, PNG, WebP — is edited in place. RAW gets an `<basename>.xmp` sidecar,
-   as Lightroom and Bridge do, and its container is never opened for writing.
-   Writing into proprietary RAW containers is where files get corrupted.
+   TIFF, PNG, WebP, GIF, PSD — is edited in place. RAW gets a `<basename>.xmp`
+   sidecar, as Lightroom and Bridge do, and its container is never opened for
+   writing. Writing into proprietary RAW containers is where files get
+   corrupted.
 3. **Write, verify, then commit.** exiftool writes with its `_original` backup;
-   the tag is re-read to confirm it took; only then is the backup removed. Any
-   failure restores from the backup.
+   the tag is re-read to confirm it took, and the image hash is re-run and shown
+   to have survived; only then is the backup removed. Any failure restores from
+   the backup. exiftool *declines to overwrite an existing* `_original` while
+   still reporting success, so a file already at that path is moved aside before
+   the write and put back after: it is neither this write's rollback nor this
+   write's to delete.
 4. **The `-stay_open` argument protocol is newline-delimited.** A filename or
    tag value containing `\n` or `\r` breaks it, and in the general case that is
    argument injection, not merely a bug. Filenames beginning with `-` are the

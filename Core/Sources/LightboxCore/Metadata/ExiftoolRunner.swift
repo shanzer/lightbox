@@ -59,11 +59,45 @@ final class ExiftoolRunner {
     private var session: StayOpenSession?
     private var nextCommandNumber = 1
 
+    /// A per-runner random prefix for the `-stay_open` command numbers, so the
+    /// ready sentinel cannot be predicted by whoever wrote the caption being
+    /// stored. `-execute` only accepts digits — a non-numeric suffix produces
+    /// no sentinel at all, measured on 13.55 — so the nonce is numeric.
+    private let sentinelNonce = Int.random(in: 100_000_000...999_999_999)
+
+    /// An empty exiftool config, so a `~/.ExifTool_config` that redefines tags
+    /// cannot change what a verification read sees. Perl requires a config to
+    /// evaluate true, hence `1;` rather than a zero-byte file — `-config
+    /// /dev/null` works but prints "did not return a true value" to stderr on
+    /// every single invocation, which would show up as a warning on every write.
+    ///
+    /// Best effort: if it cannot be created the runner simply does without,
+    /// because this is hardening, not correctness.
+    private lazy var emptyConfig: URL? = {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lightbox-exiftool-\(UUID().uuidString).config")
+        do {
+            try Data("1;\n".utf8).write(to: url)
+            return url
+        } catch {
+            return nil
+        }
+    }()
+
+    /// Options that must precede everything else on the command line.
+    private var leadingArguments: [String] {
+        guard let emptyConfig else { return [] }
+        return ["-config", emptyConfig.path]
+    }
+
     init(executable: String) {
         self.executable = executable
     }
 
-    deinit { session?.shutdown() }
+    deinit {
+        session?.shutdown()
+        if let emptyConfig { try? FileManager.default.removeItem(at: emptyConfig) }
+    }
 
     /// Scalars that end a line in the `-@` protocol, plus NUL, which truncates
     /// the argument at the `execve` boundary instead.
@@ -83,7 +117,19 @@ final class ExiftoolRunner {
             if token.unicodeScalars.contains(where: Self.forbiddenScalars.contains) {
                 return true
             }
-            if token != token.trimmingCharacters(in: .whitespaces) { return true }
+            if hasEdgeWhitespace(token) { return true }
+            // An argument is `-TAG=VALUE`, and it is the VALUE the argfile
+            // parser trims — measured on 13.55: `-MWG:Description=  indented`
+            // comes back as " indented", one space short. Checking only the
+            // whole token can never catch that, because the token always
+            // begins with "-"; it only ever catches the trailing side. A legal
+            // caption that starts with a space would otherwise read back
+            // different from what was asked for, fail verification, and get a
+            // correct edit rolled back.
+            if let equals = token.firstIndex(of: "="),
+               hasEdgeWhitespace(String(token[token.index(after: equals)...])) {
+                return true
+            }
         }
         for file in files {
             // The absolute paths this writer builds always start with "/", so
@@ -95,6 +141,16 @@ final class ExiftoolRunner {
             if (file as NSString).lastPathComponent.hasPrefix("-") { return true }
         }
         return false
+    }
+
+    /// True when the string begins or ends with a whitespace scalar. Deliberately
+    /// broader than ASCII space and tab: routing something harmless to the
+    /// one-shot costs one fork, while missing something costs a mangled value.
+    private static func hasEdgeWhitespace(_ text: String) -> Bool {
+        guard let first = text.unicodeScalars.first,
+              let last = text.unicodeScalars.last else { return false }
+        let whitespace = CharacterSet.whitespacesAndNewlines
+        return whitespace.contains(first) || whitespace.contains(last)
     }
 
     func run(arguments: [String], files: [String]) throws -> ExiftoolRun {
@@ -109,13 +165,20 @@ final class ExiftoolRunner {
         session = nil
     }
 
+    /// Terminates the session without waiting for a cooperative exit.
+    func shutdownForcefully() {
+        session?.shutdown(force: true)
+        session = nil
+    }
+
     // MARK: - One-shot
 
     private func runOneShot(arguments: [String], files: [String]) throws -> ExiftoolRun {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
-        // `--` ends option parsing, so a file named "-foo.jpg" is a filename.
-        process.arguments = arguments + ["--"] + files
+        // `-config` has to come first; `--` ends option parsing, so a file
+        // named "-foo.jpg" is a filename.
+        process.arguments = leadingArguments + arguments + ["--"] + files
 
         let out = Pipe(), err = Pipe()
         // A prompting exiftool must fail, not hang waiting on a tty.
@@ -130,10 +193,19 @@ final class ExiftoolRunner {
         // Both pipes are drained together: reading one to EOF first deadlocks
         // as soon as the other fills its 64 KB buffer.
         let deadline = Date().addingTimeInterval(Self.commandTimeout)
-        let drained = try PipeDrain.readToEnd(
-            first: out.fileHandleForReading.fileDescriptor,
-            second: err.fileHandleForReading.fileDescriptor,
-            deadline: deadline)
+        let drained: PipeDrain.Result
+        do {
+            drained = try PipeDrain.readToEnd(
+                first: out.fileHandleForReading.fileDescriptor,
+                second: err.fileHandleForReading.fileDescriptor,
+                deadline: deadline)
+        } catch {
+            // A timed-out one-shot must not be left running: it still holds the
+            // file open and may still be part-way through rewriting it.
+            process.terminate()
+            process.waitUntilExit()
+            throw error
+        }
         process.waitUntilExit()
 
         return ExiftoolRun(stdout: String(decoding: drained.first, as: UTF8.self),
@@ -150,15 +222,19 @@ final class ExiftoolRunner {
             live = session
         } else {
             session?.shutdown()
-            live = try StayOpenSession(executable: executable)
+            live = try StayOpenSession(executable: executable,
+                                       leadingArguments: leadingArguments)
             session = live
         }
 
-        let number = nextCommandNumber
+        // The command id carries the per-runner nonce, so the ready sentinel a
+        // caption would have to spell in order to truncate a read-back is not
+        // knowable to whoever wrote that caption.
+        let commandID = "\(sentinelNonce)\(nextCommandNumber)"
         nextCommandNumber += 1
         do {
             let (stdout, stderr) = try live.execute(arguments: arguments + files,
-                                                    number: number)
+                                                    commandID: commandID)
             // `-stay_open` reports no exit status per command, so "did it work"
             // has to be read off the output. This is only a first filter —
             // every write is judged by re-reading the tags, not by this string.
@@ -166,8 +242,10 @@ final class ExiftoolRunner {
                 || stdout.contains("files weren't updated due to errors")
             return ExiftoolRun(stdout: stdout, stderr: stderr, ok: !failed, route: .stayOpen)
         } catch {
-            // A wedged or dead session must not poison every later command.
-            live.shutdown()
+            // A wedged or dead session must not poison every later command, and
+            // a session that timed out is by definition not going to answer a
+            // polite `-stay_open False`.
+            live.shutdown(force: true)
             session = nil
             throw error
         }
@@ -183,10 +261,12 @@ final class ExiftoolRunner {
 
         var isRunning: Bool { !isShutDown && process.isRunning }
 
-        init(executable: String) throws {
+        init(executable: String, leadingArguments: [String]) throws {
             let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
             process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = ["-stay_open", "True", "-@", "-"]
+            // `-config` is only honoured as the first option, so it belongs on
+            // the launch line rather than in the per-command argfile.
+            process.arguments = leadingArguments + ["-stay_open", "True", "-@", "-"]
             process.standardInput = inPipe
             process.standardOutput = outPipe
             process.standardError = errPipe
@@ -200,9 +280,9 @@ final class ExiftoolRunner {
 
         deinit { shutdown() }
 
-        func execute(arguments: [String], number: Int) throws -> (String, String) {
-            let readySentinel = "{ready\(number)}"
-            let errorSentinel = "{readyerr\(number)}"
+        func execute(arguments: [String], commandID: String) throws -> (String, String) {
+            let readySentinel = "{ready\(commandID)}"
+            let errorSentinel = "{readyerr\(commandID)}"
 
             var script = ""
             for argument in arguments { script += argument + "\n" }
@@ -210,7 +290,7 @@ final class ExiftoolRunner {
             // gives stderr a terminator of its own. Without it there is no way
             // to know a command produced no diagnostics versus produced them
             // slowly, and the choice is between losing errors and blocking.
-            script += "-echo4\n\(errorSentinel)\n-execute\(number)\n"
+            script += "-echo4\n\(errorSentinel)\n-execute\(commandID)\n"
 
             guard let data = script.data(using: .utf8) else {
                 throw ExiftoolRunnerError.launchFailed("argument list is not UTF-8")
@@ -228,22 +308,26 @@ final class ExiftoolRunner {
                     String(decoding: drained.second, as: UTF8.self))
         }
 
-        func shutdown() {
+        /// - Parameter force: terminate rather than asking. Used when the
+        ///   session is being torn down *because* it stopped answering, where
+        ///   waiting on a cooperative exit would hang the caller.
+        func shutdown(force: Bool = false) {
             guard !isShutDown else { return }
             isShutDown = true
-            if process.isRunning {
-                try? stdin.write(contentsOf: Data("-stay_open\nFalse\n".utf8))
+            guard process.isRunning else {
                 try? stdin.close()
-                // A cooperative exit is the normal path; the kill is for the
-                // case that brought us here through a timeout.
-                let deadline = Date().addingTimeInterval(5)
-                while process.isRunning && Date() < deadline {
-                    usleep(20_000)
-                }
-                if process.isRunning { process.terminate() }
-            } else {
-                try? stdin.close()
+                return
             }
+            if force {
+                process.terminate()
+            } else {
+                // exiftool exits on `-stay_open False`, and closing stdin makes
+                // that unconditional, so `waitUntilExit` returns promptly
+                // without polling for it.
+                try? stdin.write(contentsOf: Data("-stay_open\nFalse\n".utf8))
+            }
+            try? stdin.close()
+            process.waitUntilExit()
         }
     }
 }
@@ -313,13 +397,43 @@ enum PipeDrain {
                 }
                 buffers[index].append(chunk)
                 if let sentinel = sentinels[index],
-                   let range = buffers[index].range(of: sentinel) {
-                    buffers[index].removeSubrange(range.lowerBound..<buffers[index].endIndex)
+                   let start = anchoredSentinel(in: buffers[index], sentinel: sentinel) {
+                    buffers[index].removeSubrange(start..<buffers[index].endIndex)
                     finished[index] = true
                 }
             }
         }
         return Result(first: buffers[0], second: buffers[1])
+    }
+
+    /// The index at which a sentinel occupying a whole line begins, or nil.
+    ///
+    /// **Anchored, not "contains".** exiftool prints the ready sentinel on a
+    /// line of its own, but the stream it prints it into also carries tag
+    /// values — and a caption reading `{ready1}` would otherwise end the read
+    /// mid-JSON, truncating the object and leaving the rest of it in the pipe
+    /// to desynchronise the *next* command on the session. Requiring a newline
+    /// on both sides (or the start of the stream on the left) means a value can
+    /// only impersonate the sentinel by containing a newline — and a value
+    /// containing a newline never reaches this protocol, because
+    /// `requiresOneShot` routes it away.
+    static func anchoredSentinel(in buffer: Data, sentinel: Data) -> Data.Index? {
+        let newline = UInt8(ascii: "\n")
+        var searchFrom = buffer.startIndex
+        while searchFrom < buffer.endIndex,
+              let found = buffer[searchFrom...].range(of: sentinel) {
+            let precededByNewline = found.lowerBound == buffer.startIndex
+                || buffer[buffer.index(before: found.lowerBound)] == newline
+            let followedByNewline = found.upperBound < buffer.endIndex
+                && buffer[found.upperBound] == newline
+            if precededByNewline && followedByNewline { return found.lowerBound }
+            // A partial match at the very end of the buffer may simply be
+            // missing its trailing newline yet; leaving it unmatched lets the
+            // next read complete it.
+            searchFrom = found.lowerBound < buffer.endIndex
+                ? buffer.index(after: found.lowerBound) : buffer.endIndex
+        }
+        return nil
     }
 
     /// Data on success, empty on EOF, nil when the descriptor would block.

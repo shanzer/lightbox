@@ -9,6 +9,13 @@ public enum ExiftoolAvailability: Sendable, Equatable {
     case available(path: String, version: String)
     case notFound
     case tooOld(path: String, version: String, minimum: String)
+    /// Something called `exiftool` is on `PATH` and is executable, but it did
+    /// not answer `-ver`. Kept distinct from `notFound` because the two need
+    /// different remedies — install it, versus work out what that file is. A
+    /// dangling symlink, a half-finished Homebrew upgrade, and a shell wrapper
+    /// that wants an interactive terminal all land here, and calling any of
+    /// them "not found" sends the user looking in the wrong place.
+    case unusable(path: String, reason: String)
 
     public var isAvailable: Bool {
         if case .available = self { return true }
@@ -19,6 +26,7 @@ public enum ExiftoolAvailability: Sendable, Equatable {
         switch self {
         case .available(let path, _): path
         case .tooOld(let path, _, _): path
+        case .unusable(let path, _): path
         case .notFound: nil
         }
     }
@@ -39,6 +47,12 @@ public enum ExiftoolAvailability: Sendable, Equatable {
             Metadata editing needs exiftool \(minimum) or newer; \(path) reports \
             \(version). Upgrade it (`brew upgrade exiftool`) and reopen the window. \
             Browsing and search do not need it.
+            """
+        case .unusable(let path, let reason):
+            """
+            Metadata editing needs exiftool. \(path) is on your PATH but did not \
+            run: \(reason). Reinstall it (`brew reinstall exiftool`) and reopen \
+            the window. Browsing and search do not need it.
             """
         }
     }
@@ -81,7 +95,11 @@ public enum ExiftoolLocator {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> ExiftoolAvailability {
         guard let path = locate(environment: environment) else { return .notFound }
-        guard let version = version(of: path) else { return .notFound }
+        let version: String
+        switch versionProbe(of: path) {
+        case .ok(let reported): version = reported
+        case .failed(let reason): return .unusable(path: path, reason: reason)
+        }
         guard isAtLeastMinimum(version) else {
             return .tooOld(path: path, version: version, minimum: minimumVersion)
         }
@@ -95,7 +113,15 @@ public enum ExiftoolLocator {
         return FileManager.default.isExecutableFile(atPath: path)
     }
 
-    private static func version(of path: String) -> String? {
+    /// The version string, or why it could not be obtained. The reason is
+    /// carried rather than collapsed to nil so `.unusable` can say something
+    /// more useful than "it did not work".
+    private enum VersionProbe {
+        case ok(String)
+        case failed(String)
+    }
+
+    private static func versionProbe(of path: String) -> VersionProbe {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = ["-ver"]
@@ -104,13 +130,17 @@ public enum ExiftoolLocator {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = out
         process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return nil }
+        do { try process.run() } catch {
+            return .failed("it could not be launched (\(error.localizedDescription))")
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
+        guard process.terminationStatus == 0 else {
+            return .failed("`-ver` exited \(process.terminationStatus)")
+        }
         let text = String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
+        return text.isEmpty ? .failed("`-ver` printed nothing") : .ok(text)
     }
 
     /// exiftool versions are `major.minor`, sometimes with a trailing letter on

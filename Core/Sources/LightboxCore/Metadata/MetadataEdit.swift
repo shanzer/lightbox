@@ -106,13 +106,6 @@ public struct RehashResult: Sendable, Hashable {
 /// Something that happened during a *successful* write and that a summary sheet
 /// should still show. Warnings never fail the write; a failure is an error.
 public enum WriteWarning: Sendable, Hashable {
-    /// **The tripwire.** `image_hash` is defined to survive a metadata edit
-    /// (HANDOFF §6); if it moved, the format's segment/chunk rule is wrong and
-    /// duplicate grouping for that format is now unreliable. The edit is kept
-    /// and the index is updated with the hash the file actually has — losing
-    /// the user's edit over a hashing bug would be the wrong trade — but this
-    /// is a bug to file, not to swallow.
-    case imageHashChanged(kind: String, before: String, after: String)
     /// The format has no `image_hash` rule (HEIC, TIFF, GIF, PSD — spec §11's
     /// last row), so duplicate grouping for this file rests on `content_hash`
     /// and `phash`, and this write just invalidated the `content_hash`. The
@@ -172,6 +165,24 @@ public enum MetadataWriteError: Error, Equatable, Sendable {
     /// Verification failed *and* the restore failed too, so the file on disk is
     /// the half-written one. The worst case, and the one that must be loudest.
     case restoreFailed(tags: [String], reason: String)
+    /// The tags did not verify and there was no backup to restore from, so
+    /// whatever exiftool left is what is on disk. Distinct from
+    /// `verificationFailed`, which promises the file *was* put back — the
+    /// caller must not be told a rollback happened when none could.
+    case verificationFailedWithoutRollback(tags: [String])
+    /// A file already occupied exiftool's `_original` backup path and could not
+    /// be moved out of the way. exiftool declines to overwrite an existing
+    /// `_original` and still reports success, so the write would have run with
+    /// no rollback available; it is refused before it starts instead.
+    case backupPathOccupied(String)
+    /// **The tripwire.** `image_hash` is defined to survive a metadata edit
+    /// (HANDOFF §6). It moved, so the format's segment/chunk rule in `Hashing/`
+    /// is wrong and duplicate grouping for that format is unreliable — and
+    /// duplicate detection *deletes files* on the strength of those hashes.
+    /// The edit is rolled back and reported as a failure rather than kept
+    /// alongside a hash the app has just proved it cannot trust. A bug to file,
+    /// not to paper over by loosening the rule.
+    case imageHashChanged(kind: String, before: String, after: String)
 }
 
 /// Knobs for one batch.

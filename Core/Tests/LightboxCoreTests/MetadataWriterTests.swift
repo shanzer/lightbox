@@ -73,6 +73,43 @@ struct ExiftoolLocatorTests {
         #expect(found == override)
     }
 
+    /// A file called `exiftool` that is executable but does not answer `-ver`
+    /// is a different problem from no exiftool at all, and needs a different
+    /// sentence: "install it" is useless advice when it *is* installed. A
+    /// dangling symlink and a half-finished Homebrew upgrade both look like
+    /// this.
+    @Test func anExecutableThatDoesNotAnswerVerIsUnusableNotMissing() throws {
+        let directory = try tree.directory("broken")
+        let binary = directory.appendingPathComponent("exiftool")
+        try "#!/bin/sh\nexit 3\n".write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: binary.path)
+
+        let availability = ExiftoolLocator.check(environment: ["PATH": directory.path])
+        guard case .unusable(let path, let reason) = availability else {
+            Issue.record("expected .unusable, got \(availability)")
+            return
+        }
+        #expect(path == binary.path)
+        #expect(reason.contains("3"))
+        #expect(!availability.isAvailable)
+        #expect(availability.explanation?.contains(binary.path) == true)
+    }
+
+    /// One that runs but prints nothing is the same class of problem.
+    @Test func anExecutableThatPrintsNoVersionIsUnusable() throws {
+        let directory = try tree.directory("silent")
+        let binary = directory.appendingPathComponent("exiftool")
+        try "#!/bin/sh\nexit 0\n".write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: binary.path)
+
+        guard case .unusable = ExiftoolLocator.check(environment: ["PATH": directory.path]) else {
+            Issue.record("expected .unusable for a binary that prints no version")
+            return
+        }
+    }
+
     /// exiftool's versions are `13.9`, `13.10`, `13.55`. A lexical compare puts
     /// `13.9` *after* `13.55`, so a minimum-version check written with `>=` on
     /// strings would reject a newer exiftool than the one it demands.
@@ -501,10 +538,9 @@ struct MetadataWriterRoundTripTests {
         // And the writer reports the same thing it just proved.
         #expect(outcomes[0].success?.rehash?.imageHash == before.imageHash)
         #expect(outcomes[0].success?.rehash?.contentHash == after.contentHash)
-        #expect(outcomes[0].success?.warnings.contains { warning in
-            if case .imageHashChanged = warning { return true }
-            return false
-        } == false)
+        // A moved image_hash is a *failure* now, so the `#require` above is
+        // itself the tripwire: this write could not have succeeded if the
+        // format's rule had let the hash drift.
     }
 
     /// Spec §9, constraint 2. The RAW container is never opened for writing —
@@ -823,5 +859,239 @@ struct MetadataWriterRoundTripTests {
         // The perceptual hash survives: an EXIF edit moves no pixels.
         #expect(row.phash == "abcdef0123456789")
         #expect(try store.needsReindex(path: url.path, size: row.size, mtime: row.mtime) == false)
+    }
+}
+
+// MARK: - Rollback safety
+
+/// A hasher whose image hash changes between the pre-write and post-write call.
+///
+/// The real tripwire can only fire if a rule in `Hashing/` is wrong, and those
+/// rules are binding — so the *reaction* to a moved hash is tested by moving it
+/// artificially. The alternative is shipping the most consequential branch in
+/// the writer with no test at all.
+private struct DriftingHasher: FileHashing {
+    let calls = LockBox(0)
+    let real = FileHasher()
+
+    func hashes(for url: URL, mediaType: MediaType) throws -> FileHashes {
+        let actual = try real.hashes(for: url, mediaType: mediaType)
+        let n = calls.withLock { (count: inout Int) -> Int in count += 1; return count }
+        // First call is the pre-write hash; every later one pretends the image
+        // data moved.
+        let image = n == 1 ? actual.imageHash : "drifted-\(n)"
+        return FileHashes(contentHash: actual.contentHash, imageHash: image,
+                          imageHashKind: actual.imageHashKind)
+    }
+}
+
+@Suite(.serialized)
+struct MetadataWriterRollbackTests {
+    let tree: TempTree
+    init() throws { tree = try TempTree() }
+
+    private func exiftoolRead(_ url: URL, _ tags: [String]) throws -> [String: Any] {
+        guard let path = MetadataWriter.availability.executablePath else {
+            throw FixtureError.missing("exiftool")
+        }
+        let runner = ExiftoolRunner(executable: path)
+        defer { runner.shutdown() }
+        let run = try runner.run(arguments: ["-j", "-G1", "-n", "-s", "-a"] + tags,
+                                 files: [url.path])
+        return try MetadataWriter.parseJSON(run.stdout)
+    }
+
+    /// **exiftool silently declines to overwrite an existing `_original`.**
+    /// Measured on 13.55: with a stale backup present it still reports
+    /// "1 image files updated" and exits 0, and the stale file is left alone.
+    ///
+    /// So a writer that stats the backup path *after* the write mistakes
+    /// somebody else's leftover for its own rollback — and a verification
+    /// failure then copies that leftover over the photo. A stale 22-byte text
+    /// file becomes the user's 2 MB JPEG, and the API reports only
+    /// "verification failed".
+    @Test(needsExiftool) func aStaleBackupIsNeverMistakenForThisWritesRollback() async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("stale.jpg"))
+        let photoBytes = try Data(contentsOf: url)
+        let backup = URL(fileURLWithPath: url.path + "_original")
+        let staleBytes = Data("not a photo, just a leftover".utf8)
+        try staleBytes.write(to: backup)
+
+        let writer = MetadataWriter()
+        await writer.setVerificationOverride { _ in ["MWG:Description"] }
+        let outcomes = await writer.write(MetadataEdit(description: "never lands"), to: [url])
+
+        #expect(try Data(contentsOf: url) == photoBytes,
+                "the photo was overwritten with an unrelated stale backup")
+        #expect(try Data(contentsOf: backup) == staleBytes,
+                "a stale backup this write did not create must be left exactly as found")
+        #expect(outcomes[0].error != nil)
+    }
+
+    /// The same leftover, on the happy path: it must not be deleted either.
+    /// The commit step removes *this write's* backup, not any file that
+    /// happens to sit at that path.
+    @Test(needsExiftool) func aStaleBackupSurvivesASuccessfulWrite() async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("stale2.jpg"))
+        let backup = URL(fileURLWithPath: url.path + "_original")
+        let staleBytes = Data("leftover from an interrupted run".utf8)
+        try staleBytes.write(to: backup)
+
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(MetadataEdit(description: "lands fine"), to: [url])
+        try #require(outcomes[0].error == nil,
+                     "write failed: \(String(describing: outcomes[0].error))")
+
+        #expect(try Data(contentsOf: backup) == staleBytes,
+                "the stale backup was deleted or overwritten by a write that did not own it")
+        let read = try exiftoolRead(url, ["-MWG:Description"])
+        #expect(read["MWG:Description"] as? String == "lands fine")
+    }
+
+    /// The tripwire is a *failure*, not a note nobody reads. A moved
+    /// `image_hash` means duplicate detection would group this file wrongly,
+    /// and duplicate detection deletes files — so the edit is rolled back and
+    /// the user is told, rather than the app carrying on with a hash it has
+    /// just proved is unreliable.
+    @Test(needsExiftool) func aMovedImageHashFailsTheWriteAndRestoresTheFile() async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("drift.jpg"))
+        let originalBytes = try Data(contentsOf: url)
+
+        let writer = MetadataWriter(hasher: DriftingHasher())
+        let outcomes = await writer.write(MetadataEdit(description: "should roll back"),
+                                          to: [url])
+
+        guard case .imageHashChanged(let kind, _, let after)? = outcomes[0].error else {
+            Issue.record("expected .imageHashChanged, got \(String(describing: outcomes[0].error))")
+            return
+        }
+        #expect(kind == "jpeg-scan-v1")
+        #expect(after.hasPrefix("drifted-"))
+        #expect(try Data(contentsOf: url) == originalBytes,
+                "a moved image_hash must roll the edit back, not keep it")
+        #expect(!FileManager.default.fileExists(atPath: url.path + "_original"))
+    }
+
+    /// The failure of the failure: verification failed, and the restore failed
+    /// too, so what is on disk is the half-written file. This is the loudest
+    /// case and the one a summary sheet must not report as an ordinary miss.
+    @Test func restoreReportsFailureWhenItCannotPutTheOriginalBack() throws {
+        let directory = try tree.directory("locked")
+        let file = directory.appendingPathComponent("a.jpg")
+        let backup = directory.appendingPathComponent("a.jpg_original")
+        try Data("half-written".utf8).write(to: file)
+        try Data("the original".utf8).write(to: backup)
+        // Read and execute, but not write: the replace needs to create a
+        // temporary file in this directory and cannot.
+        try tree.chmod("locked", 0o500)
+
+        #expect(throws: MetadataWriteError.self) {
+            try MetadataWriter.restore(backup: backup, to: file, created: false, tags: ["X"])
+        }
+    }
+
+    /// `-@` eats one leading space of a value. A legal caption that begins with
+    /// whitespace would therefore read back short, fail verification, and get
+    /// rolled back — a correct edit destroyed by the transport.
+    @Test(needsExiftool, arguments: ["  indented value", "\ttabbed value",
+                                     "trailing space  "])
+    func aValueWithEdgeWhitespaceRoundTripsExactly(_ value: String) async throws {
+        let name = "ws-\(value.utf8.count)-\(abs(value.hashValue % 1000)).jpg"
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent(name))
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(MetadataEdit(description: value), to: [url])
+        try #require(outcomes[0].error == nil,
+                     "\(value.debugDescription) failed: \(String(describing: outcomes[0].error))")
+        let read = try exiftoolRead(url, ["-MWG:Description"])
+        #expect(read["MWG:Description"] as? String == value)
+    }
+
+    /// A caption that spells the `-stay_open` ready sentinel. Matched anywhere
+    /// in the stream it truncates the JSON read-back mid-object and leaves the
+    /// rest in the pipe, desynchronising every later command on the session.
+    @Test(needsExiftool) func aCaptionSpellingTheReadySentinelDoesNotTruncateTheReadBack()
+        async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("sentinel.jpg"))
+        let caption = "{ready}{ready0}{ready1}{ready2}{ready10}{readyerr1} and more text"
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(MetadataEdit(description: caption, rating: 5),
+                                          to: [url])
+        try #require(outcomes[0].error == nil,
+                     "sentinel caption failed: \(String(describing: outcomes[0].error))")
+
+        let read = try exiftoolRead(url, ["-MWG:Description", "-MWG:Rating"])
+        #expect(read["MWG:Description"] as? String == caption)
+        #expect((read["MWG:Rating"] as? NSNumber)?.intValue == 5)
+
+        // And the session is still usable afterwards: a truncated read leaves
+        // residue that desynchronises the *next* command, not this one.
+        let second = await writer.write(MetadataEdit(description: "after"), to: [url])
+        #expect(second[0].error == nil)
+        let again = try exiftoolRead(url, ["-MWG:Description"])
+        #expect(again["MWG:Description"] as? String == "after")
+    }
+}
+
+// MARK: - Routing, second pass
+
+struct ExiftoolValueRoutingTests {
+    /// The token always begins with `-`, so a whole-token whitespace check only
+    /// ever catches the trailing side. It is the *value* after `=` that the
+    /// argfile parser trims.
+    @Test(arguments: ["-MWG:Description=  indented", "-MWG:Description=\ttabbed",
+                      "-MWG:Description=trailing ", "-XMP-xmp:Label= x "])
+    func aValueWithEdgeWhitespaceIsRoutedToTheOneShot(_ argument: String) {
+        #expect(ExiftoolRunner.requiresOneShot(arguments: [argument], files: ["/tmp/a.jpg"]))
+    }
+
+    @Test(arguments: ["-MWG:Description=inner space is fine", "-MWG:Keywords=",
+                      "-m", "-IPTCDigest=new", "-MWG:Rating=3"])
+    func ordinaryArgumentsStayOnTheStayOpenPath(_ argument: String) {
+        #expect(!ExiftoolRunner.requiresOneShot(arguments: [argument], files: ["/tmp/a.jpg"]))
+    }
+}
+
+// MARK: - Sentinel anchoring
+
+/// The nonce makes the sentinel unguessable; the anchoring makes it
+/// unspellable. Both are needed, and a round-trip test alone cannot tell them
+/// apart — with a nonce in place, an unanchored `contains` match still passes
+/// every end-to-end test. So the anchoring is pinned directly.
+struct PipeDrainSentinelTests {
+    private func find(_ text: String, _ sentinel: String) -> Int? {
+        PipeDrain.anchoredSentinel(in: Data(text.utf8), sentinel: Data(sentinel.utf8))
+            .map { Data(text.utf8).distance(from: Data(text.utf8).startIndex, to: $0) }
+    }
+
+    @Test func matchesASentinelOnItsOwnLine() {
+        #expect(find("[{\"a\":1}]\n{ready7}\n", "{ready7}") == 10)
+    }
+
+    @Test func matchesASentinelAtTheStartOfTheStream() {
+        #expect(find("{ready7}\n", "{ready7}") == 0)
+    }
+
+    /// The defect: a tag value that spells the sentinel ends the read
+    /// mid-object, truncating the JSON and leaving the remainder in the pipe to
+    /// desynchronise the next command.
+    @Test func ignoresASentinelEmbeddedInAValue() {
+        #expect(find("[{\"Description\":\"{ready7} in a caption\"}]\n", "{ready7}") == nil)
+    }
+
+    @Test func skipsAnEmbeddedOccurrenceAndFindsTheRealOneAfterIt() {
+        let stream = "[{\"d\":\"{ready7}\"}]\n{ready7}\n"
+        #expect(find(stream, "{ready7}") == 19)
+    }
+
+    /// A sentinel split across two reads must not match until its trailing
+    /// newline has actually arrived, or the read ends one byte early.
+    @Test func waitsForTheTrailingNewline() {
+        #expect(find("out\n{ready7}", "{ready7}") == nil)
+        #expect(find("out\n{ready7}\n", "{ready7}") == 4)
+    }
+
+    /// A longer id must not be matched by a shorter one's sentinel.
+    @Test func doesNotMatchADifferentCommandsSentinel() {
+        #expect(find("out\n{ready71}\n", "{ready7}") == nil)
     }
 }

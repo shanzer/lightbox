@@ -62,7 +62,7 @@ public actor MetadataWriter {
     public static let availability: ExiftoolAvailability = ExiftoolLocator.check()
 
     private let exiftool: ExiftoolAvailability
-    private let hasher: FileHasher
+    private let hasher: any FileHashing
     private var runner: ExiftoolRunner?
 
     /// Test seam: when set, stands in for the read-back step and returns the
@@ -80,7 +80,7 @@ public actor MetadataWriter {
     }
 
     public init(availability: ExiftoolAvailability = MetadataWriter.availability,
-                hasher: FileHasher = FileHasher()) {
+                hasher: any FileHashing = FileHasher()) {
         self.exiftool = availability
         self.hasher = hasher
     }
@@ -205,6 +205,27 @@ public actor MetadataWriter {
         let plan = Self.plan(edit, target: isSidecar ? .sidecar(destination) : .inPlace,
                              options: options)
 
+        // **A pre-existing `_original` is not our rollback, and it is not ours
+        // to delete.** exiftool declines to overwrite an existing backup and
+        // still reports success — measured on 13.55: with a stale `_original`
+        // present it prints "1 image files updated" and exits 0, leaving the
+        // stale file untouched. A writer that stats the backup path *after* the
+        // write therefore mistakes somebody else's leftover (a crash between
+        // write and commit, an interrupted run, another tool) for its own
+        // backup, and a verification failure then copies that leftover over the
+        // photo. So the path is cleared beforehand and the leftover put back
+        // afterwards, exactly as found.
+        let backup = URL(fileURLWithPath: destination.path + "_original")
+        let stashedBackup = try Self.stashAside(backup)
+        defer {
+            if let stashedBackup {
+                // The restore and commit paths both consume `backup` first, so
+                // this lands on a free path. If it somehow does not, the
+                // leftover stays under its stash name rather than being lost.
+                try? FileManager.default.moveItem(at: stashedBackup, to: backup)
+            }
+        }
+
         let run: ExiftoolRun
         do {
             run = try runner.run(arguments: plan.writeArguments, files: [destination.path])
@@ -215,8 +236,22 @@ public actor MetadataWriter {
             throw MetadataWriteError.exiftoolFailed(Self.diagnostic(run))
         }
 
-        let backup = URL(fileURLWithPath: destination.path + "_original")
-        let hasBackup = FileManager.default.fileExists(atPath: backup.path)
+        // With the path cleared beforehand, anything here now is unambiguously
+        // this run's backup. Its absence means exiftool made none — it found
+        // nothing to change — and there is nothing to roll back to.
+        let ourBackup = FileManager.default.fileExists(atPath: backup.path) ? backup : nil
+        let createdSidecar = isSidecar && !sidecarExistedBefore
+
+        /// Puts the file back and reports which way it failed. Never called
+        /// with a file this run did not create.
+        func rollBack(tags: [String]) throws -> Never {
+            try Self.restore(backup: ourBackup, to: destination,
+                             created: createdSidecar, tags: tags)
+            guard ourBackup != nil || createdSidecar else {
+                throw MetadataWriteError.verificationFailedWithoutRollback(tags: tags)
+            }
+            throw MetadataWriteError.verificationFailed(tags)
+        }
 
         // Verify.
         let mismatched: [String]
@@ -227,20 +262,38 @@ public actor MetadataWriter {
                 mismatched = try Self.verify(plan.expectations, at: destination, runner: runner)
             }
         } catch {
-            try Self.restore(backup: hasBackup ? backup : nil, to: destination,
-                             created: !sidecarExistedBefore && isSidecar,
-                             tags: ["<read-back failed>"])
+            try Self.restore(backup: ourBackup, to: destination,
+                             created: createdSidecar, tags: ["<read-back failed>"])
             throw MetadataWriteError.exiftoolFailed(String(describing: error))
         }
-        guard mismatched.isEmpty else {
-            try Self.restore(backup: hasBackup ? backup : nil, to: destination,
-                             created: !sidecarExistedBefore && isSidecar,
-                             tags: mismatched)
-            throw MetadataWriteError.verificationFailed(mismatched)
+        if !mismatched.isEmpty { try rollBack(tags: mismatched) }
+
+        // The tripwire, checked *before* the commit so it can still roll back.
+        // `image_hash` is defined to survive a metadata edit (HANDOFF §6); if it
+        // moved, the format's rule in `Hashing/` is wrong, duplicate grouping
+        // for that format is unreliable, and duplicate detection deletes files
+        // on the strength of those hashes. Rolled back and reported, never
+        // repaired here — those rules are binding.
+        var hashesAfter: FileHashes?
+        if !isSidecar {
+            do {
+                hashesAfter = try hasher.hashes(for: url, mediaType: mediaType)
+            } catch {
+                try Self.restore(backup: ourBackup, to: destination,
+                                 created: createdSidecar, tags: ["<rehash failed>"])
+                throw MetadataWriteError.exiftoolFailed("rehash after write failed: \(error)")
+            }
+            if let was = hashesBefore?.imageHash, let now = hashesAfter?.imageHash, was != now {
+                let kind = hashesAfter?.imageHashKind ?? mediaType.kind.rawValue
+                try Self.restore(backup: ourBackup, to: destination,
+                                 created: createdSidecar, tags: ["image_hash"])
+                throw MetadataWriteError.imageHashChanged(kind: kind, before: was, after: now)
+            }
         }
 
-        // Commit: the backup only goes away once the tags have been read back.
-        if hasBackup { try? FileManager.default.removeItem(at: backup) }
+        // Commit: this run's backup only goes away once the tags have been read
+        // back *and* the image hash has been shown to have survived.
+        if let ourBackup { try? FileManager.default.removeItem(at: ourBackup) }
 
         var warnings: [WriteWarning] = []
         let stderr = run.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -257,20 +310,9 @@ public actor MetadataWriter {
         }
 
         let after = try Self.stat(url)
-        let hashesAfter: FileHashes
-        do {
-            hashesAfter = try hasher.hashes(for: url, mediaType: mediaType)
-        } catch {
-            throw MetadataWriteError.exiftoolFailed("rehash after write failed: \(error)")
-        }
-
-        // The tripwire. `image_hash` is defined to survive a metadata edit; if
-        // it moved, the format's rule in `Hashing/` is wrong. Reported, never
-        // repaired here — HANDOFF §6 makes those rules binding.
-        if let before = hashesBefore?.imageHash, let now = hashesAfter.imageHash,
-           before != now {
-            warnings.append(.imageHashChanged(kind: hashesAfter.imageHashKind ?? mediaType.ext,
-                                              before: before, after: now))
+        // Non-nil for every in-place write: the tripwire above computed it.
+        guard let hashesAfter else {
+            throw MetadataWriteError.exiftoolFailed("rehash after write was skipped")
         }
 
         // HEIC, TIFF, GIF and PSD have no image-hash rule in version 1, so the
@@ -304,6 +346,24 @@ public actor MetadataWriter {
     }
 
     // MARK: - Backup and restore
+
+    /// Moves anything already sitting at exiftool's `_original` path out of the
+    /// way, returning where it went, or nil if the path was already free.
+    ///
+    /// A sibling name in the same directory, so the move is a rename within one
+    /// filesystem and cannot half-succeed. Throws rather than proceeding if the
+    /// path cannot be cleared: a write with no rollback available is refused
+    /// before it starts, not performed and hoped over.
+    static func stashAside(_ backup: URL) throws -> URL? {
+        guard FileManager.default.fileExists(atPath: backup.path) else { return nil }
+        let stash = URL(fileURLWithPath: backup.path + ".lightbox-stash-\(UUID().uuidString)")
+        do {
+            try FileManager.default.moveItem(at: backup, to: stash)
+        } catch {
+            throw MetadataWriteError.backupPathOccupied(backup.path)
+        }
+        return stash
+    }
 
     static func restore(backup: URL?, to destination: URL, created: Bool,
                                 tags: [String]) throws {
