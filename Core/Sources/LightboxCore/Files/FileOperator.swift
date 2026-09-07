@@ -699,8 +699,13 @@ public actor FileOperator {
     /// removing it to make room would be the very loss this whole path exists to
     /// prevent. The stash is left where it is instead: it is journalled, so
     /// nothing is stranded, and the caller reports `.rollbackIncomplete`.
-    private static func restore(_ stash: [PlannedReplacement],
-                                rollbackSucceeded: Bool) -> [String] {
+    /// Internal rather than private so the guard can be tested directly. The
+    /// loss it prevents needs a same-volume move whose mid-item rename fails
+    /// *and* whose rollback then fails, which is not constructible on demand
+    /// against a real filesystem — and a safety guard nothing can exercise is a
+    /// safety guard nothing will notice the removal of.
+    static func restore(_ stash: [PlannedReplacement],
+                        rollbackSucceeded: Bool) -> [String] {
         var problems: [String] = []
         for entry in stash.reversed() {
             if !rollbackSucceeded || FileManager.default.fileExists(atPath: entry.occupant.path) {

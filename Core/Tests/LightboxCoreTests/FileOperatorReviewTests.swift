@@ -412,3 +412,84 @@ struct FileOperatorReplaceCaseTests {
         #expect(survivor.contentHash == "hash-IMG_0001.jpg")
     }
 }
+
+// MARK: - B6: putting a displaced file back never deletes what is in its place
+
+struct FileOperatorRestoreGuardTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// The loss this guard prevents: a same-volume move displaces the occupant,
+    /// the item then fails, and the rollback that should have moved the photo
+    /// back out of the destination fails too. Whatever is at the occupant's path
+    /// now is the user's photo — its source is gone, it *was* the rename — and
+    /// deleting it to make room for the stash destroys the only copy.
+    @Test func restoreRefusesRatherThanDeletingWhatIsAtTheOriginalPath() throws {
+        let occupied = try tree.file("to/IMG_0001.jpg", bytes: 77)
+        let stash = try tree.file("to/.lightbox-replaced-abc-0-0", bytes: 10)
+        let replacement = PlannedReplacement(occupant: occupied, stash: stash)
+
+        let problems = FileOperator.restore([replacement], rollbackSucceeded: false)
+        #expect(problems.count == 1)
+        #expect(problems[0].contains("IMG_0001.jpg"))
+        // The user's photo is untouched and the displaced one is still where the
+        // journal says it is.
+        #expect(try bytes(occupied) == 77)
+        #expect(try bytes(stash) == 10)
+    }
+
+    /// The ordinary path still works: with the original path clear, the
+    /// displaced file goes back to it.
+    @Test func restorePutsTheDisplacedFileBackWhenThePathIsClear() throws {
+        let destination = try tree.directory("to")
+        let occupant = destination.appendingPathComponent("IMG_0001.jpg")
+        let stash = try tree.file("to/.lightbox-replaced-abc-0-0", bytes: 10)
+        let replacement = PlannedReplacement(occupant: occupant, stash: stash)
+
+        let problems = FileOperator.restore([replacement], rollbackSucceeded: true)
+        #expect(problems.isEmpty)
+        #expect(try bytes(occupant) == 10)
+        #expect(!exists(stash))
+    }
+}
+
+// MARK: - B1: a file the batch itself selected is never displaced
+
+struct FileOperatorReplaceBackstopTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// Select a photo that is already in the target folder, plus a same-named
+    /// one elsewhere, and move both there with Replace.
+    ///
+    /// The naive reading is that the second item collides with a real file on
+    /// disk and may displace it. It may not: that file is the *first item's
+    /// source*, which the user also selected, and the first item claims its own
+    /// name the moment it is planned. So the collision is `claimedInBatch`,
+    /// `replace` degrades, and both photos survive — which is the whole point of
+    /// tracking where a claim came from rather than only that there is one.
+    @Test func replaceOverAFileThisBatchSelectedKeepsBothPhotos() async throws {
+        let destination = try tree.directory("to")
+        let alreadyThere = try tree.file("to/IMG_0001.jpg", bytes: 77)
+        let incoming = try tree.file("a/IMG_0001.jpg", bytes: 20)
+        let store = try IndexStore.inMemory()
+        try index(alreadyThere, into: store)
+        try index(incoming, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .move, sources: [alreadyThere, incoming],
+                                     destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        #expect(plan.items[0].collisions.isEmpty)
+        #expect(plan.items[1].collisions.map(\.kind) == [.claimedInBatch])
+
+        let results = try await op.execute(plan.resolvingAllCollisions(with: .replace))
+        #expect(results[0].outcome == .skipped(.alreadyAtDestination))
+        #expect(results[1].outcome == .completed)
+        #expect(try bytes(alreadyThere) == 77)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001 2.jpg")) == 20)
+        #expect(try store.count() == 2)
+    }
+}
