@@ -4,11 +4,14 @@ Issue #10. The exact tier needed a number to confirm it was not a problem; the
 near tier needed one to choose `DuplicateFinder.nearTierCeiling`. These are
 those numbers.
 
-**Headline: brute force wins, and 120,000 rows is where the 5 s budget runs
-out.** The pairwise scan is `n(n-1)/2` XOR + popcount over 64-bit values, and
-at 50,000 rows it costs about 1 s — a fifth of the budget the issue sets. The
-proposed 16-bit-prefix bucketing is not implemented, and
+**Headline: brute force wins against the proposed prefix filter, and 100,000
+rows is as far as the 5 s budget reaches.** The pairwise scan is `n(n-1)/2` XOR +
+popcount over 64-bit values, and at 50,000 rows it costs about 1 s — a fifth of
+the budget the issue sets. The proposed 16-bit-prefix bucketing is not
+implemented, and
 [the arithmetic says it should not be](#why-there-is-no-bucketed-fast-path).
+This is not a claim that brute force beats every alternative; if the ceiling
+ever binds, [there is a right thing to reach for](#if-the-ceiling-ever-binds).
 
 **These numbers are synthetic.** They were taken over generated index rows, not
 over the 50,000-image fixture library, which does not exist on this machine.
@@ -54,37 +57,51 @@ bits of one base.
 alone and uniform hashes measure it exactly. What they under-state is the
 *result*: a real library of one person's photographs clusters, so there are
 more matches to assemble afterwards. Uniform 64-bit hashes still produce chance
-matches at these sizes — P(distance ≤ 12) ≈ 1.1e-7 per pair, so ~140 expected
-at 50,000 — which is why the near-group counts below are not zero.
+matches at these sizes. P(distance ≤ 12) = Σ_{k≤12} C(64,k) / 2⁶⁴ = 2.283e-7
+per pair, so `n(n-1)/2 × p` gives 11 expected pairs at 10,000, 285 at 50,000
+and 4,567 at 200,000 — against 6, 276 and 4,303 *groups* observed. Groups are
+the lower number because the star cover folds a record that matches two seeds
+into one group; the agreement is close enough to confirm the scan is examining
+every pair. This is why the near-group counts below are not zero.
 
 ## The numbers
 
-Two runs, both reported, because the smaller sizes are noisy enough that one
-run would over-state their precision. Group counts were identical in both.
+Four runs, all reported, because a single run over-states the precision of
+every one of these figures. Group counts were identical in all three, which is
+the check that each run examined the same pairs.
 
-| rows | exact tier | exact groups | near tier (run 1) | near tier (run 2) | near groups |
-|---:|---:|---:|---:|---:|---:|
-| 10,000 | 0.003 s | 99 | 0.059 s | 0.042 s | 6 |
-| 25,000 | 0.006–0.015 s | 249 | 0.407 s | 0.225 s | 85 |
-| 50,000 | 0.012–0.014 s | 499 | 1.315 s | 0.857 s | 276 |
-| 100,000 | 0.024 s | 999 | 3.365 s | 3.395 s | 1,080 |
-| 200,000 | 0.050 s | 1,999 | 13.652 s | 13.656 s | 4,303 |
+| rows | exact tier | exact groups | near tier (r1 / r2 / r3 / r4) | near groups |
+|---:|---:|---:|---:|---:|
+| 10,000 | 0.002–0.003 s | 99 | 0.059 / 0.042 / 0.044 / 0.043 s | 6 |
+| 25,000 | 0.004–0.015 s | 249 | 0.407 / 0.225 / 0.230 / 0.227 s | 85 |
+| 50,000 | 0.008–0.014 s | 499 | 1.315 / 0.857 / 1.391 / 0.862 s | 276 |
+| 100,000 | 0.016–0.027 s | 999 | 3.365 / 3.395 / 4.127 / 3.379 s | 1,080 |
+| 200,000 | 0.033–0.055 s | 1,999 | 13.652 / 13.656 / 15.788 / 13.649 s | 4,303 |
 
-The two large sizes agree to within 1%, which is what the ceiling is derived
-from; the small ones scatter by up to 50% because they are short enough for
-scheduling noise to matter, and they are not load-bearing.
+Run 4 is post-rebase onto `main` at 8208abd (HEIC image hashing merged) and is
+the run the committed code was measured on.
+
+Run-to-run spread is up to 62% at 50,000 and 22% at 100,000 — enough that the
+ceiling must be read off the measurements rather than off a fitted curve. Run 3
+included the `COUNT(*)` pre-check added for the ceiling, which is a small part
+of the difference; the rest is scheduling and thermal noise on a machine doing
+other things.
 
 Against the issue's budgets of **500 ms** for the exact tier and **5 s** for the
-near tier at 50,000 rows: the exact tier clears by a factor of 35, the near
-tier by a factor of about 4.
+near tier at 50,000 rows: the exact tier clears by a factor of at least 35, the
+near tier by a factor of at least 3.6 on the worst run.
 
-The near tier's growth is clean quadratic — 100k→200k is 4.06×, 50k→100k is
-2.56× (a little under 4× because the smaller sizes still carry fixed setup) —
-so the 5 s budget lands at roughly 120,000 rows:
+The near tier's growth is quadratic — 100k→200k is 3.8–4.1×, 50k→100k is
+2.6–3.0× (under 4× because the smaller sizes still carry fixed setup). A fit
+would put the 5 s budget somewhere around 110,000–120,000 rows, but the
+100,000 point alone moved 22% between runs, so the ceiling is set to the
+largest size that came in under budget on **every** run rather than to the
+first size the curve says should:
 
-    3.365 s × (120/100)² = 4.84 s
-
-Hence `DuplicateFinder.nearTierCeiling = 120_000`. Past it the near tier
+`DuplicateFinder.nearTierCeiling = 100_000`. Round down, and raise it only when
+there is a measurement at the higher size. Choosing a user-visible multi-second
+stall on the strength of an extrapolation is not a trade worth making for 20%
+more headroom. Past it the near tier
 returns nothing and sets `DuplicateReport.nearTierSkipped` to the scope size, so
 the view can say "too many files to compare here" rather than "no
 near-duplicates" — a distinction that matters when the answer is used to delete
@@ -118,6 +135,20 @@ An approximate filter is the wrong trade for a view whose output is a deletion.
 So the near tier is exhaustive up to the ceiling and refuses past it, and the
 refusal is reported rather than disguised as an empty result.
 
+### If the ceiling ever binds
+
+The thing to reach for is **multi-index hashing**, not a prefix filter: split
+the 64 bits into 4 bands of 16 and index each band separately, then for each
+probe enumerate every band value within radius 3 of the probe's band and look
+it up. Pigeonhole again — 12 differing bits over 4 bands puts at most 3 in some
+band — but this time it is *exact*, because the radius is searched rather than
+assumed to be zero. The cost is Σ_{k≤3} C(16,k) = 697 lookups per band per row,
+so ~2,800 hash-table probes per row instead of `n` comparisons; it overtakes
+brute force somewhere above a few hundred thousand rows, and it returns exactly
+the same pairs. Worth building when a real library reaches the ceiling, and not
+before — the 120,000-row ceiling is well past the library this app was written
+for.
+
 ## Debug is not a factor away
 
 The near tier is a tight scalar loop over an unsafe buffer, and the two build
@@ -129,8 +160,11 @@ configurations are not comparable:
 | 25,000 | 24.819 s | 0.407 s | 61× |
 | 50,000 | 111.401 s | 1.315 s | 85× |
 
+(Release column from run 1, for comparability with the debug run taken beside
+it.)
+
 A ceiling chosen from a debug build would have been about 12,000 rather than
-120,000 — an order of magnitude of usable library size thrown away. Both
+100,000 — an order of magnitude of usable library size thrown away. Both
 duplicate benchmarks therefore refuse to run in a debug build (`isDebugBuild` in
 `BenchmarkTests.swift`) rather than print a number somebody might act on, which
 also keeps the documented `LIGHTBOX_BENCH=1 swift test --filter Benchmark`

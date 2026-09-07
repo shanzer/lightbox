@@ -117,6 +117,18 @@ struct PerceptualHashRow: Sendable, Hashable {
     let phash: String
 }
 
+/// The row sets one duplicate report reads, all from a single database
+/// snapshot. See `IndexStore.withDuplicateScan(for:nearTierCeiling:_:)`.
+struct DuplicateScan: Sendable {
+    /// Rows sharing an exact key with another row in scope.
+    let candidates: [FileRecord]
+    /// The near tier's working set, or nil when `perceptualCount` exceeded the
+    /// ceiling and the rows were therefore never fetched.
+    let perceptual: [PerceptualHashRow]?
+    /// Rows in scope carrying a perceptual hash, counted before any were read.
+    let perceptualCount: Int
+}
+
 /// Groups a search scope into exact duplicates and near-duplicates.
 ///
 /// Two tiers, because they carry very different confidence. The exact tier is
@@ -141,14 +153,20 @@ public struct DuplicateFinder: Sendable {
     ///
     /// The scan is `n(n-1)/2` 64-bit XOR + popcount. Measured on the M4 mini in
     /// a **release** build over synthetic hashes — the scan's cost depends on
-    /// the row count and nothing else — it runs 0.06 s at 10,000 rows, 0.41 s
-    /// at 25,000, 1.32 s at 50,000, 3.37 s at 100,000 and 13.65 s at 200,000.
-    /// Clean quadratic growth, so the issue's 5 s budget lands at about 120,000
-    /// rows, and that is the number. Full run in
+    /// the row count and nothing else — it runs 0.04-0.06 s at 10,000 rows,
+    /// 0.86-1.39 s at 50,000, 3.37-4.13 s at 100,000 and 13.6-15.8 s at
+    /// 200,000, over four runs. Full numbers in
     /// `docs/superpowers/notes/2026-09-07-duplicate-grouping.md`.
     ///
-    /// A debug build is roughly 85x slower here (4.0 s at 10,000 rows), so any
-    /// re-measurement has to be `swift test -c release` or it is measuring
+    /// 100,000 is the largest size *measured* inside the issue's 5 s budget on
+    /// every run, so that is the ceiling. The quadratic fit puts 5 s nearer
+    /// 110,000-120,000, but the 100,000 point alone has varied by 22% between
+    /// runs and a ceiling extrapolated past the last measurement would be
+    /// choosing a user-visible stall on the strength of a curve. Round down;
+    /// raise it when there is a measurement at the higher size.
+    ///
+    /// A debug build is roughly 60-85x slower here (4.0 s at 10,000 rows), so
+    /// any re-measurement has to be `swift test -c release` or it is measuring
     /// bounds checks.
     ///
     /// There is no bucketed fast path, and that is a deliberate refusal rather
@@ -161,7 +179,12 @@ public struct DuplicateFinder: Sendable {
     /// *approximate* would silently drop real near-duplicates from a view whose
     /// output is a deletion, which is not a trade this feature can make. So:
     /// exhaustive up to the ceiling, and an honest refusal past it.
-    public static let nearTierCeiling = 120_000
+    ///
+    /// If the ceiling ever binds, the thing to build is multi-index hashing —
+    /// 4 bands of 16 bits, each probed to radius 3, which is exact rather than
+    /// approximate. The note works the cost out; it is not worth building for
+    /// a library this size.
+    public static let nearTierCeiling = 100_000
 
     private let store: IndexStore
     private let ceiling: Int
@@ -171,10 +194,31 @@ public struct DuplicateFinder: Sendable {
         self.ceiling = nearTierCeiling
     }
 
+    /// Both tiers over one scope, from a **single database snapshot**.
+    ///
+    /// The snapshot is the point. The store is a WAL `DatabasePool`, so each
+    /// read is its own view of the database and a tier 1 pass can re-hash a row
+    /// between two of them; a report assembled across snapshots could state a
+    /// Hamming distance computed from a `phash` that the record it hands back
+    /// no longer carries. Everything below reads through
+    /// `IndexStore.withDuplicateScan`, which holds one snapshot open across
+    /// both tiers.
+    ///
+    /// Calling `exactGroups(for:)` and `nearGroups(for:excluding:)` separately
+    /// deliberately does *not* give that guarantee — two calls are two
+    /// snapshots. That staging exists so a view can show the cheap, certain
+    /// tier immediately; a view that stages them is choosing latency over the
+    /// cross-tier consistency this method has.
     public func report(for query: SearchQuery) throws -> DuplicateReport {
-        let exact = try exactGroups(for: query)
-        let near = try nearGroups(for: query, excluding: exact)
-        return DuplicateReport(exact: exact, near: near.groups, nearTierSkipped: near.skipped)
+        try store.withDuplicateScan(for: query, nearTierCeiling: ceiling) { scan, records in
+            let exact = Self.groups(from: scan.candidates)
+            guard let rows = scan.perceptual else {
+                return DuplicateReport(exact: exact, near: [],
+                                       nearTierSkipped: scan.perceptualCount)
+            }
+            let near = try Self.nearGroups(rows: rows, excluding: exact, records: records)
+            return DuplicateReport(exact: exact, near: near.groups, nearTierSkipped: near.skipped)
+        }
     }
 
     // MARK: - Exact tier
@@ -187,6 +231,13 @@ public struct DuplicateFinder: Sendable {
     /// that must have both before it can draw anything makes the cheap,
     /// certain answer wait on the expensive, hedged one.
     public func exactGroups(for query: SearchQuery) throws -> [DuplicateGroup] {
+        Self.groups(from: try store.duplicateCandidates(for: query))
+    }
+
+    /// The pure half: candidate rows in, groups out. Separated so `report(for:)`
+    /// can run it on rows it already holds from its own snapshot rather than
+    /// issuing a second read.
+    private static func groups(from candidates: [FileRecord]) -> [DuplicateGroup] {
         /// The grouping key, kept in two namespaces. An `image_hash` and a
         /// `content_hash` are both SHA-256 hex and could collide as bare
         /// strings while meaning entirely different things.
@@ -196,7 +247,7 @@ public struct DuplicateFinder: Sendable {
         }
 
         var buckets: [Key: [FileRecord]] = [:]
-        for row in try store.duplicateCandidates(for: query) {
+        for row in candidates {
             if let image = row.imageHash {
                 buckets[.image(image), default: []].append(row)
             } else if let content = row.contentHash {
@@ -225,8 +276,12 @@ public struct DuplicateFinder: Sendable {
                                          copies: copies))
         }
         return groups.sorted { a, b in
-            guard let first = a.files.first, let second = b.files.first else {
-                return b.files.first != nil
+            // `copies.first?.files.first` rather than `files.first`, which
+            // would flatMap every sub-group of both operands on every
+            // comparison just to look at one record.
+            guard let first = a.copies.first?.files.first,
+                  let second = b.copies.first?.files.first else {
+                return b.copies.first?.files.first != nil
             }
             return Self.precedes(first, second)
         }
@@ -239,7 +294,10 @@ public struct DuplicateFinder: Sendable {
         var byHash: [String: [FileRecord]] = [:]
         // A nil content_hash cannot be a dictionary key and must not be folded
         // in with the empty string, so it gets its own sentinel and is mapped
-        // back on the way out.
+        // back on the way out. Defensive rather than reachable today: a row in
+        // an image-hash group always has a content hash, because `setHashes`
+        // writes the two together. This costs one comparison and removes the
+        // need to reason about that invariant from here.
         let nilKey = "\u{0}nil"
         for row in ordered {
             let key = row.contentHash ?? nilKey
@@ -266,6 +324,23 @@ public struct DuplicateFinder: Sendable {
     /// already covers, which is almost never what a view wants.
     public func nearGroups(for query: SearchQuery,
                            excluding exact: [DuplicateGroup]) throws -> NearTierResult {
+        // Counted before fetching, so an over-large scope costs one aggregate
+        // rather than materialising rows about to be refused. `report(for:)`
+        // does the same inside its snapshot.
+        let count = try store.countPerceptualHashRows(for: query)
+        guard count <= ceiling else { return NearTierResult(groups: [], skipped: count) }
+        let rows = try store.perceptualHashRows(for: query)
+        return try Self.nearGroups(rows: rows, excluding: exact) {
+            try store.records(ids: $0)
+        }
+    }
+
+    /// The pure half, over rows the caller has already read — so `report(for:)`
+    /// can run it inside its single snapshot, with `records` bound to that same
+    /// snapshot.
+    private static func nearGroups(
+        rows: [PerceptualHashRow], excluding exact: [DuplicateGroup],
+        records: (_ ids: [Int64]) throws -> [FileRecord]) throws -> NearTierResult {
         // Which exact group each row landed in, so the near tier can leave
         // those pairs alone. `-1` stands for "no exact group", and two rows
         // both at -1 are *not* in the same group — the comparison in
@@ -277,11 +352,7 @@ public struct DuplicateFinder: Sendable {
             }
         }
 
-        let rows = try store.perceptualHashRows(for: query)
         guard !rows.isEmpty else { return NearTierResult(groups: [], skipped: nil) }
-        guard rows.count <= ceiling else {
-            return NearTierResult(groups: [], skipped: rows.count)
-        }
 
         // Seeds are taken in the grid's order — name case-insensitively, then
         // path — not in row-id order. Ids are reused rowids, so an id-ordered
@@ -318,7 +389,7 @@ public struct DuplicateFinder: Sendable {
             wanted.append(pair.seed)
             wanted.append(contentsOf: pair.matches.map(\.id))
         }
-        let byID = Dictionary(try store.records(ids: wanted).compactMap { record in
+        let byID = Dictionary(try records(wanted).compactMap { record in
             record.id.map { ($0, record) }
         }, uniquingKeysWith: { first, _ in first })
 
@@ -389,9 +460,15 @@ public struct DuplicateFinder: Sendable {
 
     // MARK: - Ordering
 
-    /// The grid's order: file name case-insensitively, then the full path as
-    /// the tiebreak. Path is unique, so this is a total order and no rowid is
-    /// needed to break a tie — which matters, because rowids are reused.
+    /// The grid's *default* order — file name case-insensitively, then the
+    /// full path as the tiebreak. Deliberately not `query.sort`: the duplicate
+    /// view presents groups, and a group re-ordered by capture date or size
+    /// would shuffle which file seeds a near group and so change the report's
+    /// shape with a sort control. One fixed order, whatever the query asked
+    /// the grid for.
+    ///
+    /// Path is unique, so this is a total order and no rowid is needed to
+    /// break a tie — which matters, because rowids are reused.
     ///
     /// `lowercased()` rather than SQLite's `COLLATE NOCASE`, which folds ASCII
     /// only: one comparator in Swift is easier to keep consistent across the

@@ -121,8 +121,14 @@ struct DuplicateFinderTests {
         let near = try #require(report.near.first)
         #expect((near.seed.path as NSString).lastPathComponent == "a-original.jpg")
         #expect(paths(near.matches.map(\.file)) == ["d-reencoded.jpg"])
-        // Measured, not assumed: quality 0.25 moves this image 8 bits.
-        #expect(near.matches[0].distance == 8)
+        // Inside the threshold, and not zero — the two properties that make
+        // this a *near* match rather than an exact one or a stranger. Not
+        // pinned to the exact figure: the distance depends on ImageIO's JPEG
+        // encoder at quality 0.25 and on its downsample kernel, both of which
+        // move with the OS. It measured 8 on macOS 26.5.2; that number lives
+        // in `docs/superpowers/notes/2026-09-07-duplicate-grouping.md`, where
+        // it is a recorded observation rather than a contract.
+        #expect(near.matches[0].distance > 0)
         #expect(near.matches[0].distance <= DuplicateFinder.nearThreshold)
     }
 
@@ -195,16 +201,94 @@ struct DuplicateFinderTests {
 
     /// The predicate, not only the folder: "duplicates among the PNGs" has to
     /// be the same code path as "duplicates in this folder".
+    ///
+    /// Directional, so it cannot pass by finding nothing: four files share one
+    /// `image_hash`, two of them PNGs, and the PNG-filtered report must contain
+    /// exactly the two PNGs — not none, and not all four.
     @Test func theQueryPredicateNarrowsTheGroupsToo() throws {
         let store = try IndexStore.inMemory()
         try insert(store, path: "/lib/a.jpg", content: "c1", image: "i1", kind: "k")
         try insert(store, path: "/lib/b.jpg", content: "c1", image: "i1", kind: "k")
         try insert(store, path: "/lib/c.png", content: "c1", image: "i1", kind: "k")
+        try insert(store, path: "/lib/d.png", content: "c2", image: "i1", kind: "k")
+
+        let finder = DuplicateFinder(store: store)
+        #expect(try finder.report(for: everywhere).exact.first?.files.count == 4)
 
         let query = SearchQuery(scope: .everywhere, predicate: .fileExtension(["png"]))
-        let report = try DuplicateFinder(store: store).report(for: query)
-        // One PNG in scope: no twin, so no group.
-        #expect(report.exact.isEmpty)
+        let report = try finder.report(for: query)
+        #expect(report.exact.count == 1)
+        #expect(paths(report.exact[0].files) == ["c.png", "d.png"])
+    }
+
+    // MARK: - Scope, at the near tier
+
+    // The exact tier's scoping is asserted above, but the two tiers reach the
+    // database by different queries, so proving one says nothing about the
+    // other: deleting the filter from the near tier's `WHERE` leaves every
+    // exact-tier assertion in this file green. These three tests are what bite
+    // when that happens.
+
+    /// The negative case: a near pair straddling the scope boundary must not
+    /// be reported when only one of them is in scope.
+    @Test func theNearTierIsScopedToTheFolderToo() throws {
+        let store = try IndexStore.inMemory()
+        let golden = "9f32a3b705ae1b18"
+        try insert(store, path: "/lib/in/a.jpg", content: "c1", image: "i1", kind: "k",
+                   phash: golden)
+        try insert(store, path: "/lib/out/b.jpg", content: "c2", image: "i2", kind: "k",
+                   phash: try flippingBits(golden, 2))
+
+        let finder = DuplicateFinder(store: store)
+        // Both in scope: the pair is real, so the negative below is about the
+        // scope and not about the pair.
+        #expect(try finder.report(for: everywhere).near.count == 1)
+
+        let scoped = try finder.report(for: SearchQuery(scope: .folder(path: "/lib/in",
+                                                                       recursive: true)))
+        #expect(scoped.near.isEmpty, "a neighbour outside the scope must not be reported")
+    }
+
+    /// The positive case, so the test above cannot pass by scoping everything
+    /// away: both files inside the folder, one near group.
+    @Test func aNearPairWhollyInsideTheScopeIsReported() throws {
+        let store = try IndexStore.inMemory()
+        let golden = "9f32a3b705ae1b18"
+        try insert(store, path: "/lib/in/a.jpg", content: "c1", image: "i1", kind: "k",
+                   phash: golden)
+        try insert(store, path: "/lib/in/b.jpg", content: "c2", image: "i2", kind: "k",
+                   phash: try flippingBits(golden, 2))
+        try insert(store, path: "/lib/out/c.jpg", content: "c3", image: "i3", kind: "k",
+                   phash: try flippingBits(golden, 3))
+
+        let report = try DuplicateFinder(store: store)
+            .report(for: SearchQuery(scope: .folder(path: "/lib/in", recursive: true)))
+        #expect(report.near.count == 1)
+        #expect((report.near[0].seed.path as NSString).lastPathComponent == "a.jpg")
+        #expect(paths(report.near[0].matches.map(\.file)) == ["b.jpg"])
+    }
+
+    /// And the predicate, not only the folder scope.
+    @Test func theNearTierRespectsTheQueryPredicate() throws {
+        let store = try IndexStore.inMemory()
+        let golden = "9f32a3b705ae1b18"
+        try insert(store, path: "/lib/a.png", content: "c1", image: "i1", kind: "k",
+                   phash: golden)
+        try insert(store, path: "/lib/b.jpg", content: "c2", image: "i2", kind: "k",
+                   phash: try flippingBits(golden, 2))
+        try insert(store, path: "/lib/c.png", content: "c3", image: "i3", kind: "k",
+                   phash: try flippingBits(golden, 4))
+
+        let finder = DuplicateFinder(store: store)
+        // Unfiltered, a.png's nearest neighbour is the JPEG at distance 2.
+        let all = try finder.report(for: everywhere)
+        #expect(paths(all.near[0].matches.map(\.file)) == ["b.jpg", "c.png"])
+
+        let query = SearchQuery(scope: .everywhere, predicate: .fileExtension(["png"]))
+        let report = try finder.report(for: query)
+        #expect(report.near.count == 1)
+        #expect(paths(report.near[0].matches.map(\.file)) == ["c.png"],
+                "the JPEG is out of scope and must not be a neighbour")
     }
 
     /// A backup copy on a second volume is a legitimate member of the group,
@@ -369,6 +453,50 @@ struct DuplicateFinderTests {
         let report = try DuplicateFinder(store: store).report(for: everywhere)
         #expect(report.exact.map { paths($0.files) }
                 == [["Alpha.jpg", "beta.jpg"], ["yankee.jpg", "zeta.jpg"]])
+    }
+
+    /// `report(for:)` reads from one snapshot; `exactGroups` + `nearGroups`
+    /// read from two. They are two code paths through the same grouping, and
+    /// nothing else would notice if they diverged.
+    @Test func theStagedApiAgreesWithTheSingleSnapshotReport() throws {
+        let store = try IndexStore.inMemory()
+        let golden = "9f32a3b705ae1b18"
+        try insert(store, path: "/lib/a.jpg", content: "c1", image: "i1", kind: "k", phash: golden)
+        try insert(store, path: "/lib/b.jpg", content: "c2", image: "i1", kind: "k", phash: golden)
+        try insert(store, path: "/lib/c.jpg", content: "c3", image: "i2", kind: "k",
+                   phash: try flippingBits(golden, 5))
+        try insert(store, path: "/lib/d.cr2", content: "c4", image: nil,
+                   phash: try flippingBits(golden, 30))
+        try insert(store, path: "/lib/e.cr2", content: "c4", image: nil)
+
+        let finder = DuplicateFinder(store: store)
+        let report = try finder.report(for: everywhere)
+        let exact = try finder.exactGroups(for: everywhere)
+        let near = try finder.nearGroups(for: everywhere, excluding: exact)
+
+        #expect(report.exact == exact)
+        #expect(report.near == near.groups)
+        #expect(report.nearTierSkipped == near.skipped)
+        // Not vacuous: there is something in both tiers to disagree about.
+        #expect(report.exact.count == 2)
+        #expect(report.near.count == 1)
+    }
+
+    /// And they agree on the refusal, not only on the answer.
+    @Test func bothPathsReportTheSameSkippedCountAboveTheCeiling() throws {
+        let store = try IndexStore.inMemory()
+        let golden = "9f32a3b705ae1b18"
+        try insert(store, path: "/lib/a.jpg", content: "c1", image: "i1", kind: "k", phash: golden)
+        try insert(store, path: "/lib/b.jpg", content: "c2", image: "i2", kind: "k",
+                   phash: try flippingBits(golden, 2))
+        try insert(store, path: "/lib/c.jpg", content: "c3", image: "i3", kind: "k", phash: nil)
+
+        let finder = DuplicateFinder(store: store, nearTierCeiling: 1)
+        let report = try finder.report(for: everywhere)
+        let staged = try finder.nearGroups(for: everywhere, excluding: [])
+        // Two rows carry a phash; the third does not and must not be counted.
+        #expect(report.nearTierSkipped == 2)
+        #expect(staged.skipped == 2)
     }
 
     @Test func anEmptyLibraryReportsNoGroups() throws {

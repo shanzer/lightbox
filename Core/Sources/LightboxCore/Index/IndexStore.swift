@@ -619,22 +619,7 @@ public final class IndexStore: Sendable {
     /// duplicate deletion acts on.
     func duplicateCandidates(for query: SearchQuery) throws -> [FileRecord] {
         let filter = try QueryCompiler.compileFilter(query)
-        // One CTE, read three times, so the filter's parameters are bound once
-        // and the scope cannot drift between the grouping and the selection.
-        let sql = """
-            WITH scoped AS (SELECT * FROM files WHERE \(filter.sql))
-            SELECT * FROM scoped
-            WHERE (image_hash IS NOT NULL AND image_hash IN (
-                       SELECT image_hash FROM scoped WHERE image_hash IS NOT NULL
-                       GROUP BY image_hash HAVING count(*) > 1))
-               OR (image_hash IS NULL AND content_hash IS NOT NULL AND content_hash IN (
-                       SELECT content_hash FROM scoped
-                       WHERE image_hash IS NULL AND content_hash IS NOT NULL
-                       GROUP BY content_hash HAVING count(*) > 1))
-            """
-        return try pool.read { db in
-            try FileRecord.fetchAll(db, sql: sql, arguments: filter.arguments)
-        }
+        return try pool.read { db in try Self.fetchCandidates(db, filter) }
     }
 
     /// Just enough of every row in scope that carries a perceptual hash to
@@ -643,23 +628,21 @@ public final class IndexStore: Sendable {
     ///
     /// Deliberately not `[FileRecord]`. The near tier compares every pair in
     /// the scope, so it holds the whole scope in memory at once; four small
-    /// fields per row rather than twenty-two keeps that bounded, and the full
-    /// records are fetched afterwards for the handful of rows that matched.
+    /// fields per row rather than twenty-two keeps that affordable, and the
+    /// full records are fetched afterwards only for the rows that matched.
     func perceptualHashRows(for query: SearchQuery) throws -> [PerceptualHashRow] {
         let filter = try QueryCompiler.compileFilter(query)
-        let sql = """
-            SELECT id, name, path, phash FROM files
-            WHERE (\(filter.sql)) AND phash IS NOT NULL
-            """
-        return try pool.read { db in
-            try Row.fetchAll(db, sql: sql, arguments: filter.arguments).compactMap { row in
-                guard let id = row["id"] as Int64?, let phash = row["phash"] as String? else {
-                    return nil
-                }
-                return PerceptualHashRow(id: id, name: row["name"] as String? ?? "",
-                                         path: row["path"] as String? ?? "", phash: phash)
-            }
-        }
+        return try pool.read { db in try Self.fetchPerceptualHashRows(db, filter) }
+    }
+
+    /// How many rows in scope carry a perceptual hash.
+    ///
+    /// Exists so the near tier can apply its ceiling before fetching: the
+    /// ceiling bounds the pairwise scan's CPU, and fetching a million rows to
+    /// then refuse them would make it bound nothing at all.
+    func countPerceptualHashRows(for query: SearchQuery) throws -> Int {
+        let filter = try QueryCompiler.compileFilter(query)
+        return try pool.read { db in try Self.fetchPerceptualHashCount(db, filter) }
     }
 
     /// The full records for `ids`, in no particular order.
@@ -669,18 +652,105 @@ public final class IndexStore: Sendable {
     /// parameters in one statement.
     func records(ids: [Int64]) throws -> [FileRecord] {
         guard !ids.isEmpty else { return [] }
+        return try pool.read { db in try Self.fetchRecords(db, ids: ids) }
+    }
+
+    /// Everything one duplicate report reads, taken from a single snapshot.
+    ///
+    /// The reason this exists rather than three calls: the store is a WAL
+    /// `DatabasePool`, so every `pool.read` is its own snapshot, and a tier 1
+    /// pass writing between two of them can re-hash a row. The report would
+    /// then state a Hamming distance computed from a `phash` the record it
+    /// hands back no longer carries — a number attached to the wrong file, in
+    /// the one view whose output is a deletion. One snapshot makes that
+    /// impossible rather than unlikely.
+    ///
+    /// `body` receives the two row sets and a fetch for full records, all
+    /// bound to that snapshot, and does the grouping. It runs *inside* the read
+    /// transaction, so it holds a reader connection for as long as the pairwise
+    /// scan takes — bounded by `DuplicateFinder.nearTierCeiling` at a few
+    /// seconds. Under WAL a reader blocks no writer; it only defers WAL
+    /// checkpointing for that long, which is the right trade against reporting
+    /// a distance for bytes that have changed.
+    ///
+    /// `nearTierCeiling` is applied here, against a `COUNT(*)` taken before any
+    /// row is fetched, so an over-large scope costs one aggregate rather than
+    /// materialising rows the caller is about to refuse.
+    func withDuplicateScan<T>(for query: SearchQuery, nearTierCeiling ceiling: Int,
+                              _ body: (DuplicateScan, (_ ids: [Int64]) throws -> [FileRecord])
+                                  throws -> T) throws -> T {
+        let filter = try QueryCompiler.compileFilter(query)
         return try pool.read { db in
-            var out: [FileRecord] = []
-            out.reserveCapacity(ids.count)
-            for chunk in stride(from: 0, to: ids.count, by: Self.idChunkSize) {
-                let slice = Array(ids[chunk..<min(chunk + Self.idChunkSize, ids.count)])
-                let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
-                out += try FileRecord.fetchAll(
-                    db, sql: "SELECT * FROM files WHERE id IN (\(placeholders))",
-                    arguments: StatementArguments(slice))
-            }
-            return out
+            let candidates = try Self.fetchCandidates(db, filter)
+            let count = try Self.fetchPerceptualHashCount(db, filter)
+            let perceptual = count > ceiling
+                ? nil
+                : try Self.fetchPerceptualHashRows(db, filter)
+            let scan = DuplicateScan(candidates: candidates, perceptual: perceptual,
+                                     perceptualCount: count)
+            return try body(scan) { ids in try Self.fetchRecords(db, ids: ids) }
         }
+    }
+
+    // MARK: - Duplicate SQL
+
+    /// One CTE, read three times, so the filter's parameters are bound once and
+    /// the scope cannot drift between the grouping and the selection.
+    private static func candidatesSQL(_ filter: CompiledQuery) -> String {
+        """
+        WITH scoped AS (SELECT * FROM files WHERE \(filter.sql))
+        SELECT * FROM scoped
+        WHERE (image_hash IS NOT NULL AND image_hash IN (
+                   SELECT image_hash FROM scoped WHERE image_hash IS NOT NULL
+                   GROUP BY image_hash HAVING count(*) > 1))
+           OR (image_hash IS NULL AND content_hash IS NOT NULL AND content_hash IN (
+                   SELECT content_hash FROM scoped
+                   WHERE image_hash IS NULL AND content_hash IS NOT NULL
+                   GROUP BY content_hash HAVING count(*) > 1))
+        """
+    }
+
+    private static func fetchCandidates(_ db: Database,
+                                        _ filter: CompiledQuery) throws -> [FileRecord] {
+        try FileRecord.fetchAll(db, sql: candidatesSQL(filter), arguments: filter.arguments)
+    }
+
+    private static func fetchPerceptualHashRows(
+        _ db: Database, _ filter: CompiledQuery) throws -> [PerceptualHashRow] {
+        let sql = """
+            SELECT id, name, path, phash FROM files
+            WHERE (\(filter.sql)) AND phash IS NOT NULL
+            """
+        return try Row.fetchAll(db, sql: sql, arguments: filter.arguments).compactMap { row in
+            guard let id = row["id"] as Int64?, let phash = row["phash"] as String? else {
+                return nil
+            }
+            return PerceptualHashRow(id: id, name: row["name"] as String? ?? "",
+                                     path: row["path"] as String? ?? "", phash: phash)
+        }
+    }
+
+    /// The same predicate as `fetchPerceptualHashRows`, counted rather than
+    /// fetched, so the ceiling and the set it bounds cannot describe different
+    /// rows.
+    private static func fetchPerceptualHashCount(_ db: Database,
+                                                 _ filter: CompiledQuery) throws -> Int {
+        try Int.fetchOne(
+            db, sql: "SELECT count(*) FROM files WHERE (\(filter.sql)) AND phash IS NOT NULL",
+            arguments: filter.arguments) ?? 0
+    }
+
+    private static func fetchRecords(_ db: Database, ids: [Int64]) throws -> [FileRecord] {
+        var out: [FileRecord] = []
+        out.reserveCapacity(ids.count)
+        for chunk in stride(from: 0, to: ids.count, by: idChunkSize) {
+            let slice = Array(ids[chunk..<min(chunk + idChunkSize, ids.count)])
+            let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
+            out += try FileRecord.fetchAll(
+                db, sql: "SELECT * FROM files WHERE id IN (\(placeholders))",
+                arguments: StatementArguments(slice))
+        }
+        return out
     }
 
     /// Comfortably under SQLite's `SQLITE_MAX_VARIABLE_NUMBER`, which is 999 on

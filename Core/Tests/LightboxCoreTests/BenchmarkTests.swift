@@ -181,6 +181,9 @@ func measureDuplicateGroupingScaling() throws {
         // The planted exact groups, so a run that measured an empty store
         // cannot report a fast time and pass.
         #expect(result.exactGroups == rows / 100 - 1)
+        // Same for the near tier: a scan that examined no pairs would be very
+        // fast and completely uninformative.
+        #expect(result.nearGroups > 0)
         // The issue's budgets, at and inside the ceiling.
         if rows <= 100_000 {
             #expect(result.exactSeconds < 0.5)
@@ -198,8 +201,11 @@ func measureDuplicateGroupingScaling() throws {
 ///
 /// Release-only for the same reason as the scaling run above: the budgets are
 /// about the shipped app.
-@Test(.disabled(if: !benchmarksEnabled || isDebugBuild, releaseBenchmarkReason),
-      .disabled(if: !benchmarkLibraryPresent, missingLibraryReason))
+// Traits are evaluated in order, and the absent library is the more useful
+// thing to be told about: "make the fixture library" is actionable, "use
+// -c release" is not until there is something to measure.
+@Test(.disabled(if: !benchmarkLibraryPresent, missingLibraryReason),
+      .disabled(if: !benchmarksEnabled || isDebugBuild, releaseBenchmarkReason))
 func measureDuplicateGroupingOverTheFixtureLibrary() async throws {
     let temporary = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("lightbox-bench-dupes-\(UUID().uuidString)/index.sqlite")
