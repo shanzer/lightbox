@@ -474,7 +474,13 @@ fixed interval.
 
 Each logical field maps to a defined set of EXIF, IPTC, and XMP tags, and the
 mapping is documented in the code. Writing "description" to only one of the
-three produces a file that different readers disagree about.
+three produces a file that different readers disagree about. The sets are not
+hand-assembled: exiftool's **MWG composite tags** are its own implementation of
+the Metadata Working Group rules and already know which tags belong together,
+so the mapping delegates to them and hand-maps only what MWG does not cover —
+Label (`XMP-xmp:Label`, which has no MWG composite) and GPS (`GPS:*` plus
+`XMP-exif:*`, which disagree on representation: EXIF stores an unsigned
+magnitude and a hemisphere reference, XMP a signed decimal).
 
 Four deliberate constraints:
 
@@ -482,8 +488,9 @@ Four deliberate constraints:
    capture time without also writing `OffsetTimeOriginal` yields a timestamp
    that means something different on every machine. The editor requires the
    zone rather than assuming wall-clock is sufficient.
-2. **RAW gets a sidecar, not an in-place write.** JPEG, HEIC, TIFF, and PNG are
-   edited in place. RAW gets an `.xmp` sidecar, as Lightroom and Bridge do.
+2. **RAW gets a sidecar, not an in-place write.** Everything else — JPEG, HEIC,
+   TIFF, PNG, WebP — is edited in place. RAW gets an `<basename>.xmp` sidecar,
+   as Lightroom and Bridge do, and its container is never opened for writing.
    Writing into proprietary RAW containers is where files get corrupted.
 3. **Write, verify, then commit.** exiftool writes with its `_original` backup;
    the tag is re-read to confirm it took; only then is the backup removed. Any
