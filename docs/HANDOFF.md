@@ -112,7 +112,7 @@ cd ~/src/lightbox
 # Core: 610 tests, 76 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 77 tests.
+# App: builds the SwiftUI target and runs its 81 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -367,6 +367,22 @@ Eight things automated tests could not cover. **None done yet** as of the
    is remembered next time, ⌘⌫ with the grid focused, Delete Permanently naming
    the right count, and Stop After This Item on a batch long enough to catch it
    (the items already done stay done, and `op_journal` says so).
+
+   **Two of these are sheet *swaps*, and they are the part no test can reach.**
+   A `.sheet(item:)` asked for a new item while a sheet is up is the classic
+   macOS way to end up with no sheet at all and a model that believes one is
+   showing — here, a batch running with no progress indicator and no way to
+   cancel it. `BrowserModel.present(_:)` nils, yields, then presents; nothing in
+   an `xcodebuild test` run presents a real sheet, so collapsing that back to a
+   direct assignment leaves the whole suite green (measured). Both swaps have to
+   be watched by eye:
+   - **confirm-delete → progress.** Delete Permanently…, then Delete
+     Permanently in the sheet: the confirmation goes and the progress sheet
+     arrives. (The same swap as collisions → progress, which the Rename step
+     above already exercises.)
+   - **progress → summary.** A batch with a guaranteed failure — move a
+     selection into a folder you have `chmod -w`'d — so the progress sheet is
+     replaced by the summary rather than by nothing.
 7. **Cold folder open shows an empty grid** for the entire first index pass
    (~180 s at 50k). Known, ugly, deferred — the grid has no "indexing…" state.
 8. **A real index pass over the Seagate, under the new executors.** #28 moved

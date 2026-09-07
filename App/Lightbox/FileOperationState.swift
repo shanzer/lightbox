@@ -121,6 +121,17 @@ struct OperationSummary: Identifiable, Sendable {
     /// again. Nil for trash and delete, which need none.
     let destinationDirectory: URL?
     let results: [FileOperationResult]
+    /// Whether the user stopped the batch part way.
+    ///
+    /// **A clean cancel shows no sheet at all**, so this only ever reaches the
+    /// screen alongside a failure, where it explains why the counts do not add
+    /// up. That is deliberate and it is spec §11's rule read literally: the
+    /// summary reports what went wrong, and a cancel is the user getting what
+    /// they asked for. The progress sheet was on screen counting up until the
+    /// moment they pressed Stop, so nothing needs to tell them how far it got —
+    /// they watched it. Making a clean cancel present "12 of 300 moved" would
+    /// put a sheet in front of every deliberate stop, to be dismissed before
+    /// the window could be used again.
     let wasCancelled: Bool
     let failures: [Failure]
     /// Set when the batch never started — a destination that could not be read,

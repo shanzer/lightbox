@@ -387,6 +387,15 @@ final class BrowserModel {
         }
     }
 
+    /// Set from the click until `finish`, covering the stretch in which a
+    /// batch has been asked for but `batchProgress` has not been set yet —
+    /// `planAndRun` suspends in `FileOperator.plan` before `run` ever gets to
+    /// set it. Read through `isBatchRunning`, which is where the reasoning is.
+    ///
+    /// Assigned synchronously on the main actor and never across a suspension,
+    /// so nothing can observe it half-set.
+    var isBatchStarting = false
+
     /// The batch running in this window, or nil. One at a time: the commands
     /// are disabled while it is set, so two batches cannot interleave their
     /// index writes over the same rows.

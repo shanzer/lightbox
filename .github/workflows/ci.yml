@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-xcode
-      # Builds the SwiftUI target and runs its 77 tests. Unsigned by design
+      # Builds the SwiftUI target and runs its 81 tests. Unsigned by design
       # (CODE_SIGNING_ALLOWED=NO is in the project); nothing here needs a certificate.
       - name: xcodebuild test
         working-directory: App

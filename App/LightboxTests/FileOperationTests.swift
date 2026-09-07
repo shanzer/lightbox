@@ -38,6 +38,13 @@ private func emptyTrash(of store: IndexStore, batchID: String?) {
 
 private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
 
+/// Names the sheet on screen, for a failure message. `Comment` is not `String`,
+/// so a concatenated message will not compile — one interpolation, built here.
+@MainActor
+private func sheetDescription(_ model: BrowserModel) -> String {
+    model.activeSheet.map(\.id) ?? "no sheet"
+}
+
 // MARK: - The batch, end to end
 
 /// What the window does with a finished batch: update the grid, move the
@@ -150,40 +157,65 @@ struct FileOperationBatchTests {
         #expect(model.undoMenuTitle == "Undo Move 2 Items")
     }
 
-    /// A batch that failed puts the summary sheet up and hands it the reason.
+    /// A batch that failed puts the summary sheet up, hands it the reason, and
+    /// retries **only** the items that failed.
     ///
-    /// Staged by making the destination unwritable, which is the one failure a
-    /// temporary directory can produce on demand without a `Copying` seam —
-    /// `FileOperator`'s injection point is not reachable from here.
-    @Test func aFailedItemRaisesTheSummarySheetWithItsReason() async throws {
+    /// Two items, one of which cannot move: `library/locked` is `r-x`, and
+    /// removing a directory entry needs write permission on the *directory*, so
+    /// the `rename(2)` out of it fails while its sibling's succeeds. One file
+    /// would not do — a retry that re-ran the whole batch would look identical.
+    @Test func aFailedItemRaisesTheSummarySheetAndRetryTakesOnlyIt() async throws {
         let root = try tree.directory("library")
-        try tree.file("library/IMG_0001.jpg", bytes: 64)
-        let destination = try tree.directory("locked")
+        try tree.file("library/locked/IMG_LOCKED.jpg", bytes: 64)
+        try tree.file("library/free/IMG_FREE.jpg", bytes: 64)
+        let destination = try tree.directory("library/to")
         let store = try IndexStore.inMemory()
         let model = model(store)
 
         await model.open(root)
+        #expect(model.records.count == 2)
         model.selectAll()
-        try tree.chmod("locked", 0o500)
+        try tree.chmod("library/locked", 0o500)
         await model.beginBatch(.move, destination: destination)
 
         guard case .summary(let summary)? = model.activeSheet else {
-            Issue.record("no summary sheet after a failed batch: \(String(describing: model.activeSheet))")
+            Issue.record("no summary sheet after a failed batch: \(sheetDescription(model))")
             return
         }
+        #expect(summary.results.count == 2, "the summary describes the whole batch")
+        #expect(summary.completedCount == 1)
         #expect(summary.failures.count == 1)
         let failure = try #require(summary.failures.first)
-        #expect(failure.source.lastPathComponent == "IMG_0001.jpg")
+        #expect(failure.source.lastPathComponent == "IMG_LOCKED.jpg")
         #expect(!failure.reason.isEmpty)
         #expect(summary.canRetry)
         // The retry has to know where the batch was going, or "Retry Failed"
         // can only ever retry a trash.
         #expect(summary.destinationDirectory == destination)
+
+        // Retry Failed, with the directory still locked so it fails the same
+        // way. **`results.count == 1` is the assertion**: a retry that rebuilt
+        // the plan from the selection rather than from the failures would carry
+        // IMG_FREE along too — and IMG_FREE has already moved, so it would come
+        // back as a second, invented failure.
+        await model.retryFailedItems()
+        guard case .summary(let retried)? = model.activeSheet else {
+            Issue.record("no summary sheet after the retry: \(sheetDescription(model))")
+            return
+        }
+        #expect(retried.results.count == 1)
+        #expect(retried.failures.map(\.source.lastPathComponent) == ["IMG_LOCKED.jpg"])
     }
 
-    /// Nothing runs while nothing is selected, and nothing runs on top of a
-    /// batch already in flight.
-    @Test func theCommandsAreOffWithoutASelection() async throws {
+    /// Nothing runs while nothing is selected, while a batch is in flight, or
+    /// while a sheet is up.
+    ///
+    /// The last of those is not theoretical: a SwiftUI sheet is **not**
+    /// run-loop modal, so ⌘⌫ pressed over the collision sheet reaches the menu
+    /// and would start a trash batch, whose `run` overwrites `activeSheet` with
+    /// `.progress` — discarding the half-answered plan the user was part way
+    /// through, with no way back to it.
+    @Test func theCommandsAreOffWithoutASelectionDuringABatchAndUnderASheet() async throws {
         let root = try tree.directory("library")
         try tree.file("library/IMG_0001.jpg", bytes: 16)
         let store = try IndexStore.inMemory()
@@ -199,6 +231,185 @@ struct FileOperationBatchTests {
             #expect(model.isEnabled(command),
                     "\(command.title) is dead with a selection")
         }
+
+        // Assigned rather than raced into: what is under test is the rule, and
+        // a test that had to catch a real batch mid-flight to state it would be
+        // asserting on the scheduler. `cancellingABatchLeavesTheFinishedItems
+        // Done` drives the real thing.
+        model.batchProgress = BatchProgress(kind: .move, completed: 1, total: 9, current: nil)
+        for command in FileCommand.allCases {
+            #expect(!model.isEnabled(command),
+                    "\(command.title) is live while a batch is running")
+        }
+        model.batchProgress = nil
+
+        model.activeSheet = .confirmPermanentDelete(count: 1)
+        for command in FileCommand.allCases {
+            #expect(!model.isEnabled(command),
+                    "\(command.title) is live under a sheet; ⌘⌫ would discard it")
+        }
+        model.dismissSheet()
+        #expect(model.isEnabled(.trash), "dismissing the sheet did not re-arm the commands")
+    }
+
+    /// Delete Permanently asks first, and the question names the count.
+    @Test func permanentDeleteAsksFirstAndNamesTheCount() async throws {
+        let root = try tree.directory("library")
+        for index in 0..<3 { try tree.file("library/IMG_000\(index).jpg", bytes: 16) }
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+        await model.open(root)
+        model.selectAll()
+
+        model.confirmPermanentDelete()
+        guard case .confirmPermanentDelete(let count)? = model.activeSheet else {
+            Issue.record("Delete Permanently ran without asking: \(sheetDescription(model))")
+            return
+        }
+        #expect(count == model.selection.selected.count)
+        #expect(count == 3)
+        // Nothing has happened yet — the plan is only built once the user says
+        // yes, so the files are all still there.
+        #expect(model.records.count == 3)
+    }
+
+    /// A second click while the first batch is still planning must not start a
+    /// second batch over the same files.
+    ///
+    /// **The window is real and is not covered by `batchProgress`**: that is set
+    /// in `run`, which is on the far side of `await FileOperator.plan(...)`. Two
+    /// batches planned over the same sources both see them present; the first
+    /// moves them and the second reports every one as vanished.
+    @Test func aSecondClickWhileTheFirstIsStillPlanningStartsNothing() async throws {
+        let root = try tree.directory("library")
+        try tree.file("library/IMG_0001.jpg", bytes: 64)
+        let destination = try tree.directory("library/to")
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+
+        await model.open(root)
+        model.selectAll()
+
+        // Both are enqueued on the main actor before either runs; the second
+        // gets its turn while the first is suspended inside `plan`.
+        let first = Task { await model.beginBatch(.move, destination: destination) }
+        let second = Task { await model.beginBatch(.move, destination: destination) }
+        await first.value
+        await second.value
+
+        #expect(model.activeSheet == nil,
+                "a second batch ran and reported the first batch's files as vanished")
+        #expect(model.lastCompletedBatch?.completedCount == 1)
+        #expect(exists(destination.appendingPathComponent("IMG_0001.jpg")))
+    }
+
+    /// Cancel stops the batch after the item it is on, and everything already
+    /// finished stays finished — on disk and in the journal.
+    ///
+    /// Cancelled from the main actor as soon as the first progress report
+    /// lands, which is the same moment the user's click would arrive. The
+    /// deadline is there so a broken cancel fails the test rather than hanging
+    /// the suite.
+    @Test func cancellingABatchLeavesTheFinishedItemsDone() async throws {
+        let total = 300
+        let root = try tree.directory("library")
+        for index in 0..<total {
+            try tree.file(String(format: "library/from/IMG_%04d.jpg", index), bytes: 16)
+        }
+        let destination = try tree.directory("library/to")
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+
+        await model.open(root)
+        #expect(model.records.count == total)
+        model.selectAll()
+
+        let batch = Task { await model.beginBatch(.move, destination: destination) }
+        let deadline = Date().addingTimeInterval(10)
+        while (model.batchProgress?.completed ?? 0) < 1, Date() < deadline {
+            await Task.yield()
+        }
+        model.cancelBatch()
+        await batch.value
+
+        let batchID = try #require(model.lastCompletedBatch?.batchID,
+                                   "the cancelled batch completed nothing at all")
+        let done = try #require(model.lastCompletedBatch?.completedCount)
+        #expect(done > 0)
+        #expect(done < total,
+                "the batch finished before the cancel could land; raise `total`")
+
+        // The journal is the record, and it has to agree with the disk. Every
+        // item the batch finished is `complete`; the ones it never reached stay
+        // `in_flight`, which is exactly what #6's reconcile is built to settle.
+        let rows = try store.journalRows(batchID: batchID)
+        let complete = rows.filter { $0.state == .complete }
+        #expect(complete.count == done)
+        #expect(rows.contains { $0.state == .inFlight },
+                "a cancelled batch left no unreached rows, so nothing was cancelled")
+        for row in complete {
+            #expect(exists(URL(fileURLWithPath: row.dst ?? "")),
+                    "a row says complete but nothing is at \(row.dst ?? "nil")")
+        }
+    }
+
+    /// **Nothing runs until the collisions are answered**, and answering them
+    /// is what makes it run — spec §8's "no batch discovers a collision at file
+    /// 300", end to end through the model rather than over a synthetic plan.
+    ///
+    /// Three states, and the middle one is the point. `CollisionSheetTests`
+    /// proves the sheet turns a choice into the right plan; nothing proved the
+    /// window refuses to act on an unanswered one, so dropping either guard —
+    /// the `hasUnresolvedCollisions` branch in `planAndRun`, or
+    /// `isFullyResolved` in `continueWithResolvedPlan` — left the whole suite
+    /// green while the app moved a file the user had not agreed to move.
+    @Test func aCollisionStopsTheBatchUntilItIsAnswered() async throws {
+        let root = try tree.directory("library")
+        let source = try tree.file("library/from/a.jpg", bytes: 64)
+        let destination = try tree.directory("library/to")
+        try tree.file("library/to/a.jpg", bytes: 32)
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+
+        await model.open(root)
+        model.selection.selectAll(model.records.compactMap {
+            $0.path == source.path ? $0.id : nil
+        })
+        #expect(model.selection.selected.count == 1)
+
+        // 1. The sheet comes up and nothing has moved.
+        await model.beginBatch(.move, destination: destination)
+        guard case .collisions(let sheet)? = model.activeSheet else {
+            Issue.record("no collision sheet: \(sheetDescription(model))")
+            return
+        }
+        #expect(exists(source), "the file moved before anyone answered")
+        #expect(model.lastCompletedBatch == nil)
+        #expect(!sheet.isFullyResolved)
+
+        // 2. Continue with the question still open is a no-op. Not "runs and
+        //    fails": `FileOperator.execute` would throw `unresolvedCollisions`
+        //    and this window would put a summary sheet over the user's
+        //    half-answered one.
+        await model.continueWithResolvedPlan()
+        #expect(exists(source), "an unanswered plan was executed")
+        #expect(model.lastCompletedBatch == nil)
+        guard case .collisions? = model.activeSheet else {
+            Issue.record("the collision sheet was replaced by \(sheetDescription(model))")
+            return
+        }
+
+        // 3. Answered, it runs — and rename is what the answer said.
+        sheet.resolveAll(with: .rename)
+        #expect(sheet.isFullyResolved)
+        await model.continueWithResolvedPlan()
+
+        #expect(!exists(source))
+        #expect(exists(destination.appendingPathComponent("a 2.jpg")))
+        #expect(exists(destination.appendingPathComponent("a.jpg")),
+                "rename displaced the file it was supposed to leave alone")
+        #expect(model.lastCompletedBatch?.completedCount == 1)
+        #expect(model.activeSheet == nil)
     }
 
     /// The companion toggle is remembered, and it is what the plan is built

@@ -23,7 +23,15 @@ extension BrowserModel {
     // MARK: - Command availability
 
     /// Whether a batch is in flight in this window.
-    var isBatchRunning: Bool { batchProgress != nil }
+    ///
+    /// **Two flags, not one.** `batchProgress` is set in `run`, which is on the
+    /// far side of `await FileOperator.plan(...)`, so between the click and the
+    /// plan coming back there is a real window in which a second click sees
+    /// nothing running. Both batches then plan over the same sources — both see
+    /// them present — the first moves them, and the second reports every one of
+    /// the user's photos as vanished. `isBatchStarting` is set synchronously,
+    /// before the first suspension, and closes it.
+    var isBatchRunning: Bool { isBatchStarting || batchProgress != nil }
 
     /// Whether `command` can act right now.
     ///
@@ -35,7 +43,15 @@ extension BrowserModel {
         guard !selection.selected.isEmpty else { return false }
         // Not "queue it up": two batches interleaving index writes over the
         // same rows is the one thing the journal ordering cannot describe.
-        return !isBatchRunning
+        guard !isBatchRunning else { return false }
+        // **A SwiftUI sheet is not run-loop modal.** A menu key equivalent is
+        // matched by the menu bar whatever is on screen, so ⌘⌫ pressed over the
+        // collision sheet reaches this command and starts a trash batch — whose
+        // `run` overwrites `activeSheet` with `.progress`, discarding the
+        // half-answered plan behind it with no way back. The sheets are
+        // questions the window is waiting on; nothing else may act until one is
+        // answered.
+        return activeSheet == nil
     }
 
     /// The selected photos as file URLs, in display order.
@@ -60,9 +76,10 @@ extension BrowserModel {
     /// Plans `kind` over the current selection and either asks about the
     /// collisions or runs it.
     ///
-    /// Returns when the batch is over, so a caller — a test, or the sheet's
-    /// Continue button — can await the whole thing. The UI never blocks on it:
-    /// the menu commands start it in a detached `Task`.
+    /// Returns when the batch is over, or when the collision sheet has been
+    /// raised — those are the two ways this ends, and a caller awaiting it (a
+    /// test, or the sheet's Continue button) gets whichever happened. The UI
+    /// never blocks on it: the menu commands start it in a detached `Task`.
     func beginBatch(_ kind: FileOperationKind, destination: URL?) async {
         guard !isBatchRunning else { return }
         await planAndRun(kind: kind, sources: selectedURLs, destination: destination)
@@ -77,10 +94,9 @@ extension BrowserModel {
     /// Retry Failed: the same batch again, over the items that failed and
     /// nothing else.
     ///
-    /// Skips are deliberately not retried. A skip is either what the user asked
-    /// for at collision time, or a volume that went away — and retrying that in
-    /// the same breath fails the same way, at the same file, for the same
-    /// reason.
+    /// Skips are deliberately not retried — a skip is the user's own choice at
+    /// collision time, or a volume that has gone away, and neither is improved
+    /// by trying again in the same breath.
     func retryFailedItems() async {
         guard case .summary(let summary)? = activeSheet, summary.canRetry else { return }
         activeSheet = nil
@@ -106,6 +122,10 @@ extension BrowserModel {
     private func planAndRun(kind: FileOperationKind, sources: [URL],
                             destination: URL?) async {
         guard !sources.isEmpty else { return }
+        // Set here, synchronously, before the `await` below — see
+        // `isBatchRunning`. Cleared on every way out: the collision branch
+        // below, the catch, and `finish`.
+        isBatchStarting = true
         let op = fileOperator
         let companions = includeCompanions
         do {
@@ -115,15 +135,46 @@ extension BrowserModel {
             if plan.hasUnresolvedCollisions {
                 // Nothing runs until this sheet comes back resolved — spec §8's
                 // "no batch discovers a collision at file 300".
-                activeSheet = .collisions(CollisionSheetModel(plan: plan))
+                isBatchStarting = false
+                await present(.collisions(CollisionSheetModel(plan: plan)))
             } else {
                 await run(plan)
             }
         } catch {
-            activeSheet = .summary(OperationSummary(
+            isBatchStarting = false
+            await present(.summary(OperationSummary(
                 kind: kind, destinationDirectory: destination,
-                planningFailure: Self.describe(planningError: error)))
+                planningFailure: Self.describe(planningError: error))))
         }
+    }
+
+    // MARK: - Sheets
+
+    /// Puts `sheet` on screen, taking down whatever is there first.
+    ///
+    /// **A `.sheet(item:)` whose item changes identity while a sheet is up is
+    /// the classic macOS failure mode**: AppKit is still presenting the old one
+    /// when it is asked for the new one, and the window ends up with no sheet at
+    /// all while the model believes one is showing — which here would mean a
+    /// batch running with no progress indicator and no way to cancel it. Every
+    /// swap this file makes is one of those: confirm-delete → progress,
+    /// collisions → progress, progress → summary.
+    ///
+    /// Nil, yield, then present. The yield is what splits the two assignments
+    /// into two SwiftUI update transactions, so the framework sees a dismissal
+    /// and *then* a presentation rather than one identity change. It is the same
+    /// shape `retryFailedItems` gets for free by suspending between its nil and
+    /// its next sheet. `HANDOFF` §7.6 owes this a live check: nothing in an
+    /// `xcodebuild test` run presents a real sheet, so the model's state is all
+    /// a test here can see.
+    private func present(_ sheet: ActiveSheet?) async {
+        guard sheet != nil, activeSheet != nil else {
+            activeSheet = sheet
+            return
+        }
+        activeSheet = nil
+        await Task.yield()
+        activeSheet = sheet
     }
 
     // MARK: - Running
@@ -133,7 +184,7 @@ extension BrowserModel {
         let token = batchToken
         batchProgress = BatchProgress(kind: plan.kind, completed: 0,
                                       total: plan.items.count, current: nil)
-        activeSheet = .progress
+        await present(.progress)
 
         let op = fileOperator
         // Built here rather than inline in the `Task` below, so its `[weak
@@ -175,6 +226,7 @@ extension BrowserModel {
         batchToken += 1
         batchProgress = nil
         batchTask = nil
+        isBatchStarting = false
 
         let completed = results.filter(\.isCompleted)
         // A permanent delete is never remembered: nothing can undo it, and an
@@ -190,17 +242,18 @@ extension BrowserModel {
         follow(plan: plan, completed: completed)
 
         if let planningFailure {
-            activeSheet = .summary(OperationSummary(
+            await present(.summary(OperationSummary(
                 kind: plan.kind, destinationDirectory: plan.destinationDirectory,
-                planningFailure: planningFailure))
+                planningFailure: planningFailure)))
             return
         }
         let summary = OperationSummary(kind: plan.kind,
                                        destinationDirectory: plan.destinationDirectory,
                                        results: results, wasCancelled: cancelled)
         // Shown only when something failed. A batch that did what it was told
-        // does not need a sheet dismissed before the user can carry on.
-        activeSheet = summary.failures.isEmpty ? nil : .summary(summary)
+        // does not need a sheet dismissed before the user can carry on — and
+        // that includes a clean cancel; see `OperationSummary.wasCancelled`.
+        await present(summary.failures.isEmpty ? nil : .summary(summary))
     }
 
     /// What the selection means once the files have moved.

@@ -221,6 +221,15 @@ struct FileOperationCommands: View {
     /// Move To…, Copy To… and Delete Permanently… get none: each opens a panel
     /// or a sheet, and a shortcut on a permanent delete is a way to lose photos
     /// by mistyping.
+    ///
+    /// **⌘⌫ needs no focus gate, unlike ⌘A.** ⌘A has to offer the responder
+    /// chain first refusal because the search field wants it too — `selectAll:`
+    /// means one thing to a text field and another to the grid. Nothing in this
+    /// window answers ⌘⌫: `NSTextView` binds a plain ⌫, not the
+    /// command-modified form, so there is no second meaning to arbitrate. What
+    /// this command is gated on is state rather than focus — an empty
+    /// selection, a batch already running, or a sheet still waiting for an
+    /// answer — which is `BrowserModel.isEnabled(_:)`.
     private static func shortcut(for command: FileCommand) -> KeyboardShortcut? {
         command == .trash ? KeyboardShortcut(.delete, modifiers: .command) : nil
     }
