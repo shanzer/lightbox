@@ -116,6 +116,13 @@ extension IndexStore {
     static func apply(_ db: Database, mutations: [IndexMutation],
                       marks: [JournalMark]) throws -> Int {
         var applied = 0
+        // **Removals first, and it is load-bearing rather than tidy.** A
+        // `replace` retires the row of the file it overwrote before the row
+        // taking that path is written, or `UNIQUE(files.path)` refuses the
+        // second — and the launch-time reconcile leans on the same order, where
+        // one pass can carry a `.remove` of a row and a `.move` onto the path it
+        // just vacated. Both are one transaction, so "before" here means this
+        // loop, not an earlier call.
         for case .remove(let id, let path) in mutations {
             try db.execute(sql: "DELETE FROM files WHERE id = ? AND path = ?",
                            arguments: [id, path])

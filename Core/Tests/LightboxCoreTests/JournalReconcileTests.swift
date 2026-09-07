@@ -952,3 +952,181 @@ struct JournalReconcileDispositionTests {
         #expect(try rowState(store, opID) == "in_flight")
     }
 }
+
+// MARK: - Abandoning is atomic, and the next open finishes the job
+
+/// `.deferred` claims every row is still `in_flight`. That claim has to survive
+/// the write transaction, not just precede it: a check *outside* `pool.write`
+/// leaves the whole write — acquiring the writer behind a 5 s busy timeout,
+/// applying corrections computed from a snapshot up to `budget` old, and
+/// committing — happening after `init` has already returned and told its caller
+/// nothing landed.
+struct JournalReconcileAbandonTests {
+    /// The window is widened deterministically rather than raced: the seam runs
+    /// inside the transaction, after the corrections are staged and before the
+    /// commit, which is exactly the moment a real over-budget run is abandoned.
+    @Test func aRunAbandonedInsideItsWriteRollsBackAndTheNextOneFinishesIt() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try fixture.tree.directory("to")
+            .appendingPathComponent("IMG_0001.jpg")
+        let store = try fixture.open()
+        try index(source, into: store, contentHash: "content-abc")
+        try FileManager.default.moveItem(at: source, to: destination)
+        let opID = try journalRow(store, kind: "move", src: source, dst: destination)
+
+        let abandoned = LockBox<Bool>(false)
+        let report = try IndexStore.reconcileJournal(
+            in: store.pool, now: Date().timeIntervalSince1970,
+            isAbandoned: { abandoned.withLock { $0 } },
+            willCommit: { abandoned.withLock { $0 = true } })
+
+        #expect(report.disposition == .deferred)
+        // Nothing landed: not the mark, not the correction.
+        #expect(try rowState(store, opID) == "in_flight")
+        #expect(try store.record(atPath: destination.path) == nil)
+        #expect(try store.record(atPath: source.path)?.contentHash == "content-abc")
+
+        // **The retry path.** `in_flight` means "ask the filesystem", and the
+        // next open does exactly that — which is the whole reason abandoning is
+        // safe.
+        let second = try store.reconcileJournal()
+        #expect(second.disposition == .ran)
+        #expect(try rowState(store, opID) == "reconciled")
+        let row = try #require(try store.record(atPath: destination.path))
+        #expect(row.contentHash == "content-abc")
+    }
+
+    /// A reconcile that threw is not an empty journal, and the counts alone
+    /// cannot tell them apart — both are zeros.
+    @Test func aReconcileThatThrewSaysSoRatherThanLookingEmpty() throws {
+        let fixture = try ReconcileFixture()
+        let store = try fixture.open()
+        try journalRow(store, kind: "trash",
+                       src: try fixture.tree.file("lib/IMG_0001.jpg", bytes: 8))
+        try store.close()
+
+        let report = IndexStore.reconcileJournalAtOpen(in: store.pool)
+        guard case .failed = report.disposition else {
+            Issue.record("expected .failed, got \(report.disposition)")
+            return
+        }
+        #expect(report.examined == 0)
+    }
+}
+
+// MARK: - Identity across filesystems that do not keep nanoseconds
+
+struct JournalReconcileTimestampTests {
+    /// **The volume this app exists for is not APFS.** A library on an external
+    /// drive is routinely exFAT (10 ms modification times), FAT (2 s) or SMB,
+    /// and a `COPYFILE_ALL` onto one of those lands a destination whose mtime is
+    /// the source's, quantised. Requiring an exact match there fails identity on
+    /// the user's own file: the hashed source row is retired, no destination row
+    /// is written, and the report says `destinationDiffersFromTheSource` about a
+    /// perfectly good copy.
+    @Test func aDestinationWhoseMtimeWasQuantisedIsStillTheSameFile() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try fixture.tree.directory("to")
+            .appendingPathComponent("IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            let record = try index(source, into: store, contentHash: "content-abc")
+            try FileManager.default.copyItem(at: source, to: destination)
+            // What a FAT-family volume does to the copy's timestamp: floor it to
+            // the nearest two seconds.
+            let floored = (record.mtime / 2).rounded(.down) * 2
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: floored)],
+                ofItemAtPath: destination.path)
+            opID = try journalRow(store, kind: "copy", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(store.journalReconcileReport.conclusions[opID] == .happened)
+        let row = try #require(try store.record(atPath: destination.path))
+        #expect(row.width == 4000)
+        #expect(row.contentHash == nil)
+        // The source keeps everything.
+        #expect(try store.record(atPath: source.path)?.contentHash == "content-abc")
+    }
+
+    /// The tolerance is on the timestamp only. A stranger of a different length
+    /// is still a stranger however close its mtime.
+    @Test func aDifferentLengthIsNeverTheSameFileHoweverCloseTheTimestamp() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try fixture.tree.file("to/IMG_0001.jpg", bytes: 65)
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            let record = try index(source, into: store, contentHash: "content-abc")
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: record.mtime)],
+                ofItemAtPath: destination.path)
+            opID = try journalRow(store, kind: "copy", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(store.journalReconcileReport.conclusions[opID]
+                == .destinationDiffersFromTheSource)
+        #expect(try store.record(atPath: destination.path) == nil)
+    }
+}
+
+// MARK: - A pruned source row is not a mismatched destination
+
+/// `destinationDiffersFromTheSource` is a claim *about the user's file* — that
+/// what is at the destination is not what the row was about. Reporting it
+/// because there is no `files` row to compare against says something false and
+/// alarming about a file nothing is wrong with. "The index no longer has a row
+/// for the source" is an ordinary state: a walk pruned it while the app was shut.
+struct JournalReconcilePrunedSourceTests {
+    @Test func aMoveWhoseSourceRowWasPrunedIsReportedAsHappened() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try fixture.tree.directory("to")
+            .appendingPathComponent("IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.moveItem(at: source, to: destination)
+            // No row for `src` at all: nothing indexed it, or a walk pruned it.
+            opID = try journalRow(store, kind: "move", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(destination))
+        #expect(store.journalReconcileReport.conclusions[opID] == .happened)
+        #expect(try rowState(store, opID) == "reconciled")
+        #expect(try store.count() == 0)
+    }
+
+    /// The same for the both-paths-present row. The conclusion there is about
+    /// the *filesystem* — two files, one of them the copy leg's output — and a
+    /// missing index row does not change what is on disk.
+    @Test func aCrossVolumeMoveWhoseSourceRowWasPrunedStillReportsBothFiles() throws {
+        let fixture = try ReconcileFixture()
+        let source = try fixture.tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try fixture.tree.directory("to")
+            .appendingPathComponent("IMG_0001.jpg")
+        var opID: Int64 = 0
+        do {
+            let store = try fixture.open()
+            try FileManager.default.copyItem(at: source, to: destination)
+            opID = try journalRow(store, kind: "move", src: source, dst: destination)
+            try store.close()
+        }
+
+        let store = try fixture.open()
+        #expect(exists(source))
+        #expect(exists(destination))
+        #expect(store.journalReconcileReport.conclusions[opID] == .copyDoneDeleteNot)
+        #expect(try store.count() == 0)
+    }
+}

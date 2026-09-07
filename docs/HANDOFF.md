@@ -109,7 +109,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 596 tests, 72 suites.
+# Core: 602 tests, 75 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -163,7 +163,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 596 tests live. `App/` only wires it to views.
+where all the logic and all 602 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -636,11 +636,39 @@ all three are now done:
   the first window draws. The work goes to a dispatch queue and `init` waits on
   it for `IndexStore.reconcileBudget` (3 s; five thousand rows reconcile in
   about 0.19 s warm, so this only bites on a drive that has to spin up). Past
-  the budget the run is **abandoned before its write transaction**, so nothing
-  partial lands afterwards: every row stays `in_flight`, the report says
-  `.deferred`, and the next open tries again. `JournalReconcileDisposition` also
-  distinguishes a run that threw from an empty journal, which the counts alone
-  could not.
+  the budget the run is **abandoned, and the abandon is atomic with the write**:
+  the flag is read inside the transaction — on acquiring the writer and again
+  immediately before the commit — and leaves by throwing, which is the only
+  thing GRDB treats as a rollback. Checking merely *before* `pool.write` was not
+  enough, and was proven not to be: a deferred run still queued for the writer
+  behind the 5 s busy timeout and committed after `init` had returned saying
+  nothing landed, applying corrections from a snapshot up to `budget` old — and
+  `.insertCopy` goes through `upsertRow`'s `ON CONFLICT`, so one of those late
+  writes could overwrite a row a tier 0 pass had indexed properly in the
+  interim. Now every row stays `in_flight`, the report says `.deferred`, and the
+  next open finishes the job; that retry path has its own test.
+  `JournalReconcileDisposition` also distinguishes a run that threw from an
+  empty journal, which the counts alone could not.
+
+  **`destinationMatches` compares the timestamp with a tolerance and the length
+  without one**, because only one of the two is quantised by the filesystem.
+  "`copyfile` carries the times across" is an APFS sentence: measured against a
+  real `COPYFILE_ALL`, exFAT rounds a modification time to 10 ms and the FAT
+  family to 2 s, and SMB rounds either way. **Those are the ordinary volumes
+  here, not the exotic ones** — this app exists for a library on an external
+  drive — and an exact comparison failed identity on the user's own good copy,
+  retired the hashed source row, wrote no destination row, and reported
+  `destinationDiffersFromTheSource` about it. `destinationMtimeTolerance` is
+  2 s and symmetric; size stays exact, so a stranger still has to match byte for
+  byte in length *and* land within two seconds to be mistaken for the original.
+
+  **A missing `files` row for `src` is not a mismatched destination.** Both
+  `move` branches folded "no row to compare against" into
+  `destinationDiffersFromTheSource`, which is a claim *about the user's file*
+  made on the strength of an index row a walk had pruned. A pruned source row
+  now reports `happened` for the src-gone branch and `copyDoneDeleteNot` for the
+  both-present one — deliberately not `happened` there, because the source is
+  demonstrably still on disk — with no mutation either way.
 
   Two things worth knowing. **Undoing a trash leaves the restored photo without
   an index row** until the next tier 0 pass: the row was deleted when the file

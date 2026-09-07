@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 596 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 602 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 63 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -170,7 +170,12 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   is never re-read and its nulls would be permanent. Retention floors the age rule at one
   batch (`rn > 1`) for the same reason ⌘Z exists — 31 idle days must not eat the last
   batch. And the reconcile's `stat`s run off the calling thread on a bounded wait, because
-  the app opens its store on the main actor before the first window draws.
+  the app opens its store on the main actor before the first window draws — with the
+  abandon flag read **inside** the write transaction and left by throwing, since a check
+  merely before `pool.write` still commits after `init` has returned saying it did not.
+  The mtime half of the identity check carries a 2 s tolerance: "`copyfile` carries the
+  times across" is APFS-only, and exFAT/FAT/SMB quantise — which is every drive this app
+  is actually for. Size stays exact.
 - **`reconciled` is not `complete`, and undo knows the difference.** A `reconciled` row's
   outcome was reconstructed from two `stat`s after a crash, so `undoability(of:)` refuses
   the batch — as it refuses `in_flight` and `failed`. Only `skipped` is harmless enough to

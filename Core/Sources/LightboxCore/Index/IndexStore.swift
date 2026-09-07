@@ -116,10 +116,11 @@ public final class IndexStore: Sendable {
         // `BrowserModel(at:)`), the rows name whatever volume the library lives
         // on, and one `stat` on a spun-down external drive parks its thread for
         // seconds. `reconcileJournalAtOpen` hands the work to a dispatch queue
-        // and waits on it for `reconcileBudget`, then abandons it before its
-        // write. So this bounds how long a launch can block, and a run that
-        // outruns the bound leaves every row `in_flight` for the next open
-        // rather than landing half of itself afterwards.
+        // and waits on it for `reconcileBudget`, then abandons it — and the
+        // abandon is read inside the write transaction and left by throwing, so
+        // a run that outruns the bound rolls back rather than committing after
+        // this initializer has returned saying nothing landed. Every row stays
+        // `in_flight` for the next open.
         journalReconcileReport = Self.reconcileJournalAtOpen(in: pool)
     }
 
