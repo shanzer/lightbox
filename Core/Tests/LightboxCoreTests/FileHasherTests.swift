@@ -74,7 +74,9 @@ struct FileHasherTests {
     }
 
     @Test func leavesImageHashNilForFormatsWithoutAStableRule() throws {
-        for format in [Fixtures.Format.heic, .tiff] {
+        // HEIC left this list in issue #12: the exiftool round-trip experiment
+        // showed the primary item's extents survive, so it now has a rule.
+        for format in [Fixtures.Format.tiff] {
             let url = try Fixtures.writeImage(
                 to: tree.root.appendingPathComponent("x.\(format.ext)"), format: format)
             let hashes = try FileHasher().hashes(for: url, mediaType: mediaType(format.ext))

@@ -186,19 +186,35 @@ three, all computed in tier 1:
 - **`image_hash`** — SHA-256 over image data with format containers stripped, so
   writing EXIF does not invalidate it. The per-format rules were verified
   empirically against exiftool: JPEG uses a **segment denylist**, PNG a **chunk
-  denylist**, and WebP an **allowlist** — because exiftool inserts a VP8X chunk
-  that a denylist would not know to exclude. This asymmetry is deliberate;
-  don't "fix" it into symmetry.
+  denylist**, WebP an **allowlist** — because exiftool inserts a VP8X chunk that
+  a denylist would not know to exclude — and HEIC an **allowlist over the
+  primary item's `iloc` extents**, not over `mdat`. This asymmetry is
+  deliberate; don't "fix" it into symmetry.
 - **`phash`** — 64-bit DCT perceptual hash, for near-duplicates. Golden vectors
   in `PerceptualHashTests` were produced by running photolib's real
   `lib/phash.js`, so the two tools agree. Measured cross-tool divergence over
   36 real photos: 0–4 bits, mean 1.22, against a match threshold of 12.
+
+HEIC's rule has a trap of its own, measured in
+`docs/superpowers/notes/2026-09-07-heic-mdat-roundtrip.md` (issue #12). The
+obvious rule — "hash the `mdat` box" — is wrong: `Exif` and XMP live inside
+`mdat`, so its digest changed on all five files round-tripped through exiftool,
+and in two of them the box moved as well. The stable unit is the *primary
+item's* extents. Every HEIC in the library has a `grid` primary whose own
+extent is an eight-byte descriptor in `idat` with `construction_method == 1`,
+so the rule follows `pitm` → `dimg` → `iloc` and honours the construction
+method; a parser that ignored it would hash the file's first eight bytes and
+call every HEIC a duplicate of every other. Auxiliaries (gain map, depth map,
+mattes, thumbnail) and `ipco` are excluded on purpose.
 
 Two traps found the hard way, both now guarded and tested:
 - **Motion photos** (Pixel/Samsung append an MP4 after JPEG EOI) hash identically
   to their stripped stills under `image_hash`.
 - **Chunk-flood amplification**: a hostile 256 MB PNG drove 4.37 GB RSS; JPEG was
   22× worse. Fixed by coalescing ranges. Any new format parser needs the same.
+  HEIC needs more than coalescing: `iloc` can declare `offset_size == 0` and
+  65535 extents per item, so millions of non-coalescing ranges cost nothing on
+  disk. `HEICImageHash.maxExtents` caps the count outright.
 
 Hashes are written through `setHashes(for:)`, which **refuses** a write whose
 row no longer carries the path/size/mtime that was hashed. That guard is not

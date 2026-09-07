@@ -29,9 +29,9 @@ public protocol FileHashing: Sendable {
 /// first place, silently bypassing `ContentHasher`'s error handling.
 ///
 /// So the file is read once, by whichever of two routes fits it. A format with
-/// an image-hash rule (JPEG, PNG, WebP) is read whole through
+/// an image-hash rule (JPEG, PNG, WebP, HEIC) is read whole through
 /// `ContentHasher.readWholeFile` and both hashes come from that buffer; a
-/// format without one (RAW, PSD, HEIC, TIFF, GIF — which are the large ones) is
+/// format without one (RAW, PSD, TIFF, GIF — which are the large ones) is
 /// streamed for its content hash alone and gets `imageHash == nil`. Every
 /// failure stays catchable, and buffering is bounded to the formats that are
 /// small in practice, plus the `inMemoryLimit` backstop for the ones that
@@ -99,9 +99,10 @@ public struct FileHasher: FileHashing {
         case .jpeg: try JPEGImageHash.includedRanges(bytes)
         case .png: try PNGImageHash.includedRanges(bytes)
         case .webp: try WebPImageHash.includedRanges(bytes)
+        case .heic: try HEICImageHash.includedRanges(bytes)
         // Exhaustive rather than defaulted, so adding a `MediaKind` with an
         // image-hash rule fails to compile until it is routed here.
-        case .gif, .heic, .tiff, .raw, .psd:
+        case .gif, .tiff, .raw, .psd:
             throw HashError.malformed("no image-hash rule for \(kind)")
         }
     }
