@@ -1,0 +1,42 @@
+# Dependabot configuration.
+#
+# Scope note: this file governs ROUTINE version updates only. Alert-driven security PRs
+# come from the repo-level "Dependabot security updates" setting and deliberately ignore
+# most of what follows — they are never grouped, never counted against
+# open-pull-requests-limit, and always target the minimum patched version.
+version: 2
+updates:
+  # The one dependency: GRDB.swift, declared in Core/Package.swift. The App target pins the
+  # same revision through the xcodeproj's own Package.resolved, which Dependabot cannot
+  # read — so a GRDB bump PR from here also needs that file updated in the same branch
+  # (open the project in Xcode, or edit the resolved file by hand).
+  - package-ecosystem: swift
+    directory: /Core
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    labels:
+      - dependencies
+
+  # The workflows pin actions by commit SHA — the right call, because a tag is mutable and
+  # a compromised action tag is a supply-chain compromise of every build. The cost is that
+  # a pinned action never moves on its own. This ecosystem is what un-freezes them, and it
+  # rewrites both the SHA and the `# vX.Y.Z` comment beside it.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(actions)
+    labels:
+      - dependencies

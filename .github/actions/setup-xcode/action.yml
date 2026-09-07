@@ -1,0 +1,21 @@
+name: Setup Xcode
+description: Selects the newest Xcode 26.x on the runner image and prints the toolchain versions.
+
+# The Swift equivalent of the template's Node setup action: the toolchain choice lives in
+# exactly one place. Pinning the major (26) rather than an exact minor means the image
+# can retire 26.6 without breaking CI, while a jump to Xcode 27 stays a deliberate edit
+# here — `MACOSX_DEPLOYMENT_TARGET = 26.0` and `swift-tools-version: 6.2` both key off it.
+
+runs:
+  using: composite
+  steps:
+    - name: Select Xcode 26
+      shell: bash
+      run: |
+        set -euo pipefail
+        xcode="$(ls -d /Applications/Xcode_26.*.app | sort -V | tail -1)"
+        [[ -n "$xcode" ]] || { echo "no Xcode 26.x on this image" >&2; exit 1; }
+        sudo xcode-select -s "$xcode"
+        echo "Selected $xcode"
+        xcodebuild -version
+        swift --version

@@ -1,0 +1,21 @@
+[
+  { "name": "bug",             "description": "Something is broken against its own stated intent", "color": "d73a4a" },
+  { "name": "enhancement",     "description": "Works as designed; the design should change",       "color": "a2eeef" },
+  { "name": "documentation",   "description": "Documentation, or comments that drifted from code",  "color": "0075ca" },
+  { "name": "duplicate",       "description": "This issue or pull request already exists",          "color": "cfd3d7" },
+  { "name": "question",        "description": "Further information is requested",                   "color": "d876e3" },
+  { "name": "dependencies",    "description": "Dependency version updates",                         "color": "0366d6" },
+
+  { "name": "needs-triage",    "description": "Maintainer needs to evaluate this issue",            "color": "fbca04" },
+  { "name": "needs-info",      "description": "Waiting on reporter for more information",           "color": "d4c5f9" },
+  { "name": "ready-for-agent", "description": "Fully specified, ready for an AFK agent",            "color": "0e8a16" },
+  { "name": "ready-for-human", "description": "Requires human implementation",                      "color": "1d76db" },
+  { "name": "deferred",        "description": "Valid, but intentionally postponed",                 "color": "cccccc" },
+  { "name": "wontfix",         "description": "Will not be actioned",                               "color": "ffffff" },
+
+  { "name": "P0",              "description": "Blocker — fix before shipping anything",             "color": "b60205" },
+  { "name": "P1",              "description": "High severity",                                      "color": "d93f0b" },
+  { "name": "P2",              "description": "Medium severity",                                    "color": "fbca04" },
+  { "name": "P3",              "description": "Low severity",                                       "color": "0e8a16" },
+  { "name": "P4",              "description": "Note — informational / latent footgun",              "color": "c5def5" }
+]

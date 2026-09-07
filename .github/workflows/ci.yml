@@ -1,0 +1,43 @@
+name: CI
+
+# Runs the same two commands docs/HANDOFF.md §4 names for local verification, on a
+# GitHub-hosted Apple-silicon runner with the newest Xcode 26.x the image carries. The
+# project is macOS-only (`.macOS(.v26)`), so there is no Linux job to have.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege. A job that needs more should raise it on that job alone, never here.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded PR runs are pointless; every push to main gets a complete run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  core:
+    name: core tests
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-xcode
+      # 299 tests, 20 suites. Benchmarks are gated on LIGHTBOX_BENCH=1 and skip here.
+      - name: swift test
+        working-directory: Core
+        run: swift test
+
+  app:
+    name: app tests
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-xcode
+      # Builds the SwiftUI target and runs its 57 tests. Unsigned by design
+      # (CODE_SIGNING_ALLOWED=NO is in the project); nothing here needs a certificate.
+      - name: xcodebuild test
+        working-directory: App
+        run: xcodebuild -scheme Lightbox -destination 'platform=macOS' test
