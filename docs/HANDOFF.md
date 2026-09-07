@@ -205,7 +205,16 @@ extent is an eight-byte descriptor in `idat` with `construction_method == 1`,
 so the rule follows `pitm` → `dimg` → `iloc` and honours the construction
 method; a parser that ignored it would hash the file's first eight bytes and
 call every HEIC a duplicate of every other. Auxiliaries (gain map, depth map,
-mattes, thumbnail) and `ipco` are excluded on purpose.
+mattes, thumbnail) and `ipco` are excluded on purpose — the first three by
+consequence, since the rule follows `dimg` and never looks at a sibling image.
+
+The rule **fails closed**. If the primary item cannot be identified (no `iinf`,
+or no `infe` entry for it) or a derived primary does not resolve to distinct,
+non-derived coded items, HEIC gets no `image_hash` rather than a hash of the
+eight-byte layout descriptor — which is the same eight bytes for any two photos
+of a size, so the duplicate view would offer to delete unrelated pictures. Those
+files fall back to `content_hash`. Do not "improve" any of those branches into a
+default.
 
 Two traps found the hard way, both now guarded and tested:
 - **Motion photos** (Pixel/Samsung append an MP4 after JPEG EOI) *used to* hash

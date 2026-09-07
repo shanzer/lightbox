@@ -26,10 +26,15 @@ import Foundation
 /// honours `construction_method`: a parser that ignored it would hash the first
 /// eight bytes of the file and call every HEIC a duplicate of every other.
 ///
-/// Auxiliary images are deliberately excluded — the HDR gain map, the Portrait
-/// depth map and effects mattes, and the `thmb` thumbnail. Two files that are
-/// the same photograph with different auxiliaries must group together, and a
-/// gain map that Photos regenerates would otherwise split the group. `ipco`,
+/// Auxiliary images are excluded — the HDR gain map, the Portrait depth map and
+/// effects mattes, and the `thmb` thumbnail. Not by an exclusion list: none of
+/// those reference types is named anywhere below. They are excluded because the
+/// rule follows `dimg` out of the primary and looks at nothing else, so a
+/// sibling image is invisible to it whatever it is called — which also means a
+/// sibling type Apple invents next year needs no change here. That is the
+/// intended behaviour and not merely a convenient one: two files that are the
+/// same photograph with different auxiliaries must group together, and a gain
+/// map that Photos regenerates would otherwise split the group. `ipco`,
 /// which carries `hvcC`/`ispe`/`irot`/`colr`, is excluded for the same reason a
 /// sibling image must not move this hash — and because §11 has already ruled
 /// that an orientation-only difference hashes as identical.
@@ -241,13 +246,31 @@ enum HEICImageHash {
         }
 
         // 2. Resolve which items carry the primary image's coded data.
+        //
+        // The `dimg` targets are read before the primary's type is known, so
+        // that one pass over `iinf` can type the primary and its targets
+        // together. Reading them for a primary that turns out not to be derived
+        // costs one walk of `iref` and is discarded.
         let metaSpan = children(of: meta)
         let primary = try readPrimaryItemID(bytes, in: metaSpan)
-        let primaryType = try itemType(bytes, in: metaSpan, id: primary)
-        let codedIDs = try codedItemIDs(bytes, in: metaSpan,
-                                        primary: primary, primaryType: primaryType)
+        let targets = try dimgTargets(bytes, in: metaSpan, from: primary)
+        let types = try itemTypes(bytes, in: metaSpan, ids: Set(targets).union([primary]))
+
+        // Fail closed on an unknown type. Reading "no `infe` entry" as "not a
+        // derived item" would send an unidentifiable primary down the path that
+        // hashes its own extent — and if it is in fact a `grid`, that extent is
+        // an eight-byte layout descriptor identical for any two photographs of
+        // the same dimensions.
+        guard let primaryType = types[primary] else {
+            throw HashError.malformed("no iinf entry for primary item \(primary)")
+        }
+
+        let codedIDs: [Int]
         if derivedItemTypes.contains(primaryType) {
-            try validateCodedItems(bytes, in: metaSpan, ids: codedIDs, primary: primary)
+            try validateCodedItems(targets, primary: primary, types: types)
+            codedIDs = targets
+        } else {
+            codedIDs = [primary]
         }
 
         // 3. Read their extents out of `iloc`, in `dimg` order.
@@ -296,49 +319,15 @@ enum HEICImageHash {
         return try cursor.read(version == 0 ? 2 : 4)
     }
 
-    /// The `item_type` of one item, from the matching `infe` entry in `iinf`
-    /// (§8.11.6). Versions 0 and 1 of `infe` carry no item type at all — they
-    /// predate HEIF — so they report zero and are treated as non-derived.
-    private static func itemType(_ bytes: UnsafeRawBufferPointer,
-                                 in span: Range<Int>, id: Int) throws -> UInt32 {
-        guard let iinf = try findBox(bytes, type: iinfCode, in: span) else { return 0 }
-        var cursor = Cursor(bytes, at: iinf.contentStart, limit: iinf.end)
-        let version = try cursor.read(1)
-        try cursor.skip(3)
-        _ = try cursor.read(version == 0 ? 2 : 4)           // entry_count
-
-        var i = cursor.offset
-        while let entry = try readBox(bytes, at: i, limit: iinf.end) {
-            if entry.type == infeCode {
-                var e = Cursor(bytes, at: entry.contentStart, limit: entry.end)
-                let entryVersion = try e.read(1)
-                try e.skip(3)
-                if entryVersion >= 2 {
-                    let entryID = try e.read(entryVersion == 2 ? 2 : 4)
-                    try e.skip(2)                           // item_protection_index
-                    if entryID == id { return UInt32(try e.read(4)) }
-                }
-            }
-            guard entry.end > i else { throw HashError.malformed("zero-length infe at \(i)") }
-            i = entry.end
-        }
-        return 0
-    }
-
-    /// The items whose extents make up the primary image. A `grid`, `iovl` or
-    /// `iden` primary is a derived item: its own extent is a layout descriptor,
-    /// and its `dimg` reference names the coded items in assembly order.
+    /// The items a derived primary's `dimg` reference names, in assembly order,
+    /// or an empty list when there is no such reference.
     ///
-    /// A derived primary that cannot be resolved yields an empty list rather
-    /// than falling back to the primary itself. That fallback is not a
-    /// conservative default, it is a correctness bug: a `grid` item's own extent
-    /// is eight bytes of rows, columns and tile dimensions, so every photograph
-    /// of a given size would hash to the same value and the duplicate view would
-    /// offer to delete all but one of them.
-    private static func codedItemIDs(_ bytes: UnsafeRawBufferPointer,
-                                     in span: Range<Int>,
-                                     primary: Int, primaryType: UInt32) throws -> [Int] {
-        guard derivedItemTypes.contains(primaryType) else { return [primary] }
+    /// Empty rather than `[primary]`: falling back to the derived item itself is
+    /// not a conservative default but a correctness bug, because a `grid` item's
+    /// own extent is eight bytes of rows, columns and output size — the same
+    /// eight bytes for any two photographs of a given size.
+    private static func dimgTargets(_ bytes: UnsafeRawBufferPointer,
+                                    in span: Range<Int>, from primary: Int) throws -> [Int] {
         guard let iref = try findBox(bytes, type: irefCode, in: span) else { return [] }
 
         var cursor = Cursor(bytes, at: iref.contentStart, limit: iref.end)
@@ -365,14 +354,22 @@ enum HEICImageHash {
         return []
     }
 
-    /// The `item_type` of each of `ids`, in one pass over `iinf`.
+    /// The `item_type` of each of `ids`, in one pass over `iinf` (§8.11.6).
     ///
-    /// Separate from `itemType(_:in:id:)` because the per-id form would be
-    /// quadratic here: a flooded file names tens of thousands of tiles, and
-    /// re-walking `iinf` for each would be tens of thousands of walks.
+    /// One pass rather than one per id: a flooded file names tens of thousands
+    /// of tiles, and re-walking `iinf` for each would be quadratic.
+    ///
+    /// An id absent from the result has no `infe` entry, which every caller
+    /// treats as a reason to refuse. A `infe` of version 0 or 1 maps to zero:
+    /// those versions carry no `item_type` field at all, so an item described by
+    /// one cannot be a `grid` — the type is the field that would say so. They
+    /// predate HEIF, and reading them as non-derived is a statement about the
+    /// format, not a guess.
     private static func itemTypes(_ bytes: UnsafeRawBufferPointer,
                                   in span: Range<Int>, ids: Set<Int>) throws -> [Int: UInt32] {
-        guard let iinf = try findBox(bytes, type: iinfCode, in: span) else { return [:] }
+        guard let iinf = try findBox(bytes, type: iinfCode, in: span) else {
+            throw HashError.malformed("no iinf box")
+        }
         var cursor = Cursor(bytes, at: iinf.contentStart, limit: iinf.end)
         let version = try cursor.read(1)
         try cursor.skip(3)
@@ -389,6 +386,9 @@ enum HEICImageHash {
                     let entryID = try e.read(entryVersion == 2 ? 2 : 4)
                     try e.skip(2)                           // item_protection_index
                     if ids.contains(entryID) { types[entryID] = UInt32(try e.read(4)) }
+                } else {
+                    let entryID = try e.read(2)
+                    if ids.contains(entryID) { types[entryID] = 0 }
                 }
             }
             guard entry.end > i else { throw HashError.malformed("zero-length infe at \(i)") }
@@ -406,18 +406,18 @@ enum HEICImageHash {
     /// file exists to prevent. Rejecting instead means `FileHasher` records
     /// `imageHash == nil` and duplicate detection falls back to `content_hash`,
     /// which is merely less useful rather than wrong.
-    private static func validateCodedItems(_ bytes: UnsafeRawBufferPointer,
-                                           in span: Range<Int>,
-                                           ids: [Int], primary: Int) throws {
+    private static func validateCodedItems(_ ids: [Int], primary: Int,
+                                           types: [Int: UInt32]) throws {
         guard !ids.isEmpty else {
             throw HashError.malformed("derived primary item \(primary) resolves to no coded items")
         }
-        let types = try itemTypes(bytes, in: span, ids: Set(ids))
         for id in ids {
             guard id != primary else {
                 throw HashError.malformed("derived primary item \(primary) references itself")
             }
-            let type = types[id] ?? 0
+            guard let type = types[id] else {
+                throw HashError.malformed("no iinf entry for coded item \(id)")
+            }
             guard !derivedItemTypes.contains(type) else {
                 throw HashError.malformed(
                     "derived primary item \(primary) references derived item \(id)")
@@ -459,7 +459,7 @@ enum HEICImageHash {
         let baseOffsetSize = try validWidth(sizes2 >> 4, "base_offset_size")
         // `index_size` occupies the low nibble only from version 1 on; in
         // version 0 those bits are reserved and there is no extent index.
-        let indexSize = version == 0 ? 0 : sizes2 & 0x0F
+        let indexSize = version == 0 ? 0 : try validWidth(sizes2 & 0x0F, "index_size")
         let idWidth = version < 2 ? 2 : 4
         let itemCount = try cursor.read(version < 2 ? 2 : 4)
 

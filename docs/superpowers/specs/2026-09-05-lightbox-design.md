@@ -188,6 +188,13 @@ together. The measurement behind this — five real captures through an exiftool
 round-trip — is
 `docs/superpowers/notes/2026-09-07-heic-mdat-roundtrip.md`. The whole `mdat`
 box changed on every one of them, so the obvious rule would have been wrong.
+A HEIC whose primary item cannot be identified — no `iinf` box, or no `infe`
+entry for it — or whose derived primary does not resolve to distinct,
+non-derived coded items gets **no `image_hash` at all** rather than a hash of
+its layout descriptor: a `grid` descriptor is eight bytes of rows, columns and
+output size, identical for any two photographs of the same dimensions, so
+hashing it would group unrelated pictures as duplicates. Such files fall back to
+`content_hash` and `phash` like the formats below.
 
 **RAW, TIFF, PSD, GIF** — `image_hash` is NULL in version 1. TIFF and RAW are
 IFD-based with byte offsets that shift when metadata is written, so a stable

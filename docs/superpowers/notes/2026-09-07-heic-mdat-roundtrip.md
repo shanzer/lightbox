@@ -124,6 +124,15 @@ not metadata; dropping it would make a file carrying one hash identically to a
 file without it, and the duplicate view would then offer to delete the copy with
 the extra content.
 
+**The rule fails closed.** If the primary item cannot be identified — no `iinf`
+box, or no `infe` entry naming it — or if a derived primary does not resolve to
+coded items that are distinct from it and not themselves derived, the file gets
+no `image_hash` at all. The tempting fallback is to hash the primary item's own
+extent, and that is a bug rather than a default: a `grid` descriptor is eight
+bytes of rows, columns and output size, so two unrelated photographs of the same
+dimensions would land in one duplicate group. Those files fall back to
+`content_hash` and `phash`, which is less useful rather than wrong.
+
 `image_hash_kind` is **`heic-item-v1`**.
 
 ## Box listings

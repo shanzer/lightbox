@@ -57,6 +57,9 @@ private struct HEIFItem {
     /// `construction_method`: 0 = file offset, 1 = relative to `idat`,
     /// 2 = relative to another item (which this parser refuses).
     var construction: Int = 0
+    /// Declares the item in `iinf` but gives it no `iloc` entry and no bytes, so
+    /// it exists and has a type but cannot be located.
+    var omitFromILOC = false
 }
 
 /// Assembles a minimal but structurally valid HEIF item file.
@@ -71,6 +74,16 @@ private struct HEIFBuilder {
     /// Writes the `iloc` entries with `construction_method == 1` but leaves the
     /// `idat` box out, so there is nothing for them to be relative to.
     var omitIdat = false
+    /// Leaves the `iinf` box out entirely, so no item has a declared type.
+    var omitIinf = false
+    /// Overrides `iloc`'s first size byte (`offset_size << 4 | length_size`).
+    var ilocSizesByte: UInt8?
+    /// Written into every `iloc` entry's `data_reference_index`. Non-zero means
+    /// the item's bytes are in some other file.
+    var ilocDataReferenceIndex = 0
+    /// Added to each `dimg` entry's declared reference count without adding the
+    /// ids to match, so the list overruns its own box.
+    var dimgCountOverrun = 0
     /// Bytes appended after the last box.
     var trailer: [UInt8] = []
     var majorBrand = "heic"
@@ -96,12 +109,13 @@ private struct HEIFBuilder {
         }
         var iinfBody = Data(be(items.count, 2))
         iinfBody.append(infes)
-        let iinf = fullBox("iinf", version: 0, iinfBody)
+        let iinf = omitIinf ? Data() : fullBox("iinf", version: 0, iinfBody)
 
         var irefBody = Data()
         for (type, from, tos) in references {
             var body = Data(be(from, 2))
-            body.append(contentsOf: be(tos.count, 2))
+            let overrun = (type == "dimg") ? dimgCountOverrun : 0
+            body.append(contentsOf: be(tos.count + overrun, 2))
             for to in tos { body.append(contentsOf: be(to, 2)) }
             irefBody.append(box(type, body))
         }
@@ -110,23 +124,24 @@ private struct HEIFBuilder {
         // `idat` is derived rather than set by hand, and in the same item order
         // `makeILOC` walks — so a construction-1 item's declared offset and the
         // bytes actually sitting there cannot drift apart.
+        let located = items.filter { !$0.omitFromILOC }
         var idat: [UInt8] = []
-        for item in items where item.construction == 1 { idat.append(contentsOf: item.payload) }
+        for item in located where item.construction == 1 { idat.append(contentsOf: item.payload) }
         let idatBox = (idat.isEmpty || omitIdat) ? Data() : box("idat", Data(idat))
 
         // `iloc` must name absolute file offsets, which depend on how large
         // `iloc` itself is — so it is built once with placeholder offsets to
         // learn its length, then rebuilt with the real ones.
         func makeILOC(mdatStart: Int) -> Data {
-            var body = Data([0x44, 0x00])                   // offset_size 4, length_size 4,
+            var body = Data([ilocSizesByte ?? 0x44, 0x00])  // offset_size 4, length_size 4,
                                                             // base_offset_size 0, index_size 0
-            body.append(contentsOf: be(items.count, 2))
+            body.append(contentsOf: be(located.count, 2))
             var cursor = mdatStart
             var idatCursor = 0
-            for item in items {
+            for item in located {
                 body.append(contentsOf: be(item.id, 2))
                 body.append(contentsOf: be(item.construction, 2))
-                body.append(contentsOf: be(0, 2))           // data_reference_index
+                body.append(contentsOf: be(ilocDataReferenceIndex, 2))
                 body.append(contentsOf: be(1, 2))           // extent_count
                 if item.construction == 1 {
                     body.append(contentsOf: be(idatCursor, 4))
@@ -157,7 +172,7 @@ private struct HEIFBuilder {
         let meta = fullBox("meta", version: 0, metaBody)
 
         var mdatPayload = Data()
-        for item in items where item.construction == 0 {
+        for item in located where item.construction == 0 {
             mdatPayload.append(contentsOf: item.payload)
         }
         let mdat = box("mdat", mdatPayload)
@@ -280,7 +295,6 @@ struct HEICImageHashTests {
         // this cannot be passing by hashing the head of the file.
         let ranges = try heicRanges(data)
         #expect(ranges == [685..<17_268])
-        #expect(ranges[0].count == 16_583)
     }
 
     @Test func aDifferentImageChangesTheHash() throws {
@@ -327,7 +341,7 @@ struct HEICImageHashTests {
     }
 
     @Test func theExifItemDoesNotContributeToTheHash() throws {
-        var withExif = gridFixture()
+        let withExif = gridFixture()
         var withBiggerExif = gridFixture()
         withBiggerExif.items[withBiggerExif.items.count - 1].payload =
             Array("a completely different and much longer EXIF payload".utf8)
@@ -336,28 +350,23 @@ struct HEICImageHashTests {
         #expect(withExif.build().count != withBiggerExif.build().count)
     }
 
-    @Test func anAuxiliaryImageDoesNotContributeToTheHash() throws {
-        // The gain map, the depth map and the portrait mattes are `auxl` items
-        // that hang off the primary. Two files that are the same photograph
-        // with different auxiliaries must group together, so they are excluded.
+    /// `auxl` is how the HDR gain map, the Portrait depth map and the effects
+    /// mattes hang off the primary; `thmb` is the embedded thumbnail.
+    @Test(arguments: ["auxl", "thmb"])
+    func aSiblingImageDoesNotContributeToTheHash(referenceType: String) throws {
+        // Not because these reference types are on an exclusion list — they are
+        // not named anywhere in the rule. They are excluded because the rule
+        // follows `dimg` out of the primary and never looks at anything else, so
+        // a sibling image is invisible to it whatever it is called.
         let plain = gridFixture()
-        var withAux = gridFixture()
-        let auxID = 99
-        withAux.items.append(HEIFItem(id: auxID, type: "hvc1",
-                                      payload: Array(repeating: 0xAB, count: 64)))
-        withAux.references.append(("auxl", auxID, [withAux.primary]))
+        var withSibling = gridFixture()
+        let siblingID = 99
+        withSibling.items.append(HEIFItem(id: siblingID, type: "hvc1",
+                                          payload: Array(repeating: 0xAB, count: 64)))
+        withSibling.references.append((referenceType, siblingID, [withSibling.primary]))
 
-        #expect(try heicHash(plain.build()) == heicHash(withAux.build()))
-    }
-
-    @Test func aThumbnailItemDoesNotContributeToTheHash() throws {
-        let plain = gridFixture()
-        var withThumb = gridFixture()
-        withThumb.items.append(HEIFItem(id: 98, type: "hvc1",
-                                        payload: Array(repeating: 0xCD, count: 48)))
-        withThumb.references.append(("thmb", 98, [withThumb.primary]))
-
-        #expect(try heicHash(plain.build()) == heicHash(withThumb.build()))
+        #expect(withSibling.build().count > plain.build().count)
+        #expect(try heicHash(plain.build()) == heicHash(withSibling.build()))
     }
 
     @Test func reorderingTheGridTilesChangesTheHash() throws {
@@ -533,6 +542,89 @@ struct HEICImageHashTests {
         #expect(hashes.contentHash == (try ContentHasher().hash(url)))
     }
 
+    // MARK: - An unidentifiable primary
+
+    /// The same collision as the three above, reached through the other door.
+    /// If the primary's type cannot be read, treating "unknown" as "not derived"
+    /// sends it down the path that hashes its own extent — and if it really is a
+    /// `grid`, that extent is the eight-byte descriptor two different
+    /// photographs of the same size share.
+    @Test func aFileWithNoIinfBoxIsRefused() throws {
+        var b = gridFixture()
+        b.omitIinf = true
+        try expectUnresolvedDerivedPrimary(b, containing: "no iinf box")
+    }
+
+    @Test func aPrimaryItemWithNoIinfEntryIsRefused() throws {
+        var b = gridFixture()
+        b.primary = 4242                                    // declared by pitm, described nowhere
+        b.references[0] = ("dimg", 4242, [1, 2, 3])
+        try expectUnresolvedDerivedPrimary(b, containing: "no iinf entry for primary item 4242")
+    }
+
+    @Test func twoPicturesWithUnidentifiablePrimariesDoNotCollide() throws {
+        // The probe that found this: two files with different tiles, both
+        // missing `iinf`. Before failing closed they hashed the same eight
+        // bytes and came out equal.
+        var a = gridFixture(tileCount: 3, seed: 0)
+        var c = gridFixture(tileCount: 3, seed: 40)
+        #expect(try heicHash(a.build()) != heicHash(c.build()))   // different pictures
+        a.omitIinf = true
+        c.omitIinf = true
+        #expect(throws: HashError.self) { try heicRanges(a.build()) }
+        #expect(throws: HashError.self) { try heicRanges(c.build()) }
+    }
+
+    @Test func aCodedItemWithNoIinfEntryIsRefused() throws {
+        // The same reasoning one level down: a `dimg` target that cannot be
+        // typed might itself be a derived item, and following it would hash a
+        // layout descriptor.
+        var b = gridFixture()
+        b.references[0] = ("dimg", b.primary, [1, 2, 777])
+        try expectUnresolvedDerivedPrimary(b, containing: "no iinf entry for coded item 777")
+    }
+
+    // MARK: - iloc fields that must not be taken on trust
+
+    @Test func anExternalDataReferenceIsRefused() throws {
+        // A non-zero `data_reference_index` points into `dinf`/`dref`: the
+        // item's bytes are in another file. Treating the offset as local would
+        // hash whatever happened to sit at that position here.
+        var b = gridFixture()
+        b.ilocDataReferenceIndex = 1
+        let error = #expect(throws: HashError.self) { try heicRanges(b.build()) }
+        guard case .malformed(let message)? = error else {
+            Issue.record("expected a malformed error, got \(String(describing: error))")
+            return
+        }
+        #expect(message.contains("external data_reference_index"))
+    }
+
+    @Test func anIlocFieldWidthOutsideTheStandardIsRefused() throws {
+        // ISO/IEC 14496-12 permits only 0, 4 and 8. `0x63` asks for a six-byte
+        // offset and a three-byte length — arithmetic this parser has not
+        // reasoned about, and a way to make it read fields at the wrong stride.
+        var b = gridFixture()
+        b.ilocSizesByte = 0x63
+        let error = #expect(throws: HashError.self) { try heicRanges(b.build()) }
+        guard case .malformed(let message)? = error else {
+            Issue.record("expected a malformed error, got \(String(describing: error))")
+            return
+        }
+        #expect(message.contains("is not 0, 4 or 8"))
+    }
+
+    @Test func aDimgListThatOverrunsItsOwnBoxIsRefused() throws {
+        // `reference_count` says forty; only three ids follow. Bounding reads by
+        // the file rather than by the box would have this collect item ids out
+        // of whatever comes next — `iloc`, then `mdat`'s compressed bytes — and
+        // return a confident answer built from garbage.
+        var b = gridFixture()
+        b.dimgCountOverrun = 37
+        let error = #expect(throws: HashError.self) { try heicRanges(b.build()) }
+        #expect(error == .truncated)
+    }
+
     // MARK: - Amplification
 
     @Test func aGridOfManyAbuttingTilesCollapsesToOneRange() throws {
@@ -674,11 +766,13 @@ struct HEICImageHashTests {
     }
 
     @Test func heicRejectsAPrimaryItemWithNoLocation() throws {
-        // A well-formed container whose `pitm` names an item `iloc` does not
-        // describe has no image data to hash. Hashing nothing would make every
-        // such file a duplicate of every other one.
-        var b = gridFixture()
-        b.primary = 4242
+        // A well-formed container whose primary item is declared and typed but
+        // has no `iloc` entry has no image data to hash. Hashing nothing would
+        // make every such file a duplicate of every other one.
+        var b = HEIFBuilder()
+        b.items = [HEIFItem(id: 1, type: "hvc1", payload: tileBytes(1), omitFromILOC: true),
+                   HEIFItem(id: 2, type: "Exif", payload: Array("exif".utf8))]
+        b.primary = 1
         let error = #expect(throws: HashError.self) { try heicRanges(b.build()) }
         guard case .malformed(let message)? = error else {
             Issue.record("expected a malformed error, got \(String(describing: error))")
