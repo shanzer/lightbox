@@ -53,6 +53,16 @@ enum BlockingWork {
     static let runLabel = "com.lightbox.blocking-work"
 
     /// A serial queue suitable for an actor's `unownedExecutor`.
+    ///
+    /// The explicit `.userInitiated` is a *floor*, and it costs something worth
+    /// naming: a queue with a QoS of its own no longer propagates the calling
+    /// task's priority, so work enqueued by a `.background` caller runs at
+    /// user-initiated rather than in the background. That is acceptable here
+    /// because both actors that take this queue exist to serve a window the
+    /// user is looking at — a folder open and a metadata write — and neither is
+    /// ever driven from a background-priority task. It is not a licence to
+    /// reuse this for genuinely deprioritised work; such a caller wants its own
+    /// queue at its own QoS.
     static func serialQueue(_ label: String) -> DispatchSerialQueue {
         DispatchSerialQueue(label: label, qos: .userInitiated)
     }
@@ -60,6 +70,15 @@ enum BlockingWork {
     /// Concurrent, because the callers are a bounded fan-out that is *meant* to
     /// overlap — the hashing pass reads `concurrency` files at once. Blocked
     /// threads here are replaced by the workqueue, which is the entire point.
+    ///
+    /// Replaced up to a limit, though, and the limit is real: this targets a
+    /// non-overcommit root queue, and measuring it — 200 closures that block
+    /// until released — showed exactly 64 running concurrently and the rest
+    /// queued behind them. So this is not an escape from thread accounting, it
+    /// is a much larger and non-fatal budget: exceed 64 concurrently-blocked
+    /// closures and the surplus waits rather than deadlocking the process, but
+    /// it still waits. Callers must keep their fan-out well under that. Tier 1
+    /// uses `IndexCoordinator.concurrency`, which is 4.
     private static let queue = DispatchQueue(label: runLabel, qos: .userInitiated,
                                              attributes: .concurrent)
 

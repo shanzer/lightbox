@@ -272,7 +272,7 @@ row — which duplicate detection then deletes on.
 
 ## 7. Verify by hand on the mini
 
-Five things automated tests could not cover. **None done yet** as of the
+Six things automated tests could not cover. **None done yet** as of the
 2026-09-06 update. In rough priority:
 
 1. **Re-run the 50k benchmark.** All current numbers are Intel, and the choice of
@@ -314,6 +314,14 @@ Five things automated tests could not cover. **None done yet** as of the
    grid. Tests could only warn, never assert.
 5. **Cold folder open shows an empty grid** for the entire first index pass
    (~180 s at 50k). Known, ugly, deferred — the grid has no "indexing…" state.
+6. **A real index pass over the Seagate, under the new executors.** #28 moved
+   `IndexCoordinator` and `MetadataWriter` off the cooperative pool onto serial
+   dispatch queues of their own. `CooperativePoolTests` proves *where* the work
+   runs; it says nothing about the GUI path. Open a large folder on the external
+   drive, watch progress advance, then pause and resume tier 1 mid-pass and
+   confirm the counts pick up where they left off and the window stays
+   responsive throughout. Executor changes are exactly the kind that a unit
+   suite passes and a real window reveals.
 
 ## 8. Deferred, and what I'd do first in phase 2
 
