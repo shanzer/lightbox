@@ -2,8 +2,8 @@
 
 Written 2026-09-06 on the Intel iMac immediately before the move, and updated
 the same evening on the M4 mini after the move was verified. Phase 1 is
-complete and on `main` (57 commits, clean tree, single branch, **no git
-remote**). Everything below is what a session on the mini needs and cannot
+complete and on `main` (clean tree, single branch, remote `origin` =
+`github.com/shanzer/lightbox`, pushed 2026-09-06). Everything below is what a session on the mini needs and cannot
 recover from the code alone. §1–4 record the move and its verification; §5–9
 are the durable part.
 
@@ -43,7 +43,8 @@ commits, none touching `Core/.build`; working tree byte-identical to HEAD.
 **Every commit hash changed.** Hashes quoted anywhere written before the
 rewrite — the SDD ledger, the review-diff filenames under `.superpowers/sdd/`,
 the phase-1 plan's progress notes — no longer resolve. Match by commit message
-instead. The repo is now safe to push.
+instead. The rewritten history is what was pushed to `origin`, so the remote
+has never seen the Intel objects.
 
 ## 3. Environment
 
