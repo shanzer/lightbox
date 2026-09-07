@@ -109,7 +109,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 473 tests, 35 suites.
+# Core: 477 tests, 36 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -161,7 +161,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 473 tests live. `App/` only wires it to views.
+where all the logic and all 477 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|

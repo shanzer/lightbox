@@ -27,7 +27,7 @@ Requires Xcode 26 (Swift ≥ 6.2, macOS 26 SDK). The only dependency is GRDB.swi
 fetched on first build.
 
 ```bash
-cd Core && swift test                                                     # 473 tests
+cd Core && swift test                                                     # 477 tests
 cd App  && xcodebuild -scheme Lightbox -destination 'platform=macOS' test  # 63 tests
 ```
 
