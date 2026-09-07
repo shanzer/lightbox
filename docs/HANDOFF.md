@@ -1,67 +1,78 @@
 # Lightbox — handoff to the Mac mini
 
-Written 2026-09-06, on the Intel iMac, immediately before copying the tree to
-the M4 mini. Phase 1 is complete and merged to `main` (55 commits, clean tree,
-single branch, **no git remote**). Everything below is what the next session on
-the mini needs and cannot recover from the code alone.
+Written 2026-09-06 on the Intel iMac immediately before the move, and updated
+the same evening on the M4 mini after the move was verified. Phase 1 is
+complete and on `main` (57 commits, clean tree, single branch, **no git
+remote**). Everything below is what a session on the mini needs and cannot
+recover from the code alone. §1–4 record the move and its verification; §5–9
+are the durable part.
 
 ---
 
-## 1. Move it
+## 1. The move — done
 
-The tree is fully relocatable — the Xcode project references the Swift package
-as `relativePath = ../Core`, and nothing in tracked source hardcodes a machine
-path. Copy anywhere.
+The tree now lives at `~/src/lightbox` on the mini. The iMac copy at
+`/Volumes/Seagate Desktop/Pictures/tools/lightbox/` is the stale one.
 
-**Do not `cp -a` the whole directory.** `Core/.build` is 645 MB of *x86_64*
-objects (`Core/.build/x86_64-apple-macosx/…`) plus GRDB's checkout. It is
-git-ignored, useless on arm64, and SwiftPM will not always notice it is stale.
+For the record: the tree is fully relocatable (the Xcode project references the
+package as `relativePath = ../Core`; nothing hardcodes a machine path). The
+first copy attempt landed one level too deep, next to a stale mid-phase-1 copy
+that carried the 645 MB x86_64 `Core/.build`; that was deleted and the real
+tree moved up. `.git` was copied separately. The phase-1 SDD ledger
+(`.superpowers/sdd/2026-09-05-lightbox-phase-1/` — task briefs, reports,
+review diffs) was rescued from the stale copy; it is git-ignored, so it exists
+only on this machine.
 
-```bash
-# from the source machine
-rsync -a --exclude='.build/' --exclude='DerivedData/' --exclude='.superpowers/' \
-      "/Volumes/Seagate Desktop/Pictures/tools/lightbox/" \
-      /path/on/mini/lightbox/
-```
+Not copied, by design: `Core/.build`, Xcode's DerivedData, the
+`~/lightbox-bench` fixture library (regenerate it, §7.1), and the runtime index
+(`~/Library/Application Support/Lightbox/index.sqlite`).
 
-That moves ~336 MB, essentially all of it `.git` (see §2). Xcode's DerivedData
-lives outside the repo (`~/Library/Developer/Xcode/DerivedData/Lightbox-*`,
-919 MB here) and must not be copied.
+## 2. Git history — rewritten and repacked
 
-If you copy by another route and `.build` comes along: `rm -rf Core/.build`
-before the first build.
-
-## 2. Read this before you push it anywhere
-
-**The first commit accidentally committed `Core/.build`.** 3,421 objects,
-~330 MB of Intel `.o` files, module caches, and a vendored GRDB pack, in
-`5ad0724 feat: scaffold LightboxCore package`. The next commit,
-`10ca995 chore: ignore Swift build artifacts`, added the ignore and removed
-them — so they are absent from `HEAD` but permanent in history. Working tree
-source is ~500 KB; `.git` is 335 MB. Objects are all loose; it has never been
-gc'd.
-
-Right now this is free to fix: no remote, one branch, nobody else has a clone.
-The moment you push it to a forge it becomes expensive and rude to fix.
+The first commit had accidentally committed `Core/.build` (~330 MB of Intel
+objects); the next commit removed them from the tree but not from history. On
+2026-09-06, before any remote existed, this was fixed on the mini:
 
 ```bash
-git filter-repo --path Core/.build --invert-paths   # rewrites all 55 commits
+git filter-repo --path Core/.build --invert-paths --force
 git reflog expire --expire=now --all && git gc --prune=now --aggressive
 ```
 
-I did not run this — it rewrites every commit hash, and that is your call.
-Doing it on the mini after the copy is fine; doing it before saves 330 MB of
-transfer. If you skip it, at minimum `git gc` — loose objects pack down hard.
+Result: `.git` went from 323 MB of loose objects to ~540 KB in one pack; 57
+commits, none touching `Core/.build`; working tree byte-identical to HEAD.
+**Every commit hash changed.** Hashes quoted anywhere written before the
+rewrite — the SDD ledger, the review-diff filenames under `.superpowers/sdd/`,
+the phase-1 plan's progress notes — no longer resolve. Match by commit message
+instead. The repo is now safe to push.
 
 ## 3. Environment
 
-| | Intel iMac (built here) | Mac mini (verify) |
+| | Intel iMac (phase 1 built here) | M4 mini (phase 2 lives here) |
 |---|---|---|
-| macOS | 26.6.2 (25G83) | ≥ 26.0 — `MACOSX_DEPLOYMENT_TARGET = 26.0` |
-| Xcode | 26.5 (17F42), SDK 26.5 | ≥ 26.0 |
-| Swift | 6.3.2 | ≥ 6.2 — `Package.swift` is `swift-tools-version: 6.2` (needed for `.macOS(.v26)`) |
+| macOS | 26.6.2 (25G83) | 26.5.2 (25F84) — `MACOSX_DEPLOYMENT_TARGET = 26.0` |
+| Xcode | 26.5 (17F42), SDK 26.5 | 26.6 (17F113) |
+| Swift | 6.3.2 | 6.3.3 — `Package.swift` is `swift-tools-version: 6.2` (needed for `.macOS(.v26)`) |
 | arch | x86_64 | arm64 |
-| exiftool | 13.55 at `/usr/local/bin/exiftool` | **will be `/opt/homebrew/bin/exiftool`** |
+| exiftool | 13.55 at `/usr/local/bin/exiftool` | 13.55 at `/opt/homebrew/bin/exiftool` |
+| git-filter-repo | — | installed via Homebrew |
+
+Three one-time setup steps were needed on the mini before anything would build,
+all `sudo`, in this order:
+
+```bash
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer   # was pointing at CommandLineTools
+sudo xcodebuild -license accept
+sudo xcodebuild -runFirstLaunch     # otherwise xcodebuild cannot load its plug-ins (exit 70)
+```
+
+The Command Line Tools toolchain alone compiles `LightboxCore` but cannot build
+the tests — it ships no `Testing` module.
+
+**Swift 6.3.3 is stricter than 6.3.2 about expression complexity.** One test
+helper (`inserting(_:afterHeaderIn:)` in `WebPImageHashTests`) that compiled on
+the iMac failed with "unable to type-check this expression in reasonable time"
+and was split into named steps. Expect the same from any other dense
+bit-twiddling one-liner; the fix is always the same.
 
 The exiftool path change bites in **phase 2**, not now — phase 1 shells out to
 it nowhere. It was used during design to empirically verify the image-hash
@@ -70,35 +81,45 @@ binary via `PATH` or a configurable setting; do not hardcode either prefix.
 
 Sole dependency: **GRDB.swift 7.11.1**, pinned in
 `App/Lightbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
-(revision `b83108d`). First build needs network to fetch it.
+(revision `b83108d`). Fetched fine on the mini; a fresh build needs network.
 
 The app is built with `CODE_SIGNING_ALLOWED = NO`, `ENABLE_HARDENED_RUNTIME =
-NO`, no entitlements, no sandbox. On a new machine macOS will re-prompt for
-access to Desktop/Documents/Photos the first time you open a folder there, and
-because the binary is unsigned its TCC identity can reset across rebuilds — a
-repeat prompt is expected, not a bug.
+NO`, no entitlements, no sandbox. macOS will re-prompt for access to
+Desktop/Documents/Photos the first time you open a folder there, and because
+the binary is unsigned its TCC identity can reset across rebuilds — a repeat
+prompt is expected, not a bug.
 
 ## 4. Bootstrap and verify
 
 ```bash
-cd lightbox
+cd ~/src/lightbox
 
-# Core: 299 tests, 20 suites. Takes a few minutes — HashingPassTests alone
-# runs ~69s on Intel with no output. Silence is normal; do not kill it.
+# Core: 299 tests, 20 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 57 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
-Last verified on the merged `main` on Intel: **299 Core tests pass, 57 app
-tests pass, build succeeded.** Not yet verified on arm64 — that is the
-first thing to do on the mini, and a genuine test of the code, since several
-guards concern concurrency and one concerns `st_dev`.
+Verified on the mini, 2026-09-06, on the rewritten `main`:
 
-Runtime state is **not** in the repo and should not be copied:
-`~/Library/Application Support/Lightbox/index.sqlite`. Deleting it is always
-safe — the app detects a corrupt or missing index at launch and rebuilds.
+| | Intel iMac | M4 mini |
+|---|---|---|
+| Core | 299 pass, several minutes (`HashingPassTests` ~69 s silent) | **299 pass, 14.3 s** |
+| App | 57 pass | **57 pass, 3.0 s**, 1 warning |
+
+So the concurrency and `st_dev` guards now have a passing arm64 result. The one
+App warning is `selectAllPrefersAFocusedTextFieldOverTheGrid` in
+`MenuCommandTests` — the ⌘A test that can only warn, never assert (§7.4); same
+on both machines. The `linkd.autoShortcut` XPC errors that spam the App test
+log are macOS noise from the unsigned test host, not failures.
+
+The 10-minute-silence concern in §9 is moot for the plain suites on this
+hardware; it still applies to `LIGHTBOX_BENCH=1` runs.
+
+Runtime state is **not** in the repo: `~/Library/Application
+Support/Lightbox/index.sqlite`. Deleting it is always safe — the app detects a
+corrupt or missing index at launch and rebuilds.
 
 ## 5. What exists
 
@@ -164,7 +185,8 @@ row — which duplicate detection then deletes on.
 
 ## 7. Verify by hand on the mini
 
-Five things automated tests could not cover. In rough priority:
+Five things automated tests could not cover. **None done yet** as of the
+2026-09-06 update. In rough priority:
 
 1. **Re-run the 50k benchmark.** All current numbers are Intel, and the choice of
    `LazyVGrid` over an `NSCollectionView` bridge is provisional on them. The
