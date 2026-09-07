@@ -589,6 +589,104 @@ public final class IndexStore: Sendable {
         }
     }
 
+    // MARK: - Duplicates
+
+    /// Rows in `query`'s scope that share an `image_hash` with another row in
+    /// the same scope — or, where `image_hash` is NULL, a `content_hash`.
+    ///
+    /// The scope is `QueryCompiler.compileFilter`, the same boolean expression
+    /// the grid's `WHERE` is built from, so "duplicates in this folder" and
+    /// "duplicates in the whole library" are one code path with one set of
+    /// scoping bugs rather than two.
+    ///
+    /// The `image_hash IS NULL` arm is spec §11's fallback: RAW, TIFF, GIF and
+    /// PSD have no image-hash rule, so for those rows the only exact evidence
+    /// is the whole-file digest. It is written as a *separate* arm rather than
+    /// a `COALESCE(image_hash, content_hash)` key on purpose — coalescing would
+    /// let a JPEG's `content_hash` collide with a RAW's into one group, and the
+    /// two hashes are computed over different bytes, so equality between them
+    /// means nothing.
+    ///
+    /// The grouping is deliberately evaluated *inside* the scope, not over the
+    /// whole table: this answers "which files here are copies of each other",
+    /// which is the question the duplicate view acts on. (`.hasDuplicates` in
+    /// `QueryCompiler` asks the other question — "does this file have a twin
+    /// anywhere" — and is library-wide for that reason.)
+    ///
+    /// Read-only. Nothing here repairs a row: `setHashes(for:)` is what keeps
+    /// hashes attached to the file they were computed from, and a "fix it up
+    /// here" path would be a second, unguarded writer on exactly the data
+    /// duplicate deletion acts on.
+    func duplicateCandidates(for query: SearchQuery) throws -> [FileRecord] {
+        let filter = try QueryCompiler.compileFilter(query)
+        // One CTE, read three times, so the filter's parameters are bound once
+        // and the scope cannot drift between the grouping and the selection.
+        let sql = """
+            WITH scoped AS (SELECT * FROM files WHERE \(filter.sql))
+            SELECT * FROM scoped
+            WHERE (image_hash IS NOT NULL AND image_hash IN (
+                       SELECT image_hash FROM scoped WHERE image_hash IS NOT NULL
+                       GROUP BY image_hash HAVING count(*) > 1))
+               OR (image_hash IS NULL AND content_hash IS NOT NULL AND content_hash IN (
+                       SELECT content_hash FROM scoped
+                       WHERE image_hash IS NULL AND content_hash IS NOT NULL
+                       GROUP BY content_hash HAVING count(*) > 1))
+            """
+        return try pool.read { db in
+            try FileRecord.fetchAll(db, sql: sql, arguments: filter.arguments)
+        }
+    }
+
+    /// Just enough of every row in scope that carries a perceptual hash to
+    /// drive the near tier: its id, the two fields the ordering is defined on,
+    /// and the hash itself.
+    ///
+    /// Deliberately not `[FileRecord]`. The near tier compares every pair in
+    /// the scope, so it holds the whole scope in memory at once; four small
+    /// fields per row rather than twenty-two keeps that bounded, and the full
+    /// records are fetched afterwards for the handful of rows that matched.
+    func perceptualHashRows(for query: SearchQuery) throws -> [PerceptualHashRow] {
+        let filter = try QueryCompiler.compileFilter(query)
+        let sql = """
+            SELECT id, name, path, phash FROM files
+            WHERE (\(filter.sql)) AND phash IS NOT NULL
+            """
+        return try pool.read { db in
+            try Row.fetchAll(db, sql: sql, arguments: filter.arguments).compactMap { row in
+                guard let id = row["id"] as Int64?, let phash = row["phash"] as String? else {
+                    return nil
+                }
+                return PerceptualHashRow(id: id, name: row["name"] as String? ?? "",
+                                         path: row["path"] as String? ?? "", phash: phash)
+            }
+        }
+    }
+
+    /// The full records for `ids`, in no particular order.
+    ///
+    /// Chunked because the id list is as long as the near tier's match set,
+    /// which has no fixed bound, and SQLite caps the number of bound
+    /// parameters in one statement.
+    func records(ids: [Int64]) throws -> [FileRecord] {
+        guard !ids.isEmpty else { return [] }
+        return try pool.read { db in
+            var out: [FileRecord] = []
+            out.reserveCapacity(ids.count)
+            for chunk in stride(from: 0, to: ids.count, by: Self.idChunkSize) {
+                let slice = Array(ids[chunk..<min(chunk + Self.idChunkSize, ids.count)])
+                let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
+                out += try FileRecord.fetchAll(
+                    db, sql: "SELECT * FROM files WHERE id IN (\(placeholders))",
+                    arguments: StatementArguments(slice))
+            }
+            return out
+        }
+    }
+
+    /// Comfortably under SQLite's `SQLITE_MAX_VARIABLE_NUMBER`, which is 999 on
+    /// the oldest builds this could meet and 32766 on current ones.
+    private static let idChunkSize = 500
+
     public func search(_ query: SearchQuery) throws -> [FileRecord] {
         let compiled = try QueryCompiler.compile(query)
         return try pool.read { db in

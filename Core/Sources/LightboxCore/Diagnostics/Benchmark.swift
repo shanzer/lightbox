@@ -33,7 +33,54 @@ public struct BenchmarkResult: Sendable {
     public let peakResidentBytes: UInt64
 }
 
+/// Timings for one duplicate-grouping pass over a scope.
+///
+/// The two tiers are reported separately because they are budgeted separately
+/// and differ by an order of magnitude: the exact tier is a `GROUP BY` off the
+/// `image_hash` index, the near tier compares every pair of perceptual hashes
+/// in the scope. A single total would hide which one moved.
+public struct DuplicateBenchmarkResult: Sendable {
+    /// Rows the scope holds at all — the n the near tier is quadratic in.
+    public let scopeRows: Int
+    /// Rows in scope carrying a perceptual hash, which is what the near tier
+    /// actually compares.
+    public let perceptualRows: Int
+    public let exactSeconds: Double
+    public let nearSeconds: Double
+    public let exactGroups: Int
+    public let nearGroups: Int
+    /// Non-nil if the scope exceeded the ceiling and the near tier was refused,
+    /// in which case `nearSeconds` measures that refusal and nothing else.
+    public let nearTierSkipped: Int?
+}
+
 public enum Benchmark {
+    /// Times both duplicate tiers over an already-populated store.
+    ///
+    /// The tiers are run through the same public entry points a view would
+    /// use, one after the other, so the numbers describe the shipped path
+    /// rather than a benchmark-only shortcut.
+    public static func duplicateGrouping(
+        in store: IndexStore, query: SearchQuery,
+        nearTierCeiling: Int = DuplicateFinder.nearTierCeiling) throws -> DuplicateBenchmarkResult {
+        let finder = DuplicateFinder(store: store, nearTierCeiling: nearTierCeiling)
+
+        let exactStart = Date()
+        let exact = try finder.exactGroups(for: query)
+        let exactSeconds = Date().timeIntervalSince(exactStart)
+
+        let nearStart = Date()
+        let near = try finder.nearGroups(for: query, excluding: exact)
+        let nearSeconds = Date().timeIntervalSince(nearStart)
+
+        return DuplicateBenchmarkResult(
+            scopeRows: try store.search(query).count,
+            perceptualRows: try store.perceptualHashRows(for: query).count,
+            exactSeconds: exactSeconds, nearSeconds: nearSeconds,
+            exactGroups: exact.count, nearGroups: near.groups.count,
+            nearTierSkipped: near.skipped)
+    }
+
     /// Indexes `root` from an empty database and reports how long each stage
     /// took. Uses a temporary index so a run never disturbs the real one.
     public static func indexingPass(root: URL) async throws -> BenchmarkResult {
