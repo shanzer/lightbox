@@ -781,25 +781,28 @@ struct IndexStoreTests {
     /// otherwise wait for its own tier 1 hash batch — a `DatabaseQueue`
     /// serialises every access through one connection, whoever asked.
     ///
-    /// The probe write is one long statement rather than a held transaction
-    /// because `writeWithoutTransaction` is the only unwrapped write the store
-    /// exposes, and leaving a `BEGIN` dangling in it is exactly what GRDB's
-    /// `allowsUnsafeTransactions` forbids.
+    /// The write is *held* open across the timed read rather than raced
+    /// against a clock. An earlier version started a ~1 s recursive-CTE write,
+    /// slept 200 ms and asserted the probe had not finished yet; on a loaded
+    /// three-core CI runner (run 34140355843) the sleep resumed late, the probe
+    /// had already committed, and the timed read proved nothing. Here the
+    /// writer inserts, publishes `holding`, and then waits for `release` —
+    /// which the reader sets only after its `count()` has returned. "The write
+    /// was in flight during the read" is true by construction, so the only
+    /// load-bearing assertion left is the latency one.
+    ///
+    /// The hold has its own deadline: exceeding it sets `heldTooLong` and
+    /// returns, so a broken handshake is a red test rather than a hung suite.
     @Test func aReadDoesNotWaitForAWriteInFlightOnTheSameStore() async throws {
         let url = tree.root.appendingPathComponent("index.sqlite")
         let store = try IndexStore(url: url)
         try store.testExecute(sql: "CREATE TABLE slow_probe (x INTEGER)")
 
+        let holding = LockBox(false)
+        let release = LockBox(false)
         let finished = LockBox(false)
-        // Counted in the CTE and written once, rather than inserting millions
-        // of rows: the statement has to occupy the connection for about a
-        // second, not fill the temporary directory to prove it.
-        let probe = """
-            WITH RECURSIVE counter(i) AS (
-                SELECT 1 UNION ALL SELECT i + 1 FROM counter WHERE i < 12000000
-            )
-            INSERT INTO slow_probe (x) SELECT max(i) FROM counter
-            """
+        let heldTooLong = LockBox(false)
+
         // One read thrown away first. A pool opens its reader connections
         // lazily, so the first read of a store's life also pays for opening a
         // connection, reading the schema and preparing the statement — work
@@ -807,30 +810,56 @@ struct IndexStoreTests {
         // the timed region below.
         _ = try store.count()
 
-        // A plain thread, not a `Task`: the probe is a second of synchronous
-        // SQLite work, and parking a cooperative-pool thread on that starves
-        // every other suite running in parallel. Same reason
+        // A plain thread, not a `Task`: the writer parks for the whole hold,
+        // and blocking a cooperative-pool thread starves every other suite
+        // running in parallel. Same reason
         // `aWriteWaitsForAnotherConnectionsLockRatherThanFailingBusy` uses one.
         Thread.detachNewThread {
-            try? store.testExecute(sql: probe)
+            try? store.testWrite { db in
+                // The INSERT is what takes the write lock; an empty transaction
+                // would block nobody and prove nothing.
+                try db.execute(sql: "INSERT INTO slow_probe (x) VALUES (1)")
+                holding.withLock { $0 = true }
+                let giveUp = Date().addingTimeInterval(30)
+                while release.withLock({ !$0 }) {
+                    guard Date() < giveUp else {
+                        heldTooLong.withLock { $0 = true }
+                        return
+                    }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+            }
             finished.withLock { $0 = true }
         }
-        // Long enough that the write is certainly under way, short enough that
-        // it is certainly not done — the guard below checks the second half.
-        try await Task.sleep(for: .milliseconds(200))
 
-        let started = Date()
-        _ = try store.count()
-        let readTook = Date().timeIntervalSince(started)
-        let stillWriting = finished.withLock { !$0 }
+        // If the transaction never opens, the writer may still be parked on
+        // `release`; the join below has to run either way, or the suite unlinks
+        // `tree` under a live connection. `waitUntil` has already recorded the
+        // issue by then, so the failure is not lost.
+        var opened = true
+        do {
+            try await Self.waitUntil(holding, orFail: "the writer never opened its transaction",
+                                     timeout: .seconds(30))
+        } catch {
+            opened = false
+        }
 
-        #expect(stillWriting, "the probe write finished before the read; it proves nothing")
-        #expect(readTook < 0.05, "the read waited \(readTook)s for the in-flight write")
+        var readTook = 0.0
+        if opened {
+            let started = Date()
+            _ = try store.count()
+            readTook = Date().timeIntervalSince(started)
+        }
+        release.withLock { $0 = true }
 
-        // Joined rather than abandoned: the probe holds the store, and the
+        // Joined rather than abandoned: the writer holds the store, and the
         // store holds a file in `tree`, which the suite removes the moment this
         // returns. Polled rather than waited on, so nothing blocks here either.
         try await Self.waitUntil(finished, orFail: "the probe write never finished")
+
+        guard opened else { return }
+        #expect(heldTooLong.withLock { !$0 }, "the writer gave up waiting to be released")
+        #expect(readTook < 0.05, "the read waited \(readTook)s for the in-flight write")
     }
 
     /// A join that gave up.

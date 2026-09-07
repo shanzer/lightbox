@@ -939,6 +939,21 @@ public final class IndexStore: Sendable {
         try pool.writeWithoutTransaction { db in try db.execute(sql: sql, arguments: arguments) }
     }
 
+    /// One write transaction, held open for as long as `body` runs. The
+    /// difference from `testExecute` is *duration*: `testExecute` runs a single
+    /// statement and lets the writer connection go, which is no use to the test
+    /// that has to prove a read does not queue behind a write still in flight.
+    /// That test needs the transaction demonstrably open while it times its
+    /// read, and the only way to have that by construction rather than by
+    /// racing a clock is to let the test body decide when to commit.
+    ///
+    /// GRDB opens and commits the transaction around `body`, so this leaves no
+    /// dangling `BEGIN` on a pooled connection — the reason the test could not
+    /// simply reach for `testExecute`.
+    func testWrite(_ body: (Database) throws -> Void) throws {
+        try pool.write { db in try body(db) }
+    }
+
     /// Reads on one of the pool's *reader* connections, not the writer that
     /// `testExecute` uses, so a connection-scoped pragma set through one is not
     /// visible through the other. `journal_mode` is a property of the file and
