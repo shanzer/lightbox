@@ -90,7 +90,9 @@ together.
 `capture_offset`, `camera_make`, `camera_model`, `orientation`, `content_hash`,
 `image_hash`, `image_hash_kind`, `phash`, `hashed_at`, `indexed_at`.
 
-**`files_fts`** — FTS5 external-content table over `name` and `ocr_text`.
+**`files_fts`** — a standalone FTS5 table over `name` and `ocr_text`, not an
+external-content one: it stores its own copy of the text, keyed by `rowid` =
+`files.id`, and is kept in step by `upsert` and by the `files_ad` trigger.
 
 **`analysis`** — `file_id`, `ocr_text`, `text_coverage` (union area of OCR
 bounding boxes as a fraction of the frame), `top_labels` (JSON),
@@ -122,12 +124,19 @@ Two columns, because neither id is sufficient alone:
 
 **The matching rule for the reconcile's delete: a row is prunable if its
 `volume_uuid` equals the root's, or its `volume_uuid` is NULL and its `device`
-equals the root's `st_dev`.** The second clause is the pre-migration case, and
-it is also what a filesystem that publishes no UUID (SMB, some FAT) falls back
-to — such a root binds NULL, the first clause can never hold, and the rule is
-the `st_dev` comparison it was before v2. The tier 1 hashing pass guards its
-writes with the same identity, comparing the UUID where one exists and `st_dev`
-where it does not.
+equals the root's `st_dev`.** The second clause is the pre-migration case.
+
+A filesystem that publishes no UUID (SMB, some FAT) binds NULL, so the first
+clause cannot hold and the rule collapses to the `st_dev` comparison **for rows
+that carry no UUID; a row already stamped with one is never matched by a
+nameless root.** That asymmetry is the safe direction — a row naming a volume is
+making a claim a nameless root cannot answer — and it is why `volume_uuid` is
+only ever written through `COALESCE`, by both the stamp and the upsert: a pass
+whose UUID read came back nil refreshes `device` but must not erase an identity
+an earlier pass established, which would demote the row into the weaker case.
+
+The tier 1 hashing pass guards its writes with the same identity, comparing the
+UUID where one exists and `st_dev` where it does not.
 
 v2 adds the column nullable and backfills nothing: no row can name a UUID for a
 volume that may not be mounted. Each tier 0 pass instead stamps the rows whose

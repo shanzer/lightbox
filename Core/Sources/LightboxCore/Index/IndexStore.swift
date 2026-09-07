@@ -309,7 +309,11 @@ public final class IndexStore: Sendable {
                 ON CONFLICT(path) DO UPDATE SET
                     parent_dir=excluded.parent_dir, name=excluded.name, ext=excluded.ext,
                     size=excluded.size, mtime=excluded.mtime, device=excluded.device,
-                    inode=excluded.inode, volume_uuid=excluded.volume_uuid,
+                    inode=excluded.inode,
+                    -- Never back to NULL: see `setVolume(_:forPaths:)`. A pass
+                    -- whose volume published no UUID must not erase one an
+                    -- earlier pass established.
+                    volume_uuid = COALESCE(excluded.volume_uuid, files.volume_uuid),
                     width=excluded.width, height=excluded.height,
                     capture_time=excluded.capture_time, capture_offset=excluded.capture_offset,
                     camera_make=excluded.camera_make, camera_model=excluded.camera_model,
@@ -438,10 +442,20 @@ public final class IndexStore: Sendable {
                 args.append(contentsOf: slice.map { $0 as any DatabaseValueConvertible })
                 args.append(uuid)
                 args.append(volume.device)
+                // `COALESCE`, not a plain assignment. A nil UUID means "this
+                // filesystem published none", which is a different claim from
+                // "this file is not on the volume its row names" — and one pass
+                // whose resource-value read came back nil would otherwise wipe
+                // the identity off every row it walked and reinstate the replug
+                // bug. By the matching rule a NULL row is strictly *less*
+                // protected than a stamped one, so the wipe is a downgrade in
+                // both directions. `device` is refreshed unconditionally:
+                // `st_dev` is always readable, and a stale one is the thing
+                // this write exists to repair.
                 try db.execute(sql: """
-                    UPDATE files SET volume_uuid = ?, device = ?
+                    UPDATE files SET volume_uuid = COALESCE(?, volume_uuid), device = ?
                     WHERE path IN (\(placeholders))
-                      AND (volume_uuid IS NOT ? OR device <> ?)
+                      AND (volume_uuid IS NOT COALESCE(?, volume_uuid) OR device <> ?)
                     """, arguments: StatementArguments(args))
                 stamped += db.changesCount
             }
@@ -470,11 +484,18 @@ public final class IndexStore: Sendable {
     /// replugged drive still reconciles and a different filesystem handed the
     /// old `st_dev` still does not. The second is the pre-migration case: rows
     /// written before schema v2 carry no UUID, and matching them on `device`
-    /// is exactly the behaviour they were written under. A root that publishes
-    /// no UUID binds NULL for `onVolume`, which makes the first clause always
-    /// false (`volume_uuid = NULL` never holds) and leaves the whole rule as
-    /// the `device` comparison it was before — the intended fallback, not an
-    /// accident of SQL.
+    /// is exactly the behaviour they were written under.
+    ///
+    /// A root that publishes no UUID binds NULL for `onVolume`, which makes the
+    /// first clause unsatisfiable (`volume_uuid = NULL` never holds). The rule
+    /// then **collapses to the `device` comparison for rows that carry no
+    /// UUID; a row already stamped with one is never matched by a nameless
+    /// root.** That asymmetry is deliberate and is the safe direction: a row
+    /// that names a volume is making a claim a nameless root cannot answer, so
+    /// it is left alone rather than judged. It is also why `setVolume` and
+    /// `upsert` write `volume_uuid` through `COALESCE` and never back to NULL —
+    /// a stamped row must not be demoted into this weaker case by a single pass
+    /// whose resource-value read came back nil.
     @discardableResult
     public func deleteRows(under prefix: String, keeping: Set<String>,
                            onDevice device: Int64? = nil,

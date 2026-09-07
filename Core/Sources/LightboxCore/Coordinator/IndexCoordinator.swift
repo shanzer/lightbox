@@ -55,6 +55,11 @@ public actor IndexCoordinator {
     private let hasher: any FileHashing
     private let grayscale: any GrayscaleRendering
     private let concurrency: Int
+    /// How the volume answering at a path is read. Injected for the same reason
+    /// the walker and the metadata reader are: the guards below turn on a
+    /// *change* of volume between two moments in one pass, and a test cannot
+    /// stage that against the real filesystem without mounting something.
+    private let volumeReader: @Sendable (URL) -> VolumeIdentity?
 
     /// Set for the duration of a hashing batch, with the callers waiting to run
     /// one of their own. See the reentrancy note above.
@@ -67,13 +72,16 @@ public actor IndexCoordinator {
                 metadata: any MetadataReading = MetadataReader(),
                 hasher: any FileHashing = FileHasher(),
                 grayscale: any GrayscaleRendering = GrayscaleRenderer(),
-                concurrency: Int = 4) {
+                concurrency: Int = 4,
+                volumeReader: @escaping @Sendable (URL) -> VolumeIdentity?
+                    = { VolumeIdentity(ofDirectory: $0) }) {
         self.store = store
         self.walker = walker
         self.metadata = metadata
         self.hasher = hasher
         self.grayscale = grayscale
         self.concurrency = max(1, concurrency)
+        self.volumeReader = volumeReader
     }
 
     /// Walks `root`, re-reads whatever changed, and removes rows for files that
@@ -115,6 +123,27 @@ public actor IndexCoordinator {
         var progress = IndexProgress(phase: .walking)
         onProgress?(progress)
 
+        // The volume the walk is about to look at, captured *before* it starts
+        // and checked again after it finishes. Both halves are needed, and for
+        // different reasons.
+        //
+        // Capturing early is what makes the walk's results attributable. Every
+        // file the walk emits is on whatever was mounted here while it ran, and
+        // this is the only moment that is observable — read it afterwards and a
+        // volume swapped out mid-walk hands the identity of the *impostor* to
+        // rows that came off the real drive. Nothing would be deleted that pass,
+        // but the stamp would be permanent: a later pass on the real volume
+        // would no longer match those rows by UUID or by device, and they could
+        // never be pruned again. Ghosts, with no way back short of a rebuild.
+        //
+        // Re-checking afterwards is what makes them trustworthy. On a long pass
+        // the volume can go away or be replaced while the walk runs, and a
+        // reconcile is only evidence if the thing that answered at the start is
+        // still the thing answering at the end.
+        guard let volume = volumeReader(root) else {
+            throw IndexCoordinatorError.rootUnreadable(root.path)
+        }
+
         var entries: [WalkEntry] = []
         var unseen: [URL] = []
         walker.scan(root: root, options: WalkOptions(includeSubdirectories: recursive)) { event in
@@ -134,21 +163,6 @@ public actor IndexCoordinator {
         try Task.checkCancellation()
 
         if unseen.contains(where: { Self.isSamePath($0, root) }) {
-            throw IndexCoordinatorError.rootUnreadable(root.path)
-        }
-
-        // The volume every row this pass writes was seen on. Read once here,
-        // not per entry: the walk produced these files from this root, so they
-        // are on whatever is mounted here, and `volumeUUIDString` is a
-        // resource-value read there is no reason to pay 50,000 times.
-        //
-        // Read *again* below, immediately before the delete, and deliberately
-        // not reused from here: on a long pass the volume can go away while it
-        // runs, and the value the prune must be judged against is the one
-        // current at the moment of the delete. If the two disagree, the rows
-        // this pass wrote carry the old volume and the delete matches none of
-        // them — nothing is pruned, which is the safe direction.
-        guard let volume = VolumeIdentity(ofDirectory: root) else {
             throw IndexCoordinatorError.rootUnreadable(root.path)
         }
 
@@ -228,15 +242,6 @@ public actor IndexCoordinator {
             }
         }
 
-        // Backfill, and repair after a replug: a file the walk saw is on the
-        // volume that answered, whatever its row still says. Rows written
-        // before schema v2 carry no `volume_uuid` at all, and tier 0 does not
-        // re-upsert a file whose bytes are unchanged, so without this the
-        // column would stay NULL on an existing library forever. Ahead of the
-        // delete, so the very pass that stamps a row is also the one that may
-        // then reconcile it.
-        try store.setVolume(volume, forPaths: walkedPaths)
-
         // Completeness is not enough on its own: a root can enumerate perfectly
         // and still be the wrong filesystem. A stale mount point left behind, a
         // network share that mounts empty, a drive that comes back with a fresh
@@ -244,12 +249,25 @@ public actor IndexCoordinator {
         // walk reports a clean, complete, zero-entry pass. The index already
         // knows which volume each row came from, so it can tell the difference.
         //
-        // Re-stat here rather than reusing the identity read before the loop:
-        // on a long pass the volume can go away while it runs, and the value
-        // that must be trusted is the one current at the moment of the delete.
-        guard let currentVolume = VolumeIdentity(ofDirectory: root) else {
+        // The pair, not either alone: the walk's results describe `volume`, and
+        // they may only be written down if `current` is still that same volume.
+        // A mismatch means something was swapped underneath the pass, and every
+        // conclusion it reached is about a filesystem that is no longer here —
+        // so neither the stamp nor the delete may proceed. Both are gated on
+        // this, and both then use `current`, which is the identity the next
+        // pass will present.
+        guard let current = volumeReader(root), volume.matches(current) else {
             throw IndexCoordinatorError.rootUnreadable(root.path)
         }
+
+        // Backfill, and repair after a replug: a file the walk saw is on the
+        // volume that answered, whatever its row still says. Rows written
+        // before schema v2 carry no `volume_uuid` at all, and tier 0 does not
+        // re-upsert a file whose bytes are unchanged, so without this the
+        // column would stay NULL on an existing library forever. Ahead of the
+        // delete, so the very pass that stamps a row is also the one that may
+        // then reconcile it.
+        try store.setVolume(current, forPaths: walkedPaths)
 
         // Reconcile: rows for files that are no longer on disk. Scoped to what
         // this scan actually looked at — a non-recursive scan never saw the
@@ -258,10 +276,10 @@ public actor IndexCoordinator {
         // matching rule spelled out on `deleteRows`.
         if recursive {
             try store.deleteRows(under: root.path, keeping: livePaths,
-                                 onDevice: currentVolume.device, onVolume: currentVolume.uuid)
+                                 onDevice: current.device, onVolume: current.uuid)
         } else {
             try store.deleteRows(inFolder: root.path, keeping: livePaths,
-                                 onDevice: currentVolume.device, onVolume: currentVolume.uuid)
+                                 onDevice: current.device, onVolume: current.uuid)
         }
 
         progress.phase = .finished
@@ -316,7 +334,7 @@ public actor IndexCoordinator {
     public func runHashingPass(root: URL,
                                onProgress: (@Sendable (IndexProgress) -> Void)? = nil)
         async throws -> IndexProgress {
-        guard let volume = VolumeIdentity(ofDirectory: root) else {
+        guard let volume = volumeReader(root) else {
             throw IndexCoordinatorError.rootUnreadable(root.path)
         }
 
@@ -368,7 +386,7 @@ public actor IndexCoordinator {
         await acquireHashingGate()
         defer { releaseHashingGate() }
 
-        try Self.checkStillMounted(root, volume: volume)
+        try checkStillMounted(root, volume: volume)
 
         var outcome = BatchOutcome()
         // `id` is a rowid alias, so in practice it is never NULL; the filter is
@@ -409,7 +427,7 @@ public actor IndexCoordinator {
         // The batch is hashed; nothing is recorded yet. If the volume left
         // while that ran, none of these outcomes is evidence about anything —
         // and writing them would mark the files attempted forever.
-        try Self.checkStillMounted(root, volume: volume)
+        try checkStillMounted(root, volume: volume)
 
         let now = Date().timeIntervalSince1970
         for result in results {
@@ -472,8 +490,8 @@ public actor IndexCoordinator {
     /// started against. A missing root and a root on a different filesystem are
     /// the same thing here: the pass is about to record facts about files it
     /// cannot see.
-    private static func checkStillMounted(_ root: URL, volume: VolumeIdentity) throws {
-        guard let current = VolumeIdentity(ofDirectory: root), volume.matches(current) else {
+    private func checkStillMounted(_ root: URL, volume: VolumeIdentity) throws {
+        guard let current = volumeReader(root), volume.matches(current) else {
             throw IndexCoordinatorError.rootUnreadable(root.path)
         }
     }

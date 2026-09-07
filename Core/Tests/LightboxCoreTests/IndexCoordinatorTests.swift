@@ -47,6 +47,21 @@ private func makeCoordinator(_ store: IndexStore,
                      hasher: StubHasher(), grayscale: StubGrayscale(), concurrency: 4)
 }
 
+/// A coordinator that sees a different volume on each read, so a test can stage
+/// a swap underneath a pass. The last entry repeats, so a caller only says what
+/// changes. Mounting a second filesystem is the only other way to produce a
+/// genuine mid-pass change of volume, and that is not something a unit test on
+/// a CI runner should be doing.
+private func makeCoordinatorSeeing(_ store: IndexStore,
+                                   volumes: [VolumeIdentity?]) -> IndexCoordinator {
+    let remaining = LockBox(volumes)
+    return IndexCoordinator(store: store, walker: Walker(), metadata: StubMetadataReader(),
+                            hasher: StubHasher(), grayscale: StubGrayscale(), concurrency: 4,
+                            volumeReader: { _ in
+        remaining.withLock { $0.count > 1 ? $0.removeFirst() : $0.first ?? nil }
+    })
+}
+
 /// A row for a file the coordinator never walked, so a test can plant an index
 /// that predates the current mount. The volume identity is the point of it.
 private func plantedRecord(path: String, device: Int64,
@@ -478,6 +493,51 @@ struct IndexCoordinatorTests {
             #expect(row.device != foreignDevice)   // the stale mount id is refreshed with it
         }
         try store.close()
+    }
+
+    /// A volume swapped out *while the walk runs*. The pass then holds results
+    /// gathered from one filesystem and a root answered by another, and neither
+    /// of its two writes may proceed.
+    ///
+    /// The delete is the obvious one. The stamp is the dangerous one: it would
+    /// brand every row the walk produced — real files, off the real drive —
+    /// with the impostor's identity. Nothing would be deleted that pass, and
+    /// the damage would be silent and permanent, because a later pass on the
+    /// real volume would then match those rows by neither UUID nor device and
+    /// could never prune them again. Ghosts with no way back but a rebuild.
+    @Test func aVolumeSwappedDuringTheWalkStampsNothingAndDeletesNothing() async throws {
+        let doomed = try tree.file("gone.jpg")
+        try tree.file("stays.jpg")
+        let store = try IndexStore.inMemory()
+        let real = VolumeIdentity(device: 16, uuid: "REAL-VOLUME")
+        let impostor = VolumeIdentity(device: 16, uuid: "IMPOSTOR")
+
+        // A clean pass first, so the rows carry the real volume's identity.
+        _ = try await makeCoordinatorSeeing(store, volumes: [real])
+            .indexTier0(root: tree.root, recursive: true, onProgress: nil)
+        #expect(try store.count() == 2)
+        #expect(try store.record(atPath: path("stays.jpg"))?.volumeUUID == "REAL-VOLUME")
+
+        // Now the swap: the walk starts on the real volume and finishes with
+        // the impostor answering. A file really did vanish, so a pass that
+        // trusted itself would prune it.
+        try FileManager.default.removeItem(at: doomed)
+        let swapped = makeCoordinatorSeeing(store, volumes: [real, impostor])
+        await #expect(throws: IndexCoordinatorError.rootUnreadable(tree.root.path)) {
+            try await swapped.indexTier0(root: tree.root, recursive: true, onProgress: nil)
+        }
+
+        #expect(try store.count() == 2)                                    // nothing deleted
+        for name in ["gone.jpg", "stays.jpg"] {                            // nothing re-stamped
+            #expect(try store.record(atPath: path(name))?.volumeUUID == "REAL-VOLUME")
+        }
+
+        // And the proof that the guard, not a broken fixture, is what stopped
+        // it: the same pass on a stable volume prunes the row.
+        _ = try await makeCoordinatorSeeing(store, volumes: [real])
+            .indexTier0(root: tree.root, recursive: true, onProgress: nil)
+        #expect(try store.record(atPath: doomed.path) == nil)
+        #expect(try store.count() == 1)
     }
 
     /// The sharper form of the test above, and the one `st_dev` alone cannot

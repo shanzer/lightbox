@@ -113,8 +113,11 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   schema v2 the identity is `files.volume_uuid` (`VolumeIdentity`), and `device` is kept
   only for inode uniqueness and for rows written before v2. The reconcile's matching rule
   is on `IndexStore.deleteRows`: **a row is prunable if its `volume_uuid` equals the
-  root's, or its `volume_uuid` is NULL and its `device` equals the root's `st_dev`.** Don't
-  reintroduce a device-only comparison as "simpler"; it is the ghost-rows bug.
+  root's, or its `volume_uuid` is NULL and its `device` equals the root's `st_dev`.** A
+  root with no UUID therefore prunes only the NULL rows; a stamped row is never matched by
+  a nameless root, and `volume_uuid` is written only through `COALESCE` so a nil read can
+  never erase one. Don't reintroduce a device-only comparison as "simpler", and don't
+  "simplify" the COALESCE away; both are the ghost-rows bug.
 - **GRDB is on a `DatabasePool` in WAL mode, with a 5 s busy timeout.** Readers take a
   snapshot and never wait for a writer; the timeout is there for writer-versus-writer,
   which SQLite serialises whatever the journal mode. All DB configuration goes in

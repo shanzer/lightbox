@@ -396,17 +396,63 @@ struct IndexStoreTests {
         #expect(row.mtime == 1_700_000_000)
     }
 
-    /// A volume with no UUID stamps NULL rather than refusing: those rows stay
-    /// in the pre-migration case, matched by `device`, which is all such a
-    /// filesystem can offer.
-    @Test func setVolumeOnAVolumeWithNoUUIDStillRefreshesTheDevice() throws {
+    /// A nil UUID refreshes the device and leaves a known identity alone.
+    ///
+    /// "This filesystem published no UUID" is not the claim "this file is not on
+    /// the volume its row names", and one pass whose resource-value read came
+    /// back nil must not wipe the column on every row it walked — by the
+    /// matching rule a NULL row is *less* protected than a stamped one, so the
+    /// wipe would reinstate the replug bug it was added to fix.
+    @Test func setVolumeWithNoUUIDPreservesAKnownOneAndStillRefreshesTheDevice() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/known.jpg", device: 111, volumeUUID: "VOL-A"))
+        _ = try store.upsert(sampleRecord(path: "/lib/blank.jpg", device: 111, volumeUUID: nil))
+
+        #expect(try store.setVolume(VolumeIdentity(device: 3, uuid: nil),
+                                    forPaths: ["/lib/known.jpg", "/lib/blank.jpg"]) == 2)
+
+        let known = try #require(try store.record(atPath: "/lib/known.jpg"))
+        #expect(known.volumeUUID == "VOL-A")     // preserved, not erased
+        #expect(known.device == 3)               // st_dev is always readable, so always refreshed
+        let blank = try #require(try store.record(atPath: "/lib/blank.jpg"))
+        #expect(blank.volumeUUID == nil)         // nothing to preserve, nothing invented
+        #expect(blank.device == 3)
+
+        // And still idempotent: with the device now current, a repeat changes
+        // nothing rather than rewriting the same values.
+        #expect(try store.setVolume(VolumeIdentity(device: 3, uuid: nil),
+                                    forPaths: ["/lib/known.jpg", "/lib/blank.jpg"]) == 0)
+    }
+
+    /// The same guarantee on the other writer. `upsert` refreshes the whole
+    /// identity of a re-indexed file, and a nil UUID there is the same
+    /// unreliable read it is in `setVolume`.
+    @Test func upsertWithNoUUIDPreservesAKnownOneAndStillRefreshesTheDevice() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", size: 100,
+                                          device: 111, volumeUUID: "VOL-A"))
+        // The file's bytes changed, so tier 0 re-upserts it — this time from a
+        // pass whose volume reported no UUID.
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", size: 999,
+                                          device: 3, volumeUUID: nil))
+
+        let row = try #require(try store.record(atPath: "/lib/a.jpg"))
+        #expect(row.volumeUUID == "VOL-A")
+        #expect(row.device == 3)
+        #expect(row.size == 999)                 // the rest of the row did update
+    }
+
+    /// The converse, so preservation is not mistaken for "the column is
+    /// write-once": a real UUID replaces whatever was there.
+    @Test func aRealUUIDStillOverwritesTheStoredOne() throws {
         let store = try IndexStore.inMemory()
         _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", device: 111, volumeUUID: "VOL-A"))
-        #expect(try store.setVolume(VolumeIdentity(device: 3, uuid: nil),
+        #expect(try store.setVolume(VolumeIdentity(device: 3, uuid: "VOL-B"),
                                     forPaths: ["/lib/a.jpg"]) == 1)
-        let row = try #require(try store.record(atPath: "/lib/a.jpg"))
-        #expect(row.volumeUUID == nil)
-        #expect(row.device == 3)
+        #expect(try store.record(atPath: "/lib/a.jpg")?.volumeUUID == "VOL-B")
+
+        _ = try store.upsert(sampleRecord(path: "/lib/a.jpg", device: 3, volumeUUID: "VOL-C"))
+        #expect(try store.record(atPath: "/lib/a.jpg")?.volumeUUID == "VOL-C")
     }
 
     /// More paths than fit in one statement's bound variables. The chunking is

@@ -272,7 +272,11 @@ Five things automated tests could not cover. **None done yet** as of the
      row should be gone — before #4 it survived forever, because the replug
      renumbered `st_dev` and the prune guard read every row as another volume's.
    - Unplug it *during* a hashing pass. The pass must abort (`rootUnreadable`)
-     and the index must survive.
+     and the index must survive. One caveat on what "abort" means since #4: the
+     guard compares volume *identity*, so an unplug aborts (nothing answers at
+     the root, so there is no identity to match), but an unplug followed by a
+     replug before the next batch does **not** — the UUID says it is the same
+     volume, and continuing is correct. To see the abort, leave it unplugged.
 4. **⌘A with the search field focused.** Should select the field's text, not the
    grid. Tests could only warn, never assert.
 5. **Cold folder open shows an empty grid** for the entire first index pass
@@ -305,9 +309,12 @@ Two things belong at the *front* of phase 2 rather than in a backlog:
   that may not be mounted), so `IndexStore.setVolume(_:forPaths:)` stamps the
   rows each tier 0 pass actually walked — that is the backfill, and it is why it
   does not wait for a file's bytes to change; a filesystem that publishes no
-  UUID (SMB, some FAT) falls back to `st_dev` exactly as before v2; and a volume
-  whose UUID *changes* (a reformat) is deliberately out of scope — that is a new
-  library.
+  UUID (SMB, some FAT) collapses the rule to the `st_dev` comparison **for rows
+  that carry no UUID**, while a row already stamped with one is never matched by
+  a nameless root (so `volume_uuid` is written only through `COALESCE` — a nil
+  read refreshes `device` but never erases an established identity); and a
+  volume whose UUID *changes* (a reformat) is deliberately out of scope — that
+  is a new library.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And
