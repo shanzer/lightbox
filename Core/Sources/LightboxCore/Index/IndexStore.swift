@@ -20,7 +20,13 @@ public enum IndexStoreError: Error, Equatable, Sendable {
 }
 
 public final class IndexStore: Sendable {
-    private let pool: DatabasePool
+    /// Reachable from `IndexStore`'s own extensions in other files —
+    /// `IndexStore+FileOperations.swift` — and from nowhere else. Swift has no
+    /// access level for "this type, across files", and `private` is file-scoped;
+    /// `internal` plus this note is the closest thing. The rule it stands in for
+    /// is unchanged: **no type but `IndexStore` holds a `DatabasePool`**, so
+    /// every write to the index goes through an API that documents its guard.
+    let pool: DatabasePool
 
     /// The database file this store is open on.
     ///
@@ -298,69 +304,79 @@ public final class IndexStore: Sendable {
     /// by later phases survive a re-scan.
     @discardableResult
     public func upsert(_ record: FileRecord) throws -> Int64 {
-        try pool.write { db in
-            guard let id = try Int64.fetchOne(db, sql: """
-                INSERT INTO files
-                    (path, parent_dir, name, ext, size, mtime, device, inode, volume_uuid,
-                     width, height,
-                     capture_time, capture_offset, camera_make, camera_model, orientation,
-                     content_hash, image_hash, image_hash_kind, phash, hashed_at, indexed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(path) DO UPDATE SET
-                    parent_dir=excluded.parent_dir, name=excluded.name, ext=excluded.ext,
-                    size=excluded.size, mtime=excluded.mtime, device=excluded.device,
-                    inode=excluded.inode,
-                    -- Never back to NULL: see `setVolume(_:forPaths:)`. A pass
-                    -- whose volume published no UUID must not erase one an
-                    -- earlier pass established.
-                    volume_uuid = COALESCE(excluded.volume_uuid, files.volume_uuid),
-                    width=excluded.width, height=excluded.height,
-                    capture_time=excluded.capture_time, capture_offset=excluded.capture_offset,
-                    camera_make=excluded.camera_make, camera_model=excluded.camera_model,
-                    orientation=excluded.orientation, indexed_at=excluded.indexed_at,
-                    -- A changed size or mtime means the bytes changed, so every
-                    -- hash on this row is now a lie. Clearing hashed_at also
-                    -- re-enqueues the file for the tier 1 pass.
-                    content_hash = CASE WHEN files.size <> excluded.size
-                                          OR files.mtime <> excluded.mtime
-                                     THEN NULL ELSE files.content_hash END,
-                    image_hash = CASE WHEN files.size <> excluded.size
-                                        OR files.mtime <> excluded.mtime
-                                   THEN NULL ELSE files.image_hash END,
-                    image_hash_kind = CASE WHEN files.size <> excluded.size
-                                             OR files.mtime <> excluded.mtime
-                                        THEN NULL ELSE files.image_hash_kind END,
-                    phash = CASE WHEN files.size <> excluded.size
+        try pool.write { db in try Self.upsertRow(db, record) }
+    }
+
+    /// The body of `upsert`, on a caller's `Database`.
+    ///
+    /// Extracted so that the file-operation writes — which insert a copy's row
+    /// *and* mark its journal row in one transaction — reach exactly this SQL
+    /// and this FTS maintenance rather than a second copy of them. `files_fts`
+    /// is a standalone FTS5 table with nothing but this code maintaining it;
+    /// two writers of it would drift, and the symptom would be filename search
+    /// answering with names that no longer exist.
+    static func upsertRow(_ db: Database, _ record: FileRecord) throws -> Int64 {
+        guard let id = try Int64.fetchOne(db, sql: """
+            INSERT INTO files
+                (path, parent_dir, name, ext, size, mtime, device, inode, volume_uuid,
+                 width, height,
+                 capture_time, capture_offset, camera_make, camera_model, orientation,
+                 content_hash, image_hash, image_hash_kind, phash, hashed_at, indexed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(path) DO UPDATE SET
+                parent_dir=excluded.parent_dir, name=excluded.name, ext=excluded.ext,
+                size=excluded.size, mtime=excluded.mtime, device=excluded.device,
+                inode=excluded.inode,
+                -- Never back to NULL: see `setVolume(_:forPaths:)`. A pass
+                -- whose volume published no UUID must not erase one an
+                -- earlier pass established.
+                volume_uuid = COALESCE(excluded.volume_uuid, files.volume_uuid),
+                width=excluded.width, height=excluded.height,
+                capture_time=excluded.capture_time, capture_offset=excluded.capture_offset,
+                camera_make=excluded.camera_make, camera_model=excluded.camera_model,
+                orientation=excluded.orientation, indexed_at=excluded.indexed_at,
+                -- A changed size or mtime means the bytes changed, so every
+                -- hash on this row is now a lie. Clearing hashed_at also
+                -- re-enqueues the file for the tier 1 pass.
+                content_hash = CASE WHEN files.size <> excluded.size
+                                      OR files.mtime <> excluded.mtime
+                                 THEN NULL ELSE files.content_hash END,
+                image_hash = CASE WHEN files.size <> excluded.size
+                                    OR files.mtime <> excluded.mtime
+                               THEN NULL ELSE files.image_hash END,
+                image_hash_kind = CASE WHEN files.size <> excluded.size
+                                         OR files.mtime <> excluded.mtime
+                                    THEN NULL ELSE files.image_hash_kind END,
+                phash = CASE WHEN files.size <> excluded.size
+                               OR files.mtime <> excluded.mtime
+                          THEN NULL ELSE files.phash END,
+                hashed_at = CASE WHEN files.size <> excluded.size
                                    OR files.mtime <> excluded.mtime
-                              THEN NULL ELSE files.phash END,
-                    hashed_at = CASE WHEN files.size <> excluded.size
-                                       OR files.mtime <> excluded.mtime
-                                  THEN NULL ELSE files.hashed_at END
-                RETURNING id
-                """, arguments: [
-                    record.path, record.parentDir, record.name, record.ext,
-                    record.size, record.mtime, record.device, record.inode,
-                    record.volumeUUID, record.width, record.height,
-                    record.captureTime, record.captureOffset, record.cameraMake,
-                    record.cameraModel, record.orientation, record.contentHash,
-                    record.imageHash, record.imageHashKind, record.phash,
-                    record.hashedAt, record.indexedAt,
-                ]) else {
-                throw DatabaseError(resultCode: .SQLITE_ERROR,
-                                    message: "upsert returned no row id for \(record.path)")
-            }
-            // Update-in-place rather than delete-and-reinsert: phase 3 writes
-            // ocr_text into this row, and a rescan of an unchanged file must
-            // not destroy it.
-            try db.execute(sql: "UPDATE files_fts SET name = ? WHERE rowid = ?",
-                           arguments: [record.name, id])
-            if db.changesCount == 0 {
-                try db.execute(
-                    sql: "INSERT INTO files_fts (rowid, name, ocr_text) VALUES (?, ?, NULL)",
-                    arguments: [id, record.name])
-            }
-            return id
+                              THEN NULL ELSE files.hashed_at END
+            RETURNING id
+            """, arguments: [
+                record.path, record.parentDir, record.name, record.ext,
+                record.size, record.mtime, record.device, record.inode,
+                record.volumeUUID, record.width, record.height,
+                record.captureTime, record.captureOffset, record.cameraMake,
+                record.cameraModel, record.orientation, record.contentHash,
+                record.imageHash, record.imageHashKind, record.phash,
+                record.hashedAt, record.indexedAt,
+            ]) else {
+            throw DatabaseError(resultCode: .SQLITE_ERROR,
+                                message: "upsert returned no row id for \(record.path)")
         }
+        // Update-in-place rather than delete-and-reinsert: phase 3 writes
+        // ocr_text into this row, and a rescan of an unchanged file must
+        // not destroy it.
+        try db.execute(sql: "UPDATE files_fts SET name = ? WHERE rowid = ?",
+                       arguments: [record.name, id])
+        if db.changesCount == 0 {
+            try db.execute(
+                sql: "INSERT INTO files_fts (rowid, name, ocr_text) VALUES (?, ?, NULL)",
+                arguments: [id, record.name])
+        }
+        return id
     }
 
     /// Records a hashing attempt against the row `record` came from, and only
@@ -973,9 +989,8 @@ public final class IndexStore: Sendable {
 // MARK: - Integrity
 
 // An extension rather than free functions, because both members need `pool`
-// (or, for `rebuild`, the initializer that opens it) and `pool` is private to
-// this file on purpose — nothing outside `IndexStore` gets to hold a
-// `DatabasePool` and bypass the API above.
+// (or, for `rebuild`, the initializer that opens it), and nothing outside
+// `IndexStore` gets to hold a `DatabasePool` and bypass the API above.
 extension IndexStore {
     /// Runs SQLite's own consistency check against the file backing this
     /// store.
