@@ -474,7 +474,13 @@ fixed interval.
 
 Each logical field maps to a defined set of EXIF, IPTC, and XMP tags, and the
 mapping is documented in the code. Writing "description" to only one of the
-three produces a file that different readers disagree about.
+three produces a file that different readers disagree about. The sets are not
+hand-assembled: exiftool's **MWG composite tags** are its own implementation of
+the Metadata Working Group rules and already know which tags belong together,
+so the mapping delegates to them and hand-maps only what MWG does not cover —
+Label (`XMP-xmp:Label`, which has no MWG composite) and GPS (`GPS:*` plus
+`XMP-exif:*`, which disagree on representation: EXIF stores an unsigned
+magnitude and a hemisphere reference, XMP a signed decimal).
 
 Four deliberate constraints:
 
@@ -482,12 +488,20 @@ Four deliberate constraints:
    capture time without also writing `OffsetTimeOriginal` yields a timestamp
    that means something different on every machine. The editor requires the
    zone rather than assuming wall-clock is sufficient.
-2. **RAW gets a sidecar, not an in-place write.** JPEG, HEIC, TIFF, and PNG are
-   edited in place. RAW gets an `.xmp` sidecar, as Lightroom and Bridge do.
-   Writing into proprietary RAW containers is where files get corrupted.
+2. **RAW gets a sidecar, not an in-place write.** Everything else — JPEG, HEIC,
+   TIFF, PNG, WebP, GIF, PSD — is edited in place. RAW gets a `<basename>.xmp`
+   sidecar, as Lightroom and Bridge do, and its container is never opened for
+   writing. Writing into proprietary RAW containers is where files get
+   corrupted. GIF is the one in-place format with no EXIF block, so its fields
+   are written to XMP alone; a GIF's capture time and position live there and
+   nowhere else.
 3. **Write, verify, then commit.** exiftool writes with its `_original` backup;
-   the tag is re-read to confirm it took; only then is the backup removed. Any
-   failure restores from the backup.
+   the tag is re-read to confirm it took, and the image hash is re-run and shown
+   to have survived; only then is the backup removed. Any failure restores from
+   the backup. exiftool *declines to overwrite an existing* `_original` while
+   still reporting success, so a file already at that path is moved aside before
+   the write and put back after: it is neither this write's rollback nor this
+   write's to delete.
 4. **The `-stay_open` argument protocol is newline-delimited.** A filename or
    tag value containing `\n` or `\r` breaks it, and in the general case that is
    argument injection, not merely a bug. Filenames beginning with `-` are the

@@ -179,6 +179,72 @@ struct IndexStoreTests {
         #expect(row.hashedAt == 1_700_000_500)
     }
 
+    @Test func recordMetadataWriteStoresTheNewStatAndKeepsThePhash() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 100, mtime: 1_700_000_000))
+        let seeded = try #require(try store.record(atPath: "/a/b.jpg"))
+        #expect(try store.setHashes(for: seeded, content: "cc", image: "ii",
+                                    imageKind: "jpeg-scan-v1",
+                                    phash: "0123456789abcdef", hashedAt: 500))
+        let hashed = try #require(try store.record(atPath: "/a/b.jpg"))
+
+        #expect(try store.recordMetadataWrite(for: hashed, size: 140, mtime: 1_700_000_900,
+                                              content: "dd", image: "ii",
+                                              imageKind: "jpeg-scan-v1", hashedAt: 900))
+
+        let row = try #require(try store.record(atPath: "/a/b.jpg"))
+        #expect(row.size == 140)
+        #expect(row.mtime == 1_700_000_900)
+        #expect(row.contentHash == "dd")
+        #expect(row.imageHash == "ii")
+        #expect(row.hashedAt == 900)
+        // No pixel moved, so the perceptual hash is still the right one and
+        // must not be thrown away.
+        #expect(row.phash == "0123456789abcdef")
+        // And tier 0 now agrees the row describes the file, so it is not re-read.
+        #expect(try store.needsReindex(path: "/a/b.jpg", size: 140,
+                                       mtime: 1_700_000_900) == false)
+    }
+
+    /// The same guard as `setHashes(for:)`, and for the same reason: `files.id`
+    /// is a reused rowid, and a tier 0 pass can re-index the file while exiftool
+    /// is still running. A write against a row that no longer describes what was
+    /// edited would stamp one photo's hashes onto another photo's row.
+    @Test func recordMetadataWriteRefusesARowThatNoLongerMatches() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 100, mtime: 1_700_000_000))
+        let stale = try #require(try store.record(atPath: "/a/b.jpg"))
+
+        // Tier 0 re-indexes the file mid-write: the row's size and mtime move.
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 222, mtime: 1_700_000_050))
+
+        #expect(try store.recordMetadataWrite(for: stale, size: 140, mtime: 1_700_000_900,
+                                              content: "dd", image: "ii",
+                                              imageKind: "jpeg-scan-v1",
+                                              hashedAt: 900) == false)
+        let row = try #require(try store.record(atPath: "/a/b.jpg"))
+        #expect(row.size == 222)
+        #expect(row.contentHash == nil)
+        #expect(row.hashedAt == nil)
+    }
+
+    /// A row id belonging to a different path is not this file's row, even
+    /// though SQLite happily hands the id back after a delete.
+    @Test func recordMetadataWriteRefusesAReusedRowID() throws {
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 100, mtime: 1_700_000_000))
+        var stale = try #require(try store.record(atPath: "/a/b.jpg"))
+        _ = try store.upsert(sampleRecord(path: "/a/other.jpg", size: 100, mtime: 1_700_000_000))
+        let other = try #require(try store.record(atPath: "/a/other.jpg"))
+
+        // Same size and mtime, same id — but a different path.
+        stale.id = other.id
+        #expect(try store.recordMetadataWrite(for: stale, size: 140, mtime: 1_700_000_900,
+                                              content: "dd", image: nil, imageKind: nil,
+                                              hashedAt: 900) == false)
+        #expect(try #require(try store.record(atPath: "/a/other.jpg")).contentHash == nil)
+    }
+
     @Test func filesMissingHashesReturnsOnlyUnhashedRowsUnderThePrefix() throws {
         let store = try IndexStore.inMemory()
         _ = try store.upsert(sampleRecord(path: "/lib/a.jpg"))

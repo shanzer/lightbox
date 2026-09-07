@@ -75,10 +75,18 @@ the iMac failed with "unable to type-check this expression in reasonable time"
 and was split into named steps. Expect the same from any other dense
 bit-twiddling one-liner; the fix is always the same.
 
-The exiftool path change bites in **phase 2**, not now — phase 1 shells out to
-it nowhere. It was used during design to empirically verify the image-hash
-denylists survive metadata edits. When phase 2 adds EXIF writing, resolve the
-binary via `PATH` or a configurable setting; do not hardcode either prefix.
+The exiftool path change bit in **phase 2**, and is handled:
+`Metadata/ExiftoolLocator.swift` searches `PATH` at first use and hardcodes
+neither prefix, with `LIGHTBOX_EXIFTOOL` as an override for a non-standard
+install or a test stub. `MetadataWriter.availability` is the single answer to
+"can we edit?", and the round-trip tests gate on that same property so a machine
+without exiftool (every CI runner) skips them visibly instead of failing. It was
+also used during design to empirically verify the image-hash rules survive
+metadata edits; `postWriteImageHashEqualsPreWriteImageHash` now checks that
+automatically for JPEG, PNG, WebP **and HEIC** — so §6's newest rule is held to
+the same exiftool round-trip as the others — on every run **that has exiftool**.
+On a runner without it, that test and the rest of the round-trip suite skip, so
+the tripwire is only armed where the binary exists.
 
 Sole dependency: **GRDB.swift 7.11.1**, pinned in
 `App/Lightbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
@@ -95,7 +103,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 389 tests, 23 suites.
+# Core: 469 tests, 34 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 57 tests.
@@ -147,7 +155,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 389 tests live. `App/` only wires it to views.
+where all the logic and all 469 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|

@@ -467,6 +467,45 @@ public final class IndexStore: Sendable {
     /// 999 bound variables, which the four fixed parameters also come out of.
     private static let stampChunkSize = 500
 
+    /// Records the new `size`/`mtime` and re-verified hashes for a row whose
+    /// file was just rewritten by `MetadataWriter`.
+    ///
+    /// A metadata write changes the bytes, so the row's `size`, `mtime` and
+    /// `content_hash` are all stale the instant exiftool returns. Left that
+    /// way, tier 0 re-reads the file on the next pass and — worse — clears
+    /// every hash on the row, throwing away a `phash` that is still perfectly
+    /// valid because the pixels did not change. Writing the new facts here is
+    /// what keeps a metadata edit from costing a re-hash of the file.
+    ///
+    /// `phash` is deliberately untouched: an EXIF edit does not move a pixel,
+    /// so the perceptual hash on the row is still the right one.
+    ///
+    /// **Guarded exactly like `setHashes(for:)`, and for the same reason.** The
+    /// `WHERE` matches on the `path`, `size` and `mtime` the row carried
+    /// *before* the write. If a tier 0 pass re-indexed this file while exiftool
+    /// was running, or if SQLite handed this rowid to a different file after a
+    /// delete, the row no longer describes what was edited and the write is
+    /// refused — leaving `hashed_at` as it was and the file queued for a real
+    /// re-hash. Work repeated, never a wrong hash recorded. See the long
+    /// comment on `setHashes(for:)`; do not relax this into an id-only update.
+    ///
+    /// Returns whether the write landed.
+    @discardableResult
+    public func recordMetadataWrite(for record: FileRecord, size: Int64, mtime: Double,
+                                    content: String?, image: String?, imageKind: String?,
+                                    hashedAt: Double) throws -> Bool {
+        guard let id = record.id else { return false }
+        return try pool.write { db in
+            try db.execute(sql: """
+                UPDATE files SET size = ?, mtime = ?, content_hash = ?, image_hash = ?,
+                                 image_hash_kind = ?, hashed_at = ?
+                WHERE id = ? AND path = ? AND size = ? AND mtime = ?
+                """, arguments: [size, mtime, content, image, imageKind, hashedAt,
+                                 id, record.path, record.size, record.mtime])
+            return db.changesCount == 1
+        }
+    }
+
     /// Removes rows under `prefix` whose paths are not in `keeping`.
     /// FTS and `analysis` rows follow via the `files_ad` trigger and the
     /// `ON DELETE CASCADE` foreign key.
