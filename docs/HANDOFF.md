@@ -95,7 +95,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 305 tests, 20 suites.
+# Core: 341 tests, 21 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 57 tests.
@@ -147,7 +147,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 305 tests live. `App/` only wires it to views.
+where all the logic and all 341 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -186,19 +186,50 @@ three, all computed in tier 1:
 - **`image_hash`** — SHA-256 over image data with format containers stripped, so
   writing EXIF does not invalidate it. The per-format rules were verified
   empirically against exiftool: JPEG uses a **segment denylist**, PNG a **chunk
-  denylist**, and WebP an **allowlist** — because exiftool inserts a VP8X chunk
-  that a denylist would not know to exclude. This asymmetry is deliberate;
-  don't "fix" it into symmetry.
+  denylist**, WebP an **allowlist** — because exiftool inserts a VP8X chunk that
+  a denylist would not know to exclude — and HEIC an **allowlist over the
+  primary item's `iloc` extents**, not over `mdat`. This asymmetry is
+  deliberate; don't "fix" it into symmetry.
 - **`phash`** — 64-bit DCT perceptual hash, for near-duplicates. Golden vectors
   in `PerceptualHashTests` were produced by running photolib's real
   `lib/phash.js`, so the two tools agree. Measured cross-tool divergence over
   36 real photos: 0–4 bits, mean 1.22, against a match threshold of 12.
 
+HEIC's rule has a trap of its own, measured in
+`docs/superpowers/notes/2026-09-07-heic-mdat-roundtrip.md` (issue #12). The
+obvious rule — "hash the `mdat` box" — is wrong: `Exif` and XMP live inside
+`mdat`, so its digest changed on all five files round-tripped through exiftool,
+and in two of them the box moved as well. The stable unit is the *primary
+item's* extents. Every HEIC in the library has a `grid` primary whose own
+extent is an eight-byte descriptor in `idat` with `construction_method == 1`,
+so the rule follows `pitm` → `dimg` → `iloc` and honours the construction
+method; a parser that ignored it would hash the file's first eight bytes and
+call every HEIC a duplicate of every other. Auxiliaries (gain map, depth map,
+mattes, thumbnail) and `ipco` are excluded on purpose — the first three by
+consequence, since the rule follows `dimg` and never looks at a sibling image.
+
+The rule **fails closed**. If the primary item cannot be identified (no `iinf`,
+or no `infe` entry for it) or a derived primary does not resolve to distinct,
+non-derived coded items, HEIC gets no `image_hash` rather than a hash of the
+eight-byte layout descriptor — which is the same eight bytes for any two photos
+of a size, so the duplicate view would offer to delete unrelated pictures. Those
+files fall back to `content_hash`. Do not "improve" any of those branches into a
+default.
+
 Two traps found the hard way, both now guarded and tested:
-- **Motion photos** (Pixel/Samsung append an MP4 after JPEG EOI) hash identically
-  to their stripped stills under `image_hash`.
+- **Motion photos** (Pixel/Samsung append an MP4 after JPEG EOI) *used to* hash
+  identically to their stripped stills under `image_hash`, because the parser
+  stopped at EOI. That was the bug, not the intent: the duplicate view would
+  have offered to delete the copy carrying the video. `2f698b0` hashes
+  everything after EOI, so the two now differ, and `JPEGImageHash` says why in
+  the EOI case. PNG (after IEND), WebP (past the declared RIFF size) and HEIC
+  (past the last box) all follow the same convention: an appended payload is
+  content, not metadata.
 - **Chunk-flood amplification**: a hostile 256 MB PNG drove 4.37 GB RSS; JPEG was
   22× worse. Fixed by coalescing ranges. Any new format parser needs the same.
+  HEIC needs more than coalescing: `iloc` can declare `offset_size == 0` and
+  65535 extents per item, so millions of non-coalescing ranges cost nothing on
+  disk. `HEICImageHash.maxExtents` caps the count outright.
 
 Hashes are written through `setHashes(for:)`, which **refuses** a write whose
 row no longer carries the path/size/mtime that was hashed. That guard is not

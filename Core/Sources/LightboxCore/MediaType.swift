@@ -40,7 +40,8 @@ public struct MediaType: Sendable, Hashable {
         case .jpeg: JPEGImageHash.kind
         case .png: PNGImageHash.kind
         case .webp: WebPImageHash.kind
-        case .gif, .heic, .tiff, .raw, .psd: nil
+        case .heic: HEICImageHash.kind
+        case .gif, .tiff, .raw, .psd: nil
         }
     }
 }

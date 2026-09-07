@@ -176,16 +176,34 @@ loop count, which affects playback — so neither a denylist nor an allowlist is
 unambiguous, and GIFs rarely carry EXIF worth editing. The cost of getting this
 wrong exceeds the value of getting it right.
 
-**RAW, HEIC, TIFF, PSD** — `image_hash` is NULL in version 1. TIFF and RAW are
+**HEIC** — an allowlist, and not over `mdat`. Hash the byte extents `iloc`
+assigns to the **primary item**, resolved through `pitm` and — when the primary
+is a `grid`, `iovl` or `iden` derived item, which every capture in the library
+is — through its `dimg` reference to the coded tiles, hashed in `dimg` order.
+`construction_method` is honoured, so a `grid` descriptor in `idat` is not
+mistaken for a file offset. Auxiliary images (HDR gain map, Portrait depth map
+and mattes), the `thmb` thumbnail, `Exif`, XMP and `ipco` are all excluded: two
+files that are the same photograph with different auxiliaries must group
+together. The measurement behind this — five real captures through an exiftool
+round-trip — is
+`docs/superpowers/notes/2026-09-07-heic-mdat-roundtrip.md`. The whole `mdat`
+box changed on every one of them, so the obvious rule would have been wrong.
+A HEIC whose primary item cannot be identified — no `iinf` box, or no `infe`
+entry for it — or whose derived primary does not resolve to distinct,
+non-derived coded items gets **no `image_hash` at all** rather than a hash of
+its layout descriptor: a `grid` descriptor is eight bytes of rows, columns and
+output size, identical for any two photographs of the same dimensions, so
+hashing it would group unrelated pictures as duplicates. Such files fall back to
+`content_hash` and `phash` like the formats below.
+
+**RAW, TIFF, PSD, GIF** — `image_hash` is NULL in version 1. TIFF and RAW are
 IFD-based with byte offsets that shift when metadata is written, so a stable
-hash means a parser per vendor container. HEIC is more tractable, since the
-image data lives in the `mdat` box, but that must be verified empirically
-against exiftool round-trips before it is trusted. For these formats duplicate
-detection falls back to `content_hash` and `phash`.
+hash means a parser per vendor container. For these formats duplicate detection
+falls back to `content_hash` and `phash`.
 
 `image_hash_kind` records which rule produced the value — `jpeg-scan-v1`,
-`png-idat-v1`, `webp-chunk-v1`, or NULL — so a rule can be revised and only the
-affected rows recomputed.
+`png-idat-v1`, `webp-chunk-v1`, `heic-item-v1`, or NULL — so a rule can be
+revised and only the affected rows recomputed.
 
 ### Two consequences
 
@@ -498,9 +516,13 @@ four; only phase 1 should be planned in detail now.
   checkpoints, and that conversion step belongs in the plan.
 - The `is_meme` threshold values in this document are a starting point, to be
   calibrated against a sample of the real library.
-- Whether HEIC `mdat` survives an exiftool metadata round-trip unchanged
-  decides whether HEIC gains an `image_hash` in version 1. This is an
-  experiment, not a judgement call, and it is cheap to run.
+- ~~Whether HEIC `mdat` survives an exiftool metadata round-trip unchanged
+  decides whether HEIC gains an `image_hash` in version 1.~~ **Settled** by the
+  experiment in `docs/superpowers/notes/2026-09-07-heic-mdat-roundtrip.md`
+  (issue #12): the whole `mdat` box does *not* survive — it carries the `Exif`
+  and XMP items, and it moves when `meta` grows — but the primary item's coded
+  extents do, byte-for-byte, on all five files tested. HEIC therefore has an
+  `image_hash` in version 1, under the `heic-item-v1` rule in §11.
 - The `PhotoGrid` performance measurement needs a 50k-item fixture. Generating
   synthetic images is cheap; deciding whether to measure against synthetic or
   against the real library belongs in the plan.
