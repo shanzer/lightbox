@@ -249,6 +249,56 @@ public enum FileOperationFailure: Error, Sendable, Equatable, Hashable {
     case other(String)
 }
 
+public extension FileOperationFailure {
+    /// One sentence, for the summary sheet's "reason" column.
+    ///
+    /// Here rather than in `App` because the distinctions this enum draws are
+    /// its own: nothing outside `Core` knows why `destinationReadOnly` is a
+    /// separate case from `permissionDenied`, and an `App`-side `switch` would
+    /// be a second, drifting copy of that reasoning. `LocalizedError` is
+    /// deliberately not adopted — `localizedDescription` on a bare Swift enum
+    /// reads "The operation couldn't be completed. (LightboxCore.
+    /// FileOperationFailure error 1.)", and a conformance would make that
+    /// string reachable through a second spelling that nothing tests.
+    ///
+    /// **The four cases that do not mean "nothing changed" say where things
+    /// are.** A sheet that reports `sourceRemovalFailed` as a plain failure
+    /// tells the user their file did not move while both copies sit on disk;
+    /// see the type's own documentation.
+    var explanation: String {
+        switch self {
+        case .sourceVanished:
+            "The file was no longer there when its turn came."
+        case .permissionDenied:
+            "Permission denied — the file could not be read or removed, or the "
+                + "destination folder could not be written to."
+        case .destinationReadOnly:
+            "The destination is on a read-only volume."
+        case .diskFull:
+            "The destination volume is full."
+        case .volumeUnmounted:
+            "The volume stopped answering part way through."
+        case .copyIncomplete:
+            "The copy was short and has been removed; the original is untouched."
+        case .trashURLNotRecorded(let detail):
+            "The file reached the Trash but where it went could not be recorded, "
+                + "so it cannot be put back automatically (\(detail))."
+        case .rollbackIncomplete(let detail):
+            "The operation failed and could not be fully undone — \(detail)."
+        case .sourceRemovalFailed:
+            "The copy landed but the original could not be removed, so the file "
+                + "now exists in both places."
+        case .destinationNotReplaceable:
+            "The file already at the destination could not be moved out of the way."
+        case .indexWriteFailed(let detail):
+            "The files moved but the index could not be updated (\(detail)); it "
+                + "will be corrected on the next scan."
+        case .other(let detail):
+            "Failed: \(detail)"
+        }
+    }
+}
+
 public enum FileOperationOutcome: Sendable, Equatable, Hashable {
     case completed
     case skipped(FileOperationSkip)

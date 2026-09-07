@@ -21,6 +21,10 @@ struct LightboxApp: App {
                     NotificationCenter.default.post(name: .refreshFolder, object: nil)
                 }
                 .keyboardShortcut("r", modifiers: .command)
+
+                Divider()
+
+                FileOperationCommands()
             }
 
             // ⌘A as a menu command rather than as `.onKeyPress(keys: ["a"])` on
@@ -151,4 +155,93 @@ extension Notification.Name {
     static let openFolder = Notification.Name("LightboxOpenFolder")
     static let refreshFolder = Notification.Name("LightboxRefreshFolder")
     static let selectAllPhotos = Notification.Name("LightboxSelectAllPhotos")
+}
+
+/// The window the commands act on.
+///
+/// A focused value, not a notification, and this is the one place in the app
+/// where that distinction matters. ⌘O, ⌘R and ⌘A post: every window observes,
+/// and every window responds — harmless when the answer is "reload yourself",
+/// and wrong when it is "move these 300 files", because a broadcast would start
+/// one batch per open window. Spec §8's job runs in the window that started it,
+/// so the command needs the key window's model rather than all of them.
+///
+/// It is also what gives the items their enabled state: a `CommandGroup`
+/// `Button` does not participate in `NSMenuItem` validation (see the note on
+/// Cut/Copy/Paste above), so `.disabled` on a value that resolves to the focused
+/// scene is the only thing standing between an empty selection and a batch of
+/// nothing.
+extension FocusedValues {
+    @Entry var browserModel: BrowserModel?
+}
+
+/// The four batch commands, built from `FileCommand.allCases`' cases one by one.
+///
+/// Written out rather than looped, so the menu's *order* and its dividers are
+/// visible here and a reordering is a diff rather than an emergent property of
+/// an enumeration's declaration order.
+struct FileOperationCommands: View {
+    @FocusedValue(\.browserModel) private var model
+
+    var body: some View {
+        item(.moveTo)
+        item(.copyTo)
+
+        Divider()
+
+        item(.trash)
+        item(.deletePermanently)
+
+        // No Undo item here. #6 owns ⌘Z, and the hook it attaches to —
+        // `BrowserModel.lastCompletedBatch` and `undoMenuTitle` — already
+        // exists. A disabled stub would have to be a second item titled
+        // "Undo", and the Edit menu already carries one from SwiftUI's
+        // `.undoRedo` group: two items sharing ⌘Z is precisely the collision
+        // that left ⌘A mouse-only, because AppKit resolves it by stripping the
+        // key equivalent off the *custom* item. #6 replaces the stock group,
+        // gated on the grid having focus the same way Select All is.
+    }
+
+    @ViewBuilder
+    private func item(_ command: FileCommand) -> some View {
+        Button(command.title) { perform(command) }
+            .keyboardShortcut(Self.shortcut(for: command))
+            .disabled(!(model?.isEnabled(command) ?? false))
+    }
+
+    /// ⌘⌫ on Move to Trash and nothing else.
+    ///
+    /// Checked against the existing groups before it was added: ⌘O and ⌘R are
+    /// this file's, ⌘X/⌘C/⌘V/⌘A are the rebuilt pasteboard group's, and nothing
+    /// claims ⌫ with a command modifier — the stock Delete item deliberately
+    /// carries no key equivalent at all, because a bare ⌫ in the menu bar is
+    /// matched before the search field sees the keystroke. `MenuCommandTests`
+    /// asserts the count of claimants rather than trusting this comment.
+    ///
+    /// Move To…, Copy To… and Delete Permanently… get none: each opens a panel
+    /// or a sheet, and a shortcut on a permanent delete is a way to lose photos
+    /// by mistyping.
+    private static func shortcut(for command: FileCommand) -> KeyboardShortcut? {
+        command == .trash ? KeyboardShortcut(.delete, modifiers: .command) : nil
+    }
+
+    private func perform(_ command: FileCommand) {
+        guard let model, model.isEnabled(command) else { return }
+        switch command {
+        case .moveTo, .copyTo:
+            let count = model.selection.selected.count
+            let noun = count == 1 ? "item" : "items"
+            guard let choice = DestinationChooser.chooseDirectory(
+                prompt: command == .moveTo ? "Move" : "Copy",
+                message: "Choose where to \(command == .moveTo ? "move" : "copy") "
+                    + "\(count) \(noun).",
+                includeCompanions: model.includeCompanions) else { return }
+            model.includeCompanions = choice.includeCompanions
+            Task { await model.beginBatch(command.kind, destination: choice.destination) }
+        case .trash:
+            Task { await model.beginBatch(.trash, destination: nil) }
+        case .deletePermanently:
+            model.confirmPermanentDelete()
+        }
+    }
 }

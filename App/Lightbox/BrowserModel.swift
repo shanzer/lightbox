@@ -24,6 +24,34 @@ protocol RecordSearching: Sendable {
 
 extension IndexStore: RecordSearching {}
 
+/// Where the window's remembered settings live.
+///
+/// A protocol rather than `UserDefaults` directly, for exactly the reason
+/// `RecordSearching` is one — and for #15's reason besides. The App target is
+/// hosted by the real `Lightbox.app`, so `UserDefaults.standard` under
+/// `xcodebuild test` is the *user's* preferences domain, the same trap that had
+/// every test run migrating the user's index. A per-test `UserDefaults(suiteName:)`
+/// was tried first and is not good enough: `removePersistentDomain` clears the
+/// values, but `cfprefsd` writes the file out afterwards anyway, so a run leaves
+/// empty plists behind in `~/Library/Preferences` — measured, five of them.
+///
+/// `@MainActor` rather than `Sendable`, because `BrowserModel` is the only
+/// thing that touches it and is main-actor isolated; `UserDefaults` is not
+/// `Sendable` and is not going to be made so with an `@unchecked`.
+/// Production always passes `UserDefaults.standard`.
+@MainActor
+protocol PreferenceStore: AnyObject {
+    /// Nil when nothing has been written, which is not the same as `false` —
+    /// see `BrowserModel.readIncludeCompanions(from:)`.
+    func flag(forKey key: String) -> Bool?
+    func setFlag(_ value: Bool, forKey key: String)
+}
+
+extension UserDefaults: PreferenceStore {
+    func flag(forKey key: String) -> Bool? { object(forKey: key) as? Bool }
+    func setFlag(_ value: Bool, forKey key: String) { set(value, forKey: key) }
+}
+
 /// The state behind one browser window: which folder is open, what the index
 /// says is in it, and how far the current pass has got.
 ///
@@ -334,6 +362,62 @@ final class BrowserModel {
     private var indexingTask: Task<Void, Never>?
     private var hashingTask: Task<Void, Never>?
 
+    // MARK: - File operations
+
+    /// Internal rather than private: the batch machinery lives in
+    /// `BrowserModel+FileOperations.swift`, and Swift has no access level for
+    /// "this type, across files". Nothing outside `BrowserModel` touches these.
+    let fileOperator: FileOperator
+
+    /// Where the companion-files preference is remembered. See `PreferenceStore`.
+    let preferences: any PreferenceStore
+
+    static let includeCompanionsKey = "LightboxIncludeCompanionFiles"
+
+    /// Whether an image's sidecars and RAW/JPEG partner travel with it.
+    ///
+    /// Spec §8: default on, toggleable, because not doing it silently orphans
+    /// edits. The checkbox lives on the Move/Copy panel, and the answer is
+    /// remembered — a user who turns it off does so because of how their library
+    /// is organised, which does not change between one move and the next.
+    var includeCompanions: Bool {
+        didSet {
+            guard includeCompanions != oldValue else { return }
+            preferences.setFlag(includeCompanions, forKey: Self.includeCompanionsKey)
+        }
+    }
+
+    /// The batch running in this window, or nil. One at a time: the commands
+    /// are disabled while it is set, so two batches cannot interleave their
+    /// index writes over the same rows.
+    ///
+    /// Not `private(set)`, which would be a file-scoped setter and so
+    /// unreachable from `BrowserModel+FileOperations.swift`. Written there and
+    /// nowhere else.
+    var batchProgress: BatchProgress?
+
+    /// The one sheet this window is showing. See `ActiveSheet`.
+    var activeSheet: ActiveSheet?
+
+    /// The last batch that changed anything, for #6's ⌘Z. Never a permanent
+    /// delete — see `CompletedBatch`. Written only by `finish`.
+    var lastCompletedBatch: CompletedBatch?
+
+    /// The menu title ⌘Z should carry. "Undo" with nothing to undo, so the
+    /// stock item's wording is what appears before the first batch.
+    var undoMenuTitle: String { lastCompletedBatch?.undoTitle ?? "Undo" }
+
+    var batchTask: Task<Void, Never>?
+
+    /// Which batch a progress callback belongs to.
+    ///
+    /// The handler hops to the main actor through a `Task`, so a report from
+    /// the batch that just finished can land after the next one has started.
+    /// Without the token that late hop rewrites the new batch's counts with the
+    /// old batch's — a progress bar that jumps backwards for no reason the user
+    /// can see. Bumped when a batch starts and again when it finishes.
+    var batchToken = 0
+
     /// Two monotonic counters, not one.
     ///
     /// A single counter conflates "the user is looking at a different folder"
@@ -388,7 +472,7 @@ final class BrowserModel {
     /// cache, so neither case can lose anything a rebuild wouldn't also
     /// recompute, and leaving the app unable to open at all over either one
     /// would be strictly worse than a rescan.
-    init(at url: URL) throws {
+    init(at url: URL, preferences: any PreferenceStore = UserDefaults.standard) throws {
         let store: IndexStore
         // Bound outside the `if` so a corrupt-but-openable connection is
         // still reachable in the `else` branch to be closed — see below.
@@ -412,6 +496,9 @@ final class BrowserModel {
         self.searcher = store
         coordinator = IndexCoordinator(store: store)
         thumbnails = ThumbnailCache(directory: Self.defaultThumbnailDirectory)
+        fileOperator = FileOperator(store: store)
+        self.preferences = preferences
+        includeCompanions = Self.readIncludeCompanions(from: preferences)
     }
 
     /// Takes an already-open store, for tests and previews that must not touch
@@ -421,11 +508,23 @@ final class BrowserModel {
     /// give it a budget small enough to observe eviction.
     init(store: IndexStore,
          searcher: (any RecordSearching)? = nil,
-         thumbnails: ThumbnailCache? = nil) {
+         thumbnails: ThumbnailCache? = nil,
+         preferences: any PreferenceStore = UserDefaults.standard) {
         self.store = store
         self.searcher = searcher ?? store
         coordinator = IndexCoordinator(store: store)
         self.thumbnails = thumbnails ?? ThumbnailCache(directory: Self.defaultThumbnailDirectory)
+        fileOperator = FileOperator(store: store)
+        self.preferences = preferences
+        includeCompanions = Self.readIncludeCompanions(from: preferences)
+    }
+
+    /// Defaults to on when nothing has been written yet, which is why
+    /// `PreferenceStore.flag(forKey:)` returns an optional: `UserDefaults.bool`
+    /// reports false for an absent key, and a first launch would then silently
+    /// orphan every sidecar in the library.
+    private static func readIncludeCompanions(from preferences: any PreferenceStore) -> Bool {
+        preferences.flag(forKey: includeCompanionsKey) ?? true
     }
 
     // MARK: - Records

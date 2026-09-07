@@ -95,6 +95,25 @@ struct BrowserView: View {
         .onReceive(NotificationCenter.default.publisher(for: .selectAllPhotos)) { _ in
             model?.selectAll()
         }
+        // What the file-operation commands act on. A focused value rather than
+        // a notification, because a batch belongs to one window — see
+        // `FocusedValues.browserModel`.
+        .focusedSceneValue(\.browserModel, model)
+        .sheet(item: sheet) { active in
+            if let model {
+                FileOperationSheetView(model: model, sheet: active)
+            }
+        }
+    }
+
+    /// The sheet binding. Written by hand rather than `Bindable(model)` because
+    /// `model` is an optional `@State` here, and because setting it to nil has
+    /// to go through the model's own dismissal — the batch and the sheet are
+    /// not the same thing, and a sheet dismissed from the outside must not look
+    /// like a cancelled batch.
+    private var sheet: Binding<ActiveSheet?> {
+        Binding(get: { model?.activeSheet },
+                set: { if $0 == nil { model?.dismissSheet() } })
     }
 
     private func start() {

@@ -360,3 +360,60 @@ struct FileOperatorFailureTests {
         #expect(row.name == "other.jpg")
     }
 }
+
+/// The user-facing side of the failure taxonomy.
+///
+/// `FileOperationFailure` is an enum with no `LocalizedError` conformance, so
+/// `localizedDescription` on one reads "The operation couldn't be completed.
+/// (LightboxCore.FileOperationFailure error 1.)" — which is what a summary
+/// sheet would have shown for every failed item. `explanation` is the sentence
+/// that goes in that sheet, and it lives here rather than in `App` because the
+/// distinction between, say, `permissionDenied` and `destinationReadOnly` is a
+/// distinction this type makes and only this type can explain.
+struct FileOperationFailureExplanationTests {
+    /// Every case, spelled out one by one on purpose. An `allCases` loop is
+    /// impossible — the cases carry payloads — and a spot check of three would
+    /// let a new case ship with no sentence at all.
+    private static let everyCase: [FileOperationFailure] = [
+        .sourceVanished, .permissionDenied, .destinationReadOnly, .diskFull,
+        .volumeUnmounted, .copyIncomplete, .trashURLNotRecorded("detail"),
+        .rollbackIncomplete("detail"), .sourceRemovalFailed,
+        .destinationNotReplaceable, .indexWriteFailed("detail"), .other("detail"),
+    ]
+
+    @Test func everyFailureHasASentenceAndNoneOfThemIsTheDefault() {
+        for failure in Self.everyCase {
+            #expect(!failure.explanation.isEmpty, "\(failure) has no explanation")
+            #expect(!failure.explanation.contains("LightboxCore"),
+                    "\(failure) fell through to Foundation's default description")
+            #expect(failure.explanation.first?.isUppercase == true,
+                    "\(failure) does not start a sentence: \(failure.explanation)")
+        }
+    }
+
+    /// The four cases that mean "something is ahead of the record" have to say
+    /// so. A sheet that reports `sourceRemovalFailed` as a plain failure tells
+    /// the user nothing happened, while both copies are on disk.
+    @Test func theFailuresThatChangedSomethingSayWhatIsWhere() {
+        #expect(FileOperationFailure.sourceRemovalFailed.explanation
+            .localizedCaseInsensitiveContains("both"))
+        #expect(FileOperationFailure.trashURLNotRecorded("x").explanation
+            .localizedCaseInsensitiveContains("Trash"))
+        #expect(FileOperationFailure.indexWriteFailed("x").explanation
+            .localizedCaseInsensitiveContains("index"))
+        #expect(FileOperationFailure.rollbackIncomplete("x").explanation
+            .localizedCaseInsensitiveContains("undone"))
+    }
+
+    /// The three cases carrying a string carry it into the sentence. Dropping
+    /// it would leave the one failure that names a specific cause describing
+    /// itself in the abstract.
+    @Test func theCasesThatCarryDetailShowIt() {
+        #expect(FileOperationFailure.other("exiftool exploded").explanation
+            .contains("exiftool exploded"))
+        #expect(FileOperationFailure.indexWriteFailed("database is locked").explanation
+            .contains("database is locked"))
+        #expect(FileOperationFailure.rollbackIncomplete("IMG_0001.jpg").explanation
+            .contains("IMG_0001.jpg"))
+    }
+}

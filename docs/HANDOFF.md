@@ -112,7 +112,7 @@ cd ~/src/lightbox
 # Core: 610 tests, 76 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 63 tests.
+# App: builds the SwiftUI target and runs its 77 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -201,6 +201,25 @@ or an explicit `LIGHTBOX_TEST_HOST=1`) `launchIndexURL(in:)` returns nil and
 `BrowserModel.init(at:)` has no default argument, so `IndexStore.defaultURL` has
 exactly one caller. Before that guard (#15) every App test run created, migrated
 and WAL-switched the real `~/Library/Application Support/Lightbox/index.sqlite`.
+The same argument now applies to `UserDefaults`: the companion-files preference
+goes through a `PreferenceStore` the model is handed, `UserDefaults.standard` in
+production and an in-memory double in every test, because `.standard` under a
+test host is the *user's* preferences domain. A `UserDefaults(suiteName:)` was
+tried first and is not enough — `removePersistentDomain` clears the values, but
+`cfprefsd` writes the file out afterwards anyway, so the run left empty plists
+in `~/Library/Preferences`.
+
+The App side, file by file:
+
+| File | What it does |
+|---|---|
+| `LightboxApp.swift` | The scene, the menu commands, and `FocusedValues.browserModel` — the key window the file commands act on |
+| `LaunchEnvironment.swift` | Whether this launch may open the real index (#15) |
+| `BrowserModel.swift` | The window's state: folder, records, selection, filters, progress; every async step carries a `Pass` |
+| `BrowserModel+FileOperations.swift` | Spec §8's batches: plan, collision sheet, run off the main thread, put the window back together |
+| `FileOperationState.swift` | `FileCommand`, `BatchProgress`, `CompletedBatch`, `OperationSummary`, `ActiveSheet`, `CollisionSheetModel` — the testable half of the sheets |
+| `DestinationChooser.swift` | The `NSOpenPanel` behind Move/Copy To…, with the companion checkbox as its accessory view |
+| `Views/` | Thin SwiftUI: grid, tree, filters, path bar, inspector, and the four file-operation sheets |
 
 `App/Lightbox.xcodeproj/project.pbxproj` is **hand-written** (objectVersion 77,
 `PBXFileSystemSynchronizedRootGroup`). Adding a `.swift` file under
@@ -281,7 +300,7 @@ row — which duplicate detection then deletes on.
 
 ## 7. Verify by hand on the mini
 
-Seven things automated tests could not cover. **None done yet** as of the
+Eight things automated tests could not cover. **None done yet** as of the
 2026-09-06 update. In rough priority:
 
 1. **Re-run the 50k benchmark.** All current numbers are Intel, and the choice of
@@ -338,9 +357,19 @@ Seven things automated tests could not cover. **None done yet** as of the
      volume, and continuing is correct. To see the abort, leave it unplugged.
 5. **⌘A with the search field focused.** Should select the field's text, not the
    grid. Tests could only warn, never assert.
-6. **Cold folder open shows an empty grid** for the entire first index pass
+6. **The file-operation UI, against the real library** (#7). Automated tests
+   cover the model and the sheets' logic; nothing automated can open a panel or
+   click Rename. With the Seagate library open, select 30 files including a
+   RAW+JPEG pair and Move To a folder that already holds one of them: the
+   collision sheet should name that one file and nothing else, choosing Rename
+   should run the batch, and the summary sheet should **not** appear. Then check
+   the rest of the surface — the companion checkbox on the panel and whether it
+   is remembered next time, ⌘⌫ with the grid focused, Delete Permanently naming
+   the right count, and Stop After This Item on a batch long enough to catch it
+   (the items already done stay done, and `op_journal` says so).
+7. **Cold folder open shows an empty grid** for the entire first index pass
    (~180 s at 50k). Known, ugly, deferred — the grid has no "indexing…" state.
-7. **A real index pass over the Seagate, under the new executors.** #28 moved
+8. **A real index pass over the Seagate, under the new executors.** #28 moved
    `IndexCoordinator` and `MetadataWriter` off the cooperative pool onto serial
    dispatch queues of their own. `CooperativePoolTests` proves *where* the work
    runs; it says nothing about the GUI path. Open a large folder on the external
@@ -730,6 +759,51 @@ all three are now done:
   cross-volume undo. `performTransfer` is shared with the forward path, which is
   where the cross-volume legs are tested, but no test drives an undo across two
   real volumes.
+
+- ~~**The file-operation UI.**~~ **Done** (issue #7), minus ⌘Z, which is #6's.
+  Move To…, Copy To…, Move to Trash (⌘⌫) and Delete Permanently… in the File
+  menu, with the collision, progress, summary and confirmation sheets behind
+  them. All of it in `App/`; the only `Core` change was
+  `FileOperationFailure.explanation`, the sentence a summary row shows.
+  Five things worth carrying forward:
+
+  **The commands are wired through `@FocusedValue`, not a notification.** ⌘O,
+  ⌘R and ⌘A post to `NotificationCenter` and every open window responds, which
+  is harmless for "reload yourself" and wrong for "move these 300 files" — a
+  broadcast would start one batch per window. `FocusedValues.browserModel` is
+  set by `BrowserView` with `.focusedSceneValue`, so the command acts in the
+  key window and, as a bonus, gets its enabled state from that window's
+  selection.
+
+  **A disabled `CommandGroup` item has a nil `action`.** Measured, and it is
+  what makes the menu half of the enabled-state assertion possible: SwiftUI
+  strips the action off a disabled command item entirely, so `action == nil`
+  *is* "disabled" in `NSMenuItem` terms. The Cut/Copy/Paste note in
+  `LightboxApp` still holds for items with no `.disabled` on them — those
+  validate to enabled whatever the responder chain thinks.
+
+  **The grid updates with `reload()`, never `refresh()`.** `FileOperator`
+  rewrites the index rows in the same transaction that marks the journal
+  complete, so the index already describes the new world by the time a batch
+  returns; a rescan would re-walk the folder — minutes on the Seagate — to
+  learn it again. The test pins this by creating a file on disk the index has
+  never seen and asserting it does *not* appear.
+
+  **⌘Z is deliberately absent rather than stubbed.** The obvious stub is a
+  disabled item titled "Undo", and the Edit menu already carries one from
+  SwiftUI's `.undoRedo` group: two items sharing ⌘Z is exactly the collision
+  that left ⌘A mouse-only, because AppKit resolves it by stripping the key
+  equivalent off the *custom* item. The hook is
+  `BrowserModel.lastCompletedBatch` (batch id, kind, the completed results) and
+  `undoMenuTitle` ("Undo Move 12 Items"); a permanent delete is never recorded
+  there, because nothing can reverse it. #6 places the item, gated on grid focus
+  the same way Select All is.
+
+  **The selection follows the files for a move and empties for trash/delete.**
+  A move out of the folder on screen has nothing to follow, so it empties too;
+  a copy leaves the selection alone, because the sources did not go anywhere.
+
+  Owed: the GUI live check, §7.6.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And

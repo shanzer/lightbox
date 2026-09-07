@@ -283,3 +283,118 @@ extension MenuCommandTests {
                 "the field's text was not selected, so ⌘A did nothing at all")
     }
 }
+
+/// The phase 2 file-operation commands.
+///
+/// Two halves, and both are needed for the same reason ⌘A needed both: an item
+/// that exists but is unreachable, and a rule that is right but wired to
+/// nothing, look identical from either side alone.
+///
+/// - The menu really carries an item per command, with the shortcut the issue
+///   asks for and no second item claiming it. `NSApp.mainMenu` here is what
+///   SwiftUI built from `LightboxApp.commands`, not a reconstruction.
+/// - The enabled-state rule tracks the selection. That half cannot be asserted
+///   through `NSMenuItem.isEnabled`: the items are disabled by a
+///   `@FocusedValue` that resolves to the key window's `BrowserModel`, and the
+///   test host renders the inert scene and builds no model at all — so every
+///   one of them is correctly, and uninterestingly, disabled here. The rule is
+///   therefore asserted where it lives, on `BrowserModel`, and the menu is
+///   asserted to be built from the same `FileCommand` cases the rule is keyed
+///   on. `FileOperationBatchTests` covers the selection side end to end.
+@MainActor
+struct FileOperationMenuTests {
+    private func fileMenu() -> NSMenu? {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if let file = NSApp?.mainMenu?.items
+                .compactMap(\.submenu)
+                .first(where: { menu in
+                    menu.items.contains { $0.title == FileCommand.moveTo.title }
+                }) {
+                return file
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        return nil
+    }
+
+    @Test func everyFileCommandHasExactlyOneMenuItem() throws {
+        let menu = try #require(fileMenu(), "no menu carries the file-operation commands")
+        let titles = menu.items.map(\.title)
+        for command in FileCommand.allCases {
+            let found = titles.filter { $0 == command.title }.count
+            #expect(found == 1,
+                    "\(command.title) appears \(found) times; the menu holds \(titles)")
+        }
+    }
+
+    /// ⌘⌫ on Move to Trash, nothing on the other three.
+    ///
+    /// Move To…, Copy To… and Delete Permanently… deliberately have no key
+    /// equivalent: each one opens a panel or a sheet, none of them is a gesture
+    /// worth a chord, and a shortcut on Delete Permanently is a way to lose
+    /// photos by mistyping. ⌘⌫ is the one the issue asks for, and it collides
+    /// with nothing else in the menu bar — asserted rather than assumed,
+    /// because that is precisely how ⌘A came to be dead.
+    @Test func moveToTrashCarriesCommandDeleteAndNothingElseClaimsIt() throws {
+        let menu = try #require(fileMenu(), "no menu carries the file-operation commands")
+        let trash = try #require(menu.items.first { $0.title == FileCommand.trash.title })
+        #expect(trash.keyEquivalent == "\u{8}", "⌘⌫ is a backspace key equivalent")
+        #expect(trash.keyEquivalentModifierMask == .command)
+
+        for command in [FileCommand.moveTo, .copyTo, .deletePermanently] {
+            let item = try #require(menu.items.first { $0.title == command.title })
+            #expect(item.keyEquivalent.isEmpty,
+                    "\(command.title) claims '\(item.keyEquivalent)'")
+        }
+
+        let claimants = (NSApp?.mainMenu?.items.compactMap(\.submenu) ?? [])
+            .flatMap(\.items)
+            .filter { $0.keyEquivalent == "\u{8}" && $0.keyEquivalentModifierMask == .command }
+        #expect(claimants.count == 1,
+                "\(claimants.count) items claim ⌘⌫: \(claimants.map(\.title))")
+    }
+
+    /// The `.disabled` really reaches AppKit.
+    ///
+    /// Measured, not assumed: SwiftUI drops the `action` off a disabled
+    /// `CommandGroup` item entirely, so `action == nil` here *is* the disabled
+    /// state — which is why the first assertion is not redundant. Open Folder…
+    /// sits in the same group, is never disabled, and keeps its action; if the
+    /// file commands lost theirs for some reason other than being disabled,
+    /// that one would have lost its too.
+    ///
+    /// The test host builds no `BrowserModel` at all (`LaunchEnvironment`, #15),
+    /// so `@FocusedValue(\.browserModel)` resolves to nil and every file command
+    /// is correctly off. The selection side of the same rule — off with an empty
+    /// selection, on with one — is `FileOperationBatchTests`, against a real
+    /// model.
+    @Test func theFileCommandsAreOffWhenThereIsNoBrowserWindow() throws {
+        let menu = try #require(fileMenu(), "no menu carries the file-operation commands")
+        let open = try #require(menu.items.first { $0.title == "Open Folder…" },
+                                "Open Folder… is not in this menu, so the control is worthless")
+        #expect(open.action != nil,
+                "even the always-enabled command lost its action; this menu proves nothing")
+
+        for command in FileCommand.allCases {
+            let item = try #require(menu.items.first { $0.title == command.title })
+            #expect(item.action == nil,
+                    "\(command.title) is live with no window to act in")
+        }
+    }
+
+    /// The stock Undo is left standing.
+    ///
+    /// #6 adds the real ⌘Z. It is deliberately *not* stubbed as a second Undo
+    /// item here: the Edit menu already carries one from SwiftUI's `.undoRedo`
+    /// group, and two items sharing ⌘Z is the exact collision that left ⌘A
+    /// mouse-only — AppKit strips the key equivalent off the custom item. The
+    /// hook #6 needs is `BrowserModel.lastCompletedBatch` and `undoMenuTitle`,
+    /// which exist and are tested; the menu item is #6's to place.
+    @Test func theStockUndoIsStillThereForIssue6ToReplace() throws {
+        let edit = try #require(NSApp?.mainMenu?.items.compactMap(\.submenu)
+            .first { $0.items.contains { $0.title == "Undo" } },
+            "no Edit menu carries an Undo item")
+        #expect(edit.items.filter { $0.title.hasPrefix("Undo") }.count == 1)
+    }
+}
