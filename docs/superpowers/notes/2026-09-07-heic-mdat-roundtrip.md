@@ -341,6 +341,23 @@ all 1238 digests are distinct, which is the expected answer for an archive that
 has already been deduplicated: the rule is not collapsing different photographs
 into one group.
 
+## The fixture the tests use
+
+The round-trip above runs on files far too large to check in. macOS's own HEIF
+encoder turns out to produce the same structure, though: `CGImageDestination`
+writing a 1024×768 image emits a `grid` primary of four `hvc1` tiles with the
+grid descriptor in `idat` under `construction_method == 1` — the real shape, in
+17,268 bytes and with no photograph in it. That file is
+`Core/Tests/LightboxCoreTests/Fixtures/grid.heic`, and it round-trips exactly
+like the captures above: primary extents identical, `mdat` both grown and moved
+(669 → 791).
+
+Below 1024×768 the encoder stops tiling and writes a single `hvc1` item, so the
+fixture is checked in rather than generated: a future macOS raising that
+threshold would otherwise turn the grid test back into the single-item case
+without anything failing. `theCheckedInFixtureIsATiledGridHEIC` pins its size
+and extents so that cannot pass unnoticed.
+
 ## Reproducing
 
 ```bash

@@ -95,7 +95,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 305 tests, 20 suites.
+# Core: 341 tests, 21 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 57 tests.
@@ -147,7 +147,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 305 tests live. `App/` only wires it to views.
+where all the logic and all 341 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -208,8 +208,14 @@ call every HEIC a duplicate of every other. Auxiliaries (gain map, depth map,
 mattes, thumbnail) and `ipco` are excluded on purpose.
 
 Two traps found the hard way, both now guarded and tested:
-- **Motion photos** (Pixel/Samsung append an MP4 after JPEG EOI) hash identically
-  to their stripped stills under `image_hash`.
+- **Motion photos** (Pixel/Samsung append an MP4 after JPEG EOI) *used to* hash
+  identically to their stripped stills under `image_hash`, because the parser
+  stopped at EOI. That was the bug, not the intent: the duplicate view would
+  have offered to delete the copy carrying the video. `2f698b0` hashes
+  everything after EOI, so the two now differ, and `JPEGImageHash` says why in
+  the EOI case. PNG (after IEND), WebP (past the declared RIFF size) and HEIC
+  (past the last box) all follow the same convention: an appended payload is
+  content, not metadata.
 - **Chunk-flood amplification**: a hostile 256 MB PNG drove 4.37 GB RSS; JPEG was
   22× worse. Fixed by coalescing ranges. Any new format parser needs the same.
   HEIC needs more than coalescing: `iloc` can declare `offset_size == 0` and

@@ -33,6 +33,10 @@ import Foundation
 /// which carries `hvcC`/`ispe`/`irot`/`colr`, is excluded for the same reason a
 /// sibling image must not move this hash — and because §11 has already ruled
 /// that an orientation-only difference hashes as identical.
+///
+/// This type is the normative rule. `scripts/heic-box-walk.swift` is a
+/// diagnostic that reports the same structures in a readable form and was used
+/// to produce the note's box tables; where the two disagree, this one is right.
 enum HEICImageHash {
     static let kind = "heic-item-v1"
 
@@ -42,12 +46,18 @@ enum HEICImageHash {
     /// so a few hundred kilobytes of `iloc` can name millions of extents that
     /// cost nothing on disk, land on the same offset, and therefore never
     /// coalesce. That is the PNG chunk flood in a new container — 4.37 GB of RSS
-    /// at 256 MB of input — so the count is capped rather than trusted. A real
-    /// primary item has tens of extents; this leaves four orders of magnitude of
-    /// headroom, and exceeding it costs only the image hash, since `FileHasher`
-    /// treats a parse failure as "no image hash" and still records the content
-    /// hash.
-    static let maxExtents = 1 << 20
+    /// at 256 MB of input — so the count is capped rather than trusted.
+    ///
+    /// The cap is what bounds amplification, so it is set against that rather
+    /// than against generosity: one extent costs as little as one byte of
+    /// `iloc` but sixteen bytes of `Range`, and the indexer hashes several files
+    /// at once. At 2^16 a hostile file can turn a megabyte of input into about
+    /// 1 MB of ranges instead of the 77 MB that 2^20 allowed. Real primaries
+    /// have tens of extents — 48 tiles on an iPhone capture, 4 on the smallest
+    /// grid fixture — so this still leaves three orders of magnitude of
+    /// headroom, and exceeding it costs only the image hash: `FileHasher` treats
+    /// a parse failure as "no image hash" and still records the content hash.
+    static let maxExtents = 1 << 16
 
     /// Brands that mark an ISOBMFF file as a HEIF image rather than, say, an
     /// MP4 with a `.heic` extension. Matched against the major brand and every
@@ -86,12 +96,20 @@ enum HEICImageHash {
 
     /// Every multi-byte read goes through here, so a forged length can only
     /// produce `HashError.truncated` and never an out-of-bounds access.
+    ///
+    /// `limit` is the end of the box being read, not the end of the file. A
+    /// short `iref` whose reference count overruns its own box would otherwise
+    /// keep reading — collecting item ids out of `iloc`, or out of `mdat`'s
+    /// compressed bytes — and produce a confident answer from garbage. Bounding
+    /// each parse to its own box turns that into an error.
     private struct Cursor {
         let bytes: UnsafeRawBufferPointer
+        let limit: Int
         var offset: Int
 
-        init(_ bytes: UnsafeRawBufferPointer, at offset: Int) {
+        init(_ bytes: UnsafeRawBufferPointer, at offset: Int, limit: Int) {
             self.bytes = bytes
+            self.limit = min(limit, bytes.count)
             self.offset = offset
         }
 
@@ -101,7 +119,7 @@ enum HEICImageHash {
             guard width >= 0, width <= 8 else {
                 throw HashError.malformed("field width \(width) is not addressable")
             }
-            guard offset >= 0, offset <= bytes.count - width else { throw HashError.truncated }
+            guard offset >= 0, offset <= limit - width else { throw HashError.truncated }
             // Accumulated as `UInt64`: a 64-bit `largesize` or `base_offset`
             // with the high bit set overflows the shift on a signed `Int` and
             // traps, which a hostile file must not be able to cause.
@@ -117,7 +135,7 @@ enum HEICImageHash {
         }
 
         mutating func skip(_ count: Int) throws {
-            guard count >= 0, offset <= bytes.count - count else { throw HashError.truncated }
+            guard count >= 0, offset <= limit - count else { throw HashError.truncated }
             offset += count
         }
     }
@@ -134,7 +152,7 @@ enum HEICImageHash {
     private static func readBox(_ bytes: UnsafeRawBufferPointer,
                                 at offset: Int, limit: Int) throws -> BoxSpan? {
         guard offset >= 0, offset + 8 <= limit else { return nil }
-        var cursor = Cursor(bytes, at: offset)
+        var cursor = Cursor(bytes, at: offset, limit: limit)
         var size = try cursor.read(4)
         let type = UInt32(try cursor.read(4))
         var headerLength = 8
@@ -228,6 +246,9 @@ enum HEICImageHash {
         let primaryType = try itemType(bytes, in: metaSpan, id: primary)
         let codedIDs = try codedItemIDs(bytes, in: metaSpan,
                                         primary: primary, primaryType: primaryType)
+        if derivedItemTypes.contains(primaryType) {
+            try validateCodedItems(bytes, in: metaSpan, ids: codedIDs, primary: primary)
+        }
 
         // 3. Read their extents out of `iloc`, in `dimg` order.
         let idatPayloadStart = try findBox(bytes, type: idatCode, in: metaSpan)?.contentStart
@@ -253,7 +274,7 @@ enum HEICImageHash {
 
     private static func checkBrands(_ bytes: UnsafeRawBufferPointer, ftyp: BoxSpan) throws {
         guard ftyp.end - ftyp.contentStart >= 8 else { throw HashError.truncated }
-        var cursor = Cursor(bytes, at: ftyp.contentStart)
+        var cursor = Cursor(bytes, at: ftyp.contentStart, limit: ftyp.end)
         let major = UInt32(try cursor.read(4))
         _ = try cursor.read(4)                              // minor version
         if heifBrands.contains(major) { return }
@@ -269,7 +290,7 @@ enum HEICImageHash {
         guard let pitm = try findBox(bytes, type: pitmCode, in: span) else {
             throw HashError.malformed("no pitm box")
         }
-        var cursor = Cursor(bytes, at: pitm.contentStart)
+        var cursor = Cursor(bytes, at: pitm.contentStart, limit: pitm.end)
         let version = try cursor.read(1)
         try cursor.skip(3)                                  // flags
         return try cursor.read(version == 0 ? 2 : 4)
@@ -281,7 +302,7 @@ enum HEICImageHash {
     private static func itemType(_ bytes: UnsafeRawBufferPointer,
                                  in span: Range<Int>, id: Int) throws -> UInt32 {
         guard let iinf = try findBox(bytes, type: iinfCode, in: span) else { return 0 }
-        var cursor = Cursor(bytes, at: iinf.contentStart)
+        var cursor = Cursor(bytes, at: iinf.contentStart, limit: iinf.end)
         let version = try cursor.read(1)
         try cursor.skip(3)
         _ = try cursor.read(version == 0 ? 2 : 4)           // entry_count
@@ -289,7 +310,7 @@ enum HEICImageHash {
         var i = cursor.offset
         while let entry = try readBox(bytes, at: i, limit: iinf.end) {
             if entry.type == infeCode {
-                var e = Cursor(bytes, at: entry.contentStart)
+                var e = Cursor(bytes, at: entry.contentStart, limit: entry.end)
                 let entryVersion = try e.read(1)
                 try e.skip(3)
                 if entryVersion >= 2 {
@@ -307,13 +328,20 @@ enum HEICImageHash {
     /// The items whose extents make up the primary image. A `grid`, `iovl` or
     /// `iden` primary is a derived item: its own extent is a layout descriptor,
     /// and its `dimg` reference names the coded items in assembly order.
+    ///
+    /// A derived primary that cannot be resolved yields an empty list rather
+    /// than falling back to the primary itself. That fallback is not a
+    /// conservative default, it is a correctness bug: a `grid` item's own extent
+    /// is eight bytes of rows, columns and tile dimensions, so every photograph
+    /// of a given size would hash to the same value and the duplicate view would
+    /// offer to delete all but one of them.
     private static func codedItemIDs(_ bytes: UnsafeRawBufferPointer,
                                      in span: Range<Int>,
                                      primary: Int, primaryType: UInt32) throws -> [Int] {
         guard derivedItemTypes.contains(primaryType) else { return [primary] }
-        guard let iref = try findBox(bytes, type: irefCode, in: span) else { return [primary] }
+        guard let iref = try findBox(bytes, type: irefCode, in: span) else { return [] }
 
-        var cursor = Cursor(bytes, at: iref.contentStart)
+        var cursor = Cursor(bytes, at: iref.contentStart, limit: iref.end)
         let version = try cursor.read(1)
         try cursor.skip(3)
         let idWidth = version == 0 ? 2 : 4
@@ -321,23 +349,80 @@ enum HEICImageHash {
         var i = cursor.offset
         while let entry = try readBox(bytes, at: i, limit: iref.end) {
             if entry.type == dimgCode {
-                var e = Cursor(bytes, at: entry.contentStart)
+                var e = Cursor(bytes, at: entry.contentStart, limit: entry.end)
                 let from = try e.read(idWidth)
                 let count = try e.read(2)
                 if from == primary {
                     var ids: [Int] = []
                     ids.reserveCapacity(min(count, 4096))
                     for _ in 0..<count { ids.append(try e.read(idWidth)) }
-                    // A derived item that references nothing describes no image.
-                    // Falling back to its own extent would hash eight bytes of
-                    // layout metadata as though they were pixels.
                     return ids
                 }
             }
             guard entry.end > i else { throw HashError.malformed("zero-length iref at \(i)") }
             i = entry.end
         }
-        return [primary]
+        return []
+    }
+
+    /// The `item_type` of each of `ids`, in one pass over `iinf`.
+    ///
+    /// Separate from `itemType(_:in:id:)` because the per-id form would be
+    /// quadratic here: a flooded file names tens of thousands of tiles, and
+    /// re-walking `iinf` for each would be tens of thousands of walks.
+    private static func itemTypes(_ bytes: UnsafeRawBufferPointer,
+                                  in span: Range<Int>, ids: Set<Int>) throws -> [Int: UInt32] {
+        guard let iinf = try findBox(bytes, type: iinfCode, in: span) else { return [:] }
+        var cursor = Cursor(bytes, at: iinf.contentStart, limit: iinf.end)
+        let version = try cursor.read(1)
+        try cursor.skip(3)
+        _ = try cursor.read(version == 0 ? 2 : 4)           // entry_count
+
+        var types: [Int: UInt32] = [:]
+        var i = cursor.offset
+        while let entry = try readBox(bytes, at: i, limit: iinf.end) {
+            if entry.type == infeCode {
+                var e = Cursor(bytes, at: entry.contentStart, limit: entry.end)
+                let entryVersion = try e.read(1)
+                try e.skip(3)
+                if entryVersion >= 2 {
+                    let entryID = try e.read(entryVersion == 2 ? 2 : 4)
+                    try e.skip(2)                           // item_protection_index
+                    if ids.contains(entryID) { types[entryID] = UInt32(try e.read(4)) }
+                }
+            }
+            guard entry.end > i else { throw HashError.malformed("zero-length infe at \(i)") }
+            i = entry.end
+        }
+        return types
+    }
+
+    /// A derived primary must resolve to coded items — items that carry bytes.
+    ///
+    /// Without this a `grid` with no `dimg`, a `dimg` that names the grid
+    /// itself, or a `grid` whose targets are themselves `grid`s all end up
+    /// hashing an eight-byte layout descriptor. Two different photographs of the
+    /// same dimensions then collide, which is the one failure mode this whole
+    /// file exists to prevent. Rejecting instead means `FileHasher` records
+    /// `imageHash == nil` and duplicate detection falls back to `content_hash`,
+    /// which is merely less useful rather than wrong.
+    private static func validateCodedItems(_ bytes: UnsafeRawBufferPointer,
+                                           in span: Range<Int>,
+                                           ids: [Int], primary: Int) throws {
+        guard !ids.isEmpty else {
+            throw HashError.malformed("derived primary item \(primary) resolves to no coded items")
+        }
+        let types = try itemTypes(bytes, in: span, ids: Set(ids))
+        for id in ids {
+            guard id != primary else {
+                throw HashError.malformed("derived primary item \(primary) references itself")
+            }
+            let type = types[id] ?? 0
+            guard !derivedItemTypes.contains(type) else {
+                throw HashError.malformed(
+                    "derived primary item \(primary) references derived item \(id)")
+            }
+        }
     }
 
     /// `iloc`, §8.11.3, read in one pass. Versions 0, 1 and 2 differ in the
@@ -355,14 +440,23 @@ enum HEICImageHash {
             throw HashError.malformed("no iloc box")
         }
 
-        var cursor = Cursor(bytes, at: iloc.contentStart)
+        var cursor = Cursor(bytes, at: iloc.contentStart, limit: iloc.end)
         let version = try cursor.read(1)
         try cursor.skip(3)
+        // ISO/IEC 14496-12 permits only 0, 4 and 8 for each of these widths.
+        // Anything else is a forged nibble, and accepting it would let a file
+        // choose an arithmetic this parser has not reasoned about.
+        func validWidth(_ width: Int, _ name: String) throws -> Int {
+            guard width == 0 || width == 4 || width == 8 else {
+                throw HashError.malformed("iloc \(name) of \(width) is not 0, 4 or 8")
+            }
+            return width
+        }
         let sizes = try cursor.read(1)
-        let offsetSize = sizes >> 4
-        let lengthSize = sizes & 0x0F
+        let offsetSize = try validWidth(sizes >> 4, "offset_size")
+        let lengthSize = try validWidth(sizes & 0x0F, "length_size")
         let sizes2 = try cursor.read(1)
-        let baseOffsetSize = sizes2 >> 4
+        let baseOffsetSize = try validWidth(sizes2 >> 4, "base_offset_size")
         // `index_size` occupies the low nibble only from version 1 on; in
         // version 0 those bits are reserved and there is no extent index.
         let indexSize = version == 0 ? 0 : sizes2 & 0x0F
@@ -383,7 +477,15 @@ enum HEICImageHash {
             let id = try cursor.read(idWidth)
             var construction = 0
             if version >= 1 { construction = try cursor.read(2) & 0x0F }
-            try cursor.skip(2)                              // data_reference_index
+            // A non-zero `data_reference_index` points into `dinf`/`dref`: the
+            // item's bytes live in another file. There are none to hash here,
+            // and treating the offset as local would hash whatever happened to
+            // be at that position in this file.
+            let dataReference = try cursor.read(2)
+            guard dataReference == 0 else {
+                throw HashError.malformed(
+                    "item \(id) has external data_reference_index \(dataReference)")
+            }
             let declaredBase = try cursor.read(baseOffsetSize)
             let extentCount = try cursor.read(2)
 

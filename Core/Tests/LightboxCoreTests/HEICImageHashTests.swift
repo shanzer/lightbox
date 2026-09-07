@@ -51,10 +51,11 @@ private func fullBox(_ type: String, version: Int, _ payload: Data) -> Data {
 private struct HEIFItem {
     var id: Int
     var type: String            // "hvc1", "grid", "Exif", "mime", …
-    /// The item's bytes. A `grid` item's descriptor goes in `idat` instead, so
-    /// this is empty for one.
+    /// The item's bytes. They are laid out in `mdat` for a `construction_method`
+    /// of 0 and in `idat` for one of 1.
     var payload: [UInt8] = []
-    /// `construction_method`: 0 = file offset, 1 = relative to `idat`.
+    /// `construction_method`: 0 = file offset, 1 = relative to `idat`,
+    /// 2 = relative to another item (which this parser refuses).
     var construction: Int = 0
 }
 
@@ -67,8 +68,9 @@ private struct HEIFBuilder {
     var primary: Int = 1
     /// `iref` entries, as (type, fromID, toIDs).
     var references: [(String, Int, [Int])] = []
-    /// The `idat` payload, holding any `construction_method == 1` item's bytes.
-    var idat: [UInt8] = []
+    /// Writes the `iloc` entries with `construction_method == 1` but leaves the
+    /// `idat` box out, so there is nothing for them to be relative to.
+    var omitIdat = false
     /// Bytes appended after the last box.
     var trailer: [UInt8] = []
     var majorBrand = "heic"
@@ -105,7 +107,12 @@ private struct HEIFBuilder {
         }
         let iref = references.isEmpty ? Data() : fullBox("iref", version: 0, irefBody)
 
-        let idatBox = idat.isEmpty ? Data() : box("idat", Data(idat))
+        // `idat` is derived rather than set by hand, and in the same item order
+        // `makeILOC` walks — so a construction-1 item's declared offset and the
+        // bytes actually sitting there cannot drift apart.
+        var idat: [UInt8] = []
+        for item in items where item.construction == 1 { idat.append(contentsOf: item.payload) }
+        let idatBox = (idat.isEmpty || omitIdat) ? Data() : box("idat", Data(idat))
 
         // `iloc` must name absolute file offsets, which depend on how large
         // `iloc` itself is — so it is built once with placeholder offsets to
@@ -165,6 +172,12 @@ private struct HEIFBuilder {
     }
 }
 
+/// A `grid` item's own extent: version, flags, rows-1, columns-1 and the output
+/// dimensions. Eight bytes that say nothing about the picture — which is why
+/// hashing them instead of the tiles would collapse every same-sized photograph
+/// into one duplicate group.
+private let gridDescriptor: [UInt8] = [0, 0, 0, 2, 0x04, 0x00, 0x03, 0x00]
+
 /// Tile bytes that differ per tile, so a rule that hashed the wrong tiles, or
 /// hashed them in the wrong order, produces a different digest.
 private func tileBytes(_ index: Int, count: Int = 32) -> [UInt8] {
@@ -180,8 +193,7 @@ private func gridFixture(tileCount: Int = 3, seed: Int = 0) -> HEIFBuilder {
     }
     let gridID = tileCount + 1
     b.items.append(HEIFItem(id: gridID, type: "grid",
-                            payload: [0, 0, 0, 0, 0, 0, 0, 0], construction: 1))
-    b.idat = [0, 0, 0, 0, 0, 0, 0, 0]
+                            payload: gridDescriptor, construction: 1))
     b.items.append(HEIFItem(id: gridID + 1, type: "Exif",
                             payload: Array("EXIF-payload-goes-here".utf8)))
     b.primary = gridID
@@ -224,6 +236,51 @@ struct HEICImageHashTests {
         #expect(try ContentHasher().hash(a) != ContentHasher().hash(b))
 
         #expect(try heicHash(a) == heicHash(b))                        // the warranty
+    }
+
+    @Test(.enabled(if: exiftoolAvailable, "exiftool not installed"))
+    func aRealGridHEICSurvivesAnExiftoolMetadataRoundTrip() throws {
+        // The test above uses what `Fixtures.writeImage` produces at 64×48: a
+        // single `hvc1` primary, no `grid`, no `idat`. Every HEIC in a real
+        // library is tiled, so the shape that actually ships needs a fixture of
+        // its own — a checked-in file rather than a generated one, so that a
+        // future macOS changing its tiling threshold cannot quietly turn this
+        // back into the single-item case.
+        let a = tree.root.appendingPathComponent("grid-a.heic")
+        let b = tree.root.appendingPathComponent("grid-b.heic")
+        try FileManager.default.copyItem(at: Fixtures.url("grid.heic"), to: a)
+        try FileManager.default.copyItem(at: a, to: b)
+        #expect(exiftool(["-q", "-overwrite_original",
+                          "-Description=lightbox-experiment",
+                          "-Keywords=heic-roundtrip",
+                          "-DateTimeOriginal=2021:07:08 09:10:11",
+                          "-OffsetTimeOriginal=-04:00", b.path]))
+
+        // The write restructured the file the way it does on real captures:
+        // `mdat` both grew and moved, because exiftool inserted an XMP item and
+        // `meta` grew ahead of it.
+        let before = try Data(contentsOf: a)
+        let after = try Data(contentsOf: b)
+        #expect(after.count > before.count)
+        #expect(try ContentHasher().hash(a) != ContentHasher().hash(b))
+
+        #expect(try heicHash(a) == heicHash(b))                        // the warranty
+    }
+
+    @Test func theCheckedInFixtureIsATiledGridHEIC() throws {
+        // Pins what the fixture is. If it were a single-item file the
+        // round-trip above would prove nothing about the shape that ships.
+        let data = try Data(contentsOf: Fixtures.url("grid.heic"))
+        #expect(data.count == 17_268)
+
+        // A `grid` primary of four `hvc1` tiles. The tiles abut in `mdat`, so
+        // the four `dimg` extents coalesce into a single range — which is what
+        // every real capture does too, and why the flood guard never fires on
+        // honest input. The span starts at 685, well past `ftyp` and `meta`, so
+        // this cannot be passing by hashing the head of the file.
+        let ranges = try heicRanges(data)
+        #expect(ranges == [685..<17_268])
+        #expect(ranges[0].count == 16_583)
     }
 
     @Test func aDifferentImageChangesTheHash() throws {
@@ -340,19 +397,156 @@ struct HEICImageHashTests {
         #expect(try heicHash(gridFixture().build()) != heicHash(withTrailer.build()))
     }
 
+    // MARK: - construction_method
+
+    /// A grid whose *middle tile* is stored in `idat` rather than `mdat`. Only
+    /// the grid item itself normally uses `construction_method == 1`, and the
+    /// grid item's own extent is never hashed — so without a coded item using
+    /// method 1 the whole branch is unreachable from the tests, and a mutation
+    /// that replaced it with a throw would go unnoticed.
+    private func gridWithATileInIdat() -> HEIFBuilder {
+        var b = HEIFBuilder()
+        b.items = [
+            HEIFItem(id: 1, type: "hvc1", payload: tileBytes(1)),
+            HEIFItem(id: 2, type: "hvc1", payload: tileBytes(2), construction: 1),
+            HEIFItem(id: 3, type: "hvc1", payload: tileBytes(3)),
+            HEIFItem(id: 4, type: "grid", payload: gridDescriptor, construction: 1),
+            HEIFItem(id: 5, type: "Exif", payload: Array("exif".utf8)),
+        ]
+        b.primary = 4
+        b.references = [("dimg", 4, [1, 2, 3]), ("cdsc", 5, [4])]
+        return b
+    }
+
+    @Test func aCodedItemInIdatIsResolvedAgainstTheIdatBox() throws {
+        // `construction_method == 1` makes an extent offset relative to the
+        // payload of `idat`, not to the file. A parser that ignored it would
+        // read tile 2 from offset 32 of the *file* — inside `ftyp` and `meta` —
+        // and hash structure as though it were pixels.
+        let data = gridWithATileInIdat().build()
+        let ranges = try heicRanges(data)
+
+        var hashed = Data()
+        for range in ranges { hashed.append(contentsOf: data[range]) }
+        var expected = Data()
+        for i in 1...3 { expected.append(contentsOf: tileBytes(i)) }
+        #expect(hashed == expected)
+
+        // Tile 2 really is somewhere other than the two mdat tiles, so the three
+        // extents cannot have coalesced into one contiguous run.
+        #expect(ranges.count == 3)
+        // And it is earlier in the file than the mdat tiles: `idat` lives inside
+        // `meta`, which precedes `mdat`.
+        #expect(ranges[1].lowerBound < ranges[0].lowerBound)
+    }
+
+    @Test func aCodedItemInIdatWithoutAnIdatBoxIsRefused() throws {
+        var b = gridWithATileInIdat()
+        b.omitIdat = true
+        let error = #expect(throws: HashError.self) { try heicRanges(b.build()) }
+        guard case .malformed(let message)? = error else {
+            Issue.record("expected a malformed error, got \(String(describing: error))")
+            return
+        }
+        #expect(message.contains("idat"))
+    }
+
+    @Test func anUnsupportedConstructionMethodIsRefused() throws {
+        // Method 2 makes an offset relative to another *item*. No writer
+        // measured here produces it, and guessing at it would be a way to hash
+        // the wrong bytes silently, so it is refused rather than approximated.
+        var b = gridWithATileInIdat()
+        b.items[1].construction = 2
+        let error = #expect(throws: HashError.self) { try heicRanges(b.build()) }
+        guard case .malformed(let message)? = error else {
+            Issue.record("expected a malformed error, got \(String(describing: error))")
+            return
+        }
+        #expect(message.contains("construction_method"))
+    }
+
+    // MARK: - A derived primary that does not resolve
+
+    /// The failure these three guard against is the worst one this file can
+    /// produce. A `grid` item's own extent is eight bytes of rows, columns and
+    /// output size, so falling back to it makes every photograph of a given
+    /// dimension hash identically — and the duplicate view would then offer to
+    /// delete all but one of them.
+    @Test func aGridPrimaryWithNoDimgReferenceIsRefused() throws {
+        var b = gridFixture()
+        b.references = [("cdsc", b.primary + 1, [b.primary])]     // no dimg at all
+        try expectUnresolvedDerivedPrimary(b, containing: "no coded items")
+    }
+
+    @Test func aGridPrimaryThatReferencesItselfIsRefused() throws {
+        var b = gridFixture()
+        b.references[0] = ("dimg", b.primary, [b.primary])
+        try expectUnresolvedDerivedPrimary(b, containing: "references itself")
+    }
+
+    @Test func aGridPrimaryThatReferencesAnotherGridIsRefused() throws {
+        var b = gridFixture()
+        let inner = 90
+        b.items.append(HEIFItem(id: inner, type: "grid", payload: gridDescriptor))
+        b.references[0] = ("dimg", b.primary, [inner])
+        try expectUnresolvedDerivedPrimary(b, containing: "derived item")
+    }
+
+    @Test func twoDifferentPhotographsWithUnresolvableGridsDoNotCollide() throws {
+        // The bug in its original form. These two files hold different pictures
+        // — different tile bytes, so different hashes when their grids resolve —
+        // but identical eight-byte grid descriptors, because the descriptor
+        // says only "two by two, 1024 by 768". Hashing the primary item's own
+        // extent as a fallback therefore made them a duplicate pair.
+        var a = gridFixture(tileCount: 3, seed: 0)
+        var c = gridFixture(tileCount: 3, seed: 40)
+        #expect(try heicHash(a.build()) != heicHash(c.build()))      // they are different pictures
+
+        a.references = []
+        c.references = []
+        let dataA = a.build(), dataC = c.build()
+        let descriptorA = try heicRanges(gridFixture().build())      // resolvable, for contrast
+        #expect(!descriptorA.isEmpty)
+
+        // Neither has an image hash now, so neither can equal the other.
+        #expect(throws: HashError.self) { try heicRanges(dataA) }
+        #expect(throws: HashError.self) { try heicRanges(dataC) }
+    }
+
+    /// Asserts the parser refuses, and that `FileHasher` turns that refusal into
+    /// `imageHash == nil` with a content hash still recorded.
+    private func expectUnresolvedDerivedPrimary(_ builder: HEIFBuilder,
+                                                containing fragment: String) throws {
+        let data = builder.build()
+        let error = #expect(throws: HashError.self) { try heicRanges(data) }
+        guard case .malformed(let message)? = error else {
+            Issue.record("expected a malformed error, got \(String(describing: error))")
+            return
+        }
+        #expect(message.contains(fragment), "got: \(message)")
+
+        let url = tree.root.appendingPathComponent("unresolved-\(UUID().uuidString).heic")
+        try data.write(to: url)
+        let hashes = try FileHasher().hashes(for: url, mediaType: MediaType.forExtension("heic")!)
+        #expect(hashes.imageHash == nil)
+        #expect(hashes.imageHashKind == nil)
+        #expect(hashes.contentHash == (try ContentHasher().hash(url)))
+    }
+
     // MARK: - Amplification
 
     @Test func aGridOfManyAbuttingTilesCollapsesToOneRange() throws {
-        // 30,000 one-byte tiles. Uncoalesced this is one `Range` per tile, and
-        // Task 9's 256 MB in-memory limit admits a file of this shape — at that
-        // size the PNG equivalent cost 1.2 GB of RSS, and the indexer hashes
-        // several files at once.
+        // 60,000 one-byte tiles — just under `maxExtents`, so this is the
+        // largest legitimate shape the parser accepts. Uncoalesced it is one
+        // `Range` per tile, and Task 9's 256 MB in-memory limit admits a file of
+        // this shape: at that size the PNG equivalent cost 1.2 GB of RSS, and
+        // the indexer hashes several files at once.
         var b = HEIFBuilder()
-        let tiles = 30_000
+        let tiles = 60_000
+        #expect(tiles < HEICImageHash.maxExtents)
         for i in 1...tiles { b.items.append(HEIFItem(id: i, type: "hvc1", payload: [UInt8(i & 0xFF)])) }
         b.items.append(HEIFItem(id: tiles + 1, type: "grid",
-                                payload: [0, 0, 0, 0, 0, 0, 0, 0], construction: 1))
-        b.idat = [0, 0, 0, 0, 0, 0, 0, 0]
+                                payload: gridDescriptor, construction: 1))
         b.primary = tiles + 1
         b.references = [("dimg", tiles + 1, Array(1...tiles))]
 
@@ -366,7 +560,8 @@ struct HEICImageHashTests {
         // few hundred kilobytes of `iloc` can declare millions of extents that
         // cost nothing on disk and do not coalesce. The parser refuses past its
         // cap rather than materialising a `Range` for each.
-        let data = hostileExtentFile(items: 20, extentsPerItem: 65_535)
+        let data = hostileExtentFile(items: 2, extentsPerItem: 65_535)
+        #expect(2 * 65_535 > HEICImageHash.maxExtents)
         #expect(data.count < 2 << 20)                       // the file really is small
 
         let error = #expect(throws: HashError.self) { try heicRanges(data) }
@@ -377,9 +572,9 @@ struct HEICImageHashTests {
         #expect(message.contains("extent"))
     }
 
-    /// An `iloc` with `offset_size == 0` and `length_size == 1`: every extent
-    /// costs one byte on disk, starts at the same place and has a different
-    /// length, so none of them merge into its neighbour.
+    /// An `iloc` with `offset_size == 0`: every extent starts at the same place
+    /// and has a different length, so none of them merge into its neighbour,
+    /// and four bytes of `iloc` buys a sixteen-byte `Range`.
     private func hostileExtentFile(items: Int, extentsPerItem: Int) -> Data {
         let ftyp = box("ftyp", Data(Array("heic".utf8) + be(0, 4) + Array("mif1".utf8)))
         let hdlr = fullBox("hdlr", version: 0,
@@ -407,7 +602,7 @@ struct HEICImageHashTests {
         for i in 1...items { irefBody.append(contentsOf: be(i, 2)) }
         let iref = fullBox("iref", version: 0, box("dimg", irefBody))
 
-        var ilocBody = Data([0x01, 0x40])            // offset_size 0, length_size 1,
+        var ilocBody = Data([0x04, 0x40])            // offset_size 0, length_size 4,
                                                      // base_offset_size 4, index_size 0
         ilocBody.append(contentsOf: be(items + 1, 2))
         for i in 1...(items + 1) {
@@ -417,7 +612,9 @@ struct HEICImageHashTests {
             ilocBody.append(contentsOf: be(0, 4))    // base_offset
             let count = i > items ? 1 : extentsPerItem
             ilocBody.append(contentsOf: be(count, 2))
-            for e in 0..<count { ilocBody.append(UInt8(truncatingIfNeeded: e &+ 1)) }
+            for e in 0..<count {
+                ilocBody.append(contentsOf: be(Int(UInt8(truncatingIfNeeded: e &+ 1)), 4))
+            }
         }
         let iloc = fullBox("iloc", version: 1, ilocBody)
 

@@ -10,10 +10,18 @@
 // §14 asks: does the primary item's coded image data survive a metadata
 // round-trip byte-for-byte.
 //
-// Usage:  swift scripts/heic-box-walk.swift <file.heic> [--json]
+// Usage:  swift scripts/heic-box-walk.swift <file.heic>
 //
-// Not part of the shipped package; it exists so the note's box tables are
-// reproducible.
+// THIS IS A DIAGNOSTIC, NOT THE RULE. It is not part of the shipped package and
+// nothing depends on it. The normative implementation is
+// `Core/Sources/LightboxCore/Hashing/HEICImageHash.swift`, which is stricter
+// than this walker in ways that matter for untrusted input: it bounds every
+// read by the enclosing box, caps the extent count, rejects field widths ISO
+// does not define and external data references, and refuses a derived primary
+// item that does not resolve to coded items. Where the two disagree, the parser
+// in `Core/` is right and this file should be corrected to match. It exists so
+// the box tables in `docs/superpowers/notes/2026-09-07-heic-mdat-roundtrip.md`
+// are reproducible by hand.
 
 import Foundation
 import CryptoKit
