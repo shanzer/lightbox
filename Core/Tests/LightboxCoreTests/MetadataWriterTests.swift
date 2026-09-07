@@ -559,6 +559,29 @@ struct MetadataWriterRoundTripTests {
         #expect(!FileManager.default.fileExists(atPath: sidecar.path + "_original"))
     }
 
+    /// The HEIC caveat, made visible. HEIC has no `image_hash` rule, so its
+    /// duplicate grouping rests on `content_hash` — which this write just
+    /// invalidated. That is acceptable, but the writer must say so rather than
+    /// let the inspector pretend a HEIC edit costs the same as a JPEG one.
+    @Test(needsExiftool) func aFormatWithNoImageHashRuleSaysSo() async throws {
+        let heic = try Fixtures.writeImage(
+            to: tree.root.appendingPathComponent("nohash.heic"), format: .heic)
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(MetadataEdit(rating: 3), to: [heic])
+        try #require(outcomes[0].error == nil)
+        #expect(outcomes[0].success?.rehash?.imageHash == nil)
+        #expect(outcomes[0].success?.warnings.contains(.imageHashUnavailable(kind: "heic")) == true)
+
+        // A JPEG, which does have a rule, must not carry the warning.
+        let jpeg = try Fixtures.writeImage(to: tree.root.appendingPathComponent("hash.jpg"))
+        let jpegOutcomes = await writer.write(MetadataEdit(rating: 3), to: [jpeg])
+        try #require(jpegOutcomes[0].error == nil)
+        #expect(jpegOutcomes[0].success?.warnings.contains { warning in
+            if case .imageHashUnavailable = warning { return true }
+            return false
+        } == false)
+    }
+
     /// An empty value clears the field out of all three families, and must
     /// verify as *absent* — exiftool removes the tag rather than storing "".
     @Test(needsExiftool) func anEmptyValueClearsTheFieldEverywhere() async throws {

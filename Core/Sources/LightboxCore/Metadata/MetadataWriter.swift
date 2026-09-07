@@ -273,6 +273,14 @@ public actor MetadataWriter {
                                               before: before, after: now))
         }
 
+        // HEIC, TIFF, GIF and PSD have no image-hash rule in version 1, so the
+        // only hash of theirs that survives a metadata edit is the `phash`.
+        // The write is correct; the file is just temporarily ungrouped from
+        // its exact copies, and the inspector should be able to say so.
+        if hashesAfter.imageHash == nil {
+            warnings.append(.imageHashUnavailable(kind: mediaType.kind.rawValue))
+        }
+
         let rehash = RehashResult(size: after.size, mtime: after.mtime,
                                   contentHash: hashesAfter.contentHash,
                                   imageHash: hashesAfter.imageHash,

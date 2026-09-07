@@ -113,6 +113,13 @@ public enum WriteWarning: Sendable, Hashable {
     /// the user's edit over a hashing bug would be the wrong trade — but this
     /// is a bug to file, not to swallow.
     case imageHashChanged(kind: String, before: String, after: String)
+    /// The format has no `image_hash` rule (HEIC, TIFF, GIF, PSD — spec §11's
+    /// last row), so duplicate grouping for this file rests on `content_hash`
+    /// and `phash`, and this write just invalidated the `content_hash`. The
+    /// file is written correctly; what changes is that it is temporarily
+    /// ungrouped from its exact copies. The inspector should say so rather
+    /// than pretend a HEIC edit is as cheap as a JPEG one.
+    case imageHashUnavailable(kind: String)
     /// The container was expected to be byte-identical after a sidecar write
     /// and was not.
     case containerModifiedBySidecarWrite
