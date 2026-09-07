@@ -204,6 +204,14 @@ public actor FileOperator {
             let marks = execution.marksJournal ? Self.marks(ops, execution) : []
             do {
                 if !execution.mutations.isEmpty || !marks.isEmpty {
+                    // The applied count is deliberately not checked. A mutation
+                    // a guard refused is one whose row no longer describes the
+                    // file that was planned against — another pass has already
+                    // moved on — and the filesystem operation still happened,
+                    // so `complete` is the truth about the filesystem and the
+                    // next tier 0 pass reconciles the row. Refusing to journal
+                    // it would make an undoable operation un-undoable to
+                    // protect an index entry that self-heals.
                     try store.applyAndMark(execution.mutations, marks: marks)
                 }
             } catch {

@@ -216,7 +216,7 @@ struct FileOperatorCompanionTests {
     @Test func aRawTakesItsJPEGAndItsSidecarWithIt() async throws {
         let raw = try tree.file("from/IMG_0001.CR2", bytes: 40)
         let jpeg = try tree.file("from/IMG_0001.JPG", bytes: 30)
-        let sidecar = try tree.file("from/IMG_0001.xmp", bytes: 5)
+        _ = try tree.file("from/IMG_0001.xmp", bytes: 5)
         // A file that merely starts with the same characters is not a companion.
         let unrelated = try tree.file("from/IMG_00012.JPG", bytes: 7)
         let destination = try tree.directory("to")

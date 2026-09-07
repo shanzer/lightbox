@@ -166,12 +166,13 @@ where all the logic and all 477 tests live. `App/` only wires it to views.
 | Area | Files | What it does |
 |---|---|---|
 | Walk | `Walker.swift`, `MediaType.swift` | Recursive enumeration; extension + UTI classification (RAW, HEIC, JPEG, PNG, WebP) |
-| Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity |
+| Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift`, `Index/IndexStore+FileOperations.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity; the `op_journal` writes and the guarded row move/copy/remove |
 | Metadata | `Metadata/{ImageMetadata,MetadataReader}.swift` | ImageIO `CGImageSource` reads — dimensions, camera, capture time |
 | Hashing | `Hashing/*.swift` | Three hashes: `content_hash` (whole file), `image_hash` (format-stripped pixel data), `phash` (DCT perceptual) |
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
+| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan, companion files, `op_journal` ordering, per-item results (§8) |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
 | Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
 
@@ -335,7 +336,8 @@ Phase 2 per the spec: file operations (move/copy/delete with an undo journal),
 EXIF editing via exiftool, and the duplicate view built on the three hashes
 already being computed.
 
-Two things belong at the *front* of phase 2 rather than in a backlog:
+Three things belonged at the *front* of phase 2 rather than in a backlog, and
+all three are now done:
 
 - ~~**`DatabasePool` + WAL.**~~ **Done** (issue #3). Readers no longer block on
   the writer, in their own window or another's; the busy timeout stays for
@@ -362,6 +364,59 @@ Two things belong at the *front* of phase 2 rather than in a backlog:
   read refreshes `device` but never erases an established identity); and a
   volume whose UUID *changes* (a reformat) is deliberately out of scope — that
   is a new library.
+
+- ~~**`FileOperator`.**~~ **Done** (issue #5). Move, copy, trash and permanent
+  delete over a selection, spec §8. Five things worth carrying forward:
+
+  **The order is the type.** Journal (`state = 'in_flight'`, one transaction,
+  before a byte moves) → filesystem → index. The index write and the `complete`
+  mark are the *same* transaction, so there is no window in which the index has
+  moved on and the journal has not. `OpJournalState` documents the full state
+  set, which is the contract #6's undo and launch-time reconcile read:
+  `in_flight` (outcome unknown, ask the filesystem), `complete`, `failed`
+  (attempted, nothing changed), `skipped` (journalled, deliberately not
+  attempted — the volume went away), and `reconciled`, which only #6 writes.
+
+  **One journal row per *file*, not per item.** Issue #5 asked for a row per
+  item, and for a photo with no sidecar those are the same thing. They are not
+  the same thing for a RAW with an `.xmp`: the schema has one `src`/`dst` per
+  row and no way to name a companion, so a row per file is the only shape from
+  which undo can put a sidecar back. One `batch_id` keeps them one undoable
+  unit. The spec is untouched by this — §8 constrains the *ordering* ("every
+  operation is written to `op_journal` before it runs and marked complete
+  after"), not the row granularity.
+
+  **Hash carry-over on copy is guarded twice**, and both guards matter. The
+  destination's length must equal the source's (a `copyfile` that returns
+  success can still leave a short file behind a full disk), and the source's
+  `path`/`size`/`mtime` must still match the row that was hashed — the
+  `setHashes(for:)` rule, read rather than written. Either doubt leaves the new
+  row's hashes NULL and re-queues tier 1. A wrong carry-over is a permanent
+  digest for bytes a file does not contain, on a row nothing will revisit, in
+  the table duplicate deletion acts on.
+
+  **A cross-volume move is written out as copy-then-delete** rather than left
+  to `moveItem`, precisely so the intermediate state is reachable and
+  describable: copy landed, source removal refused, both paths present. That is
+  the one outcome the operator will not classify — `complete` and `failed` would
+  both be lies — so the row stays `in_flight` and the reconcile settles it.
+  `replace` likewise moves the existing file aside and removes it only once the
+  item has succeeded; unlinking first has a window in which the user has
+  neither file, reachable by something as ordinary as a full disk.
+
+  **`FileManager.contentsOfDirectory(at:)` resolves symlinks.** A companion of
+  a file under `/var/…` comes back under `/private/var/…`, and `files.path`
+  holds whatever the walker was given. Companion URLs are therefore built by
+  appending *names* to the source's own directory URL. The symptom of getting
+  this wrong is quiet: the `.xmp` moves and its row stays behind.
+
+  Owed: the Seagate live check. The batch was exercised over 50 real photos
+  copied off `03_DEDUPED_ARCHIVE/2019` into a scratch directory on the boot
+  volume — 53 journal rows, all `complete`, companions moved, `files_fts`
+  following the rename — but that is one volume, so the same-volume `rename(2)`
+  path and the `COPYFILE_CLONE` path are the only ones a real drive would add
+  coverage for. The archive holds no RAW and no `.xmp`, so the pair in that
+  check was named rather than found.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And

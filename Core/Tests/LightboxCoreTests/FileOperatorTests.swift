@@ -322,4 +322,17 @@ struct FileOperatorRemovalTests {
                                   destination: tree.root)
         }
     }
+
+    /// A destination that is not there is caught at plan time. The realistic
+    /// cause is the one this app is built around: the drive was unplugged
+    /// between the user picking a folder and the batch being run.
+    @Test func aDestinationThatIsNotThereIsRefusedAtPlanTime() async throws {
+        let source = try tree.file("lib/IMG_0001.jpg", bytes: 8)
+        let missing = tree.root.appendingPathComponent("no-such-folder")
+        let store = try IndexStore.inMemory()
+        let op = FileOperator(store: store)
+        await #expect(throws: FileOperatorError.destinationUnreadable(missing.path)) {
+            _ = try await op.plan(kind: .move, sources: [source], destination: missing)
+        }
+    }
 }
