@@ -60,6 +60,7 @@ struct FileOperatorIntraBatchCollisionTests {
         let op = FileOperator(store: store)
         let plan = try await op.plan(kind: .move, sources: [first, second],
                                      destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
         let results = try await op.execute(plan.resolvingAllCollisions(with: .replace))
         #expect(results.allSatisfy { $0.outcome == .completed })
 
@@ -83,6 +84,7 @@ struct FileOperatorIntraBatchCollisionTests {
         let op = FileOperator(store: store)
         let plan = try await op.plan(kind: .copy, sources: [first, second],
                                      destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
         let results = try await op.execute(plan.resolvingAllCollisions(with: .replace))
         #expect(results.allSatisfy { $0.outcome == .completed })
         #expect(try bytes(destination.appendingPathComponent("IMG_0001.jpg")) == 10)
@@ -428,9 +430,11 @@ struct FileOperatorRestoreGuardTests {
     @Test func restoreRefusesRatherThanDeletingWhatIsAtTheOriginalPath() throws {
         let occupied = try tree.file("to/IMG_0001.jpg", bytes: 77)
         let stash = try tree.file("to/.lightbox-replaced-abc-0-0", bytes: 10)
-        let replacement = PlannedReplacement(occupant: occupied, stash: stash)
+        let staged = StagedReplacement(
+            replacement: PlannedReplacement(occupant: occupied, stash: stash),
+            opID: 1, staged: true)
 
-        let problems = FileOperator.restore([replacement], rollbackSucceeded: false)
+        let problems = FileOperator.restore([staged], rollbackSucceeded: false)
         #expect(problems.count == 1)
         // `first`, not `[0]`: a subscript here traps rather than fails, and a
         // test that crashes the process takes the rest of the suite's output
@@ -449,9 +453,11 @@ struct FileOperatorRestoreGuardTests {
         let destination = try tree.directory("to")
         let occupant = destination.appendingPathComponent("IMG_0001.jpg")
         let stash = try tree.file("to/.lightbox-replaced-abc-0-0", bytes: 10)
-        let replacement = PlannedReplacement(occupant: occupant, stash: stash)
+        let staged = StagedReplacement(
+            replacement: PlannedReplacement(occupant: occupant, stash: stash),
+            opID: 1, staged: true)
 
-        let problems = FileOperator.restore([replacement], rollbackSucceeded: true)
+        let problems = FileOperator.restore([staged], rollbackSucceeded: true)
         #expect(problems.isEmpty)
         #expect(try bytes(occupant) == 10)
         #expect(!exists(stash))
@@ -495,5 +501,244 @@ struct FileOperatorReplaceBackstopTests {
         #expect(try bytes(alreadyThere) == 77)
         #expect(try bytes(destination.appendingPathComponent("IMG_0001 2.jpg")) == 20)
         #expect(try store.count() == 2)
+    }
+}
+
+// MARK: - C1/I1: a vanished occupant settles its own row and retires its own row
+
+/// The occupant of a `replace` can go away in the same plan/execute gap the
+/// design already documents for sources. Staging then skips it, so the staged
+/// list is a *subset* of the replacements — and anything that pairs the two by
+/// position afterwards attributes every row past the gap to the wrong file.
+struct FileOperatorVanishedOccupantTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// Two occupants, the **first** of which vanishes. Observed before the fix:
+    /// the row for the file that was never trashed carried a Trash URL holding
+    /// the *other* file's bytes, and the file that really was trashed kept no
+    /// record at all. #6 reading that would have written the sidecar's bytes
+    /// over the RAW's path.
+    @Test func asideRowsAreNeverAttributedToAnotherFile() async throws {
+        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
+        _ = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        let destination = try tree.directory("to")
+        let occupantRaw = try tree.file("to/IMG_0001.CR2", bytes: 11)
+        let occupantXmp = try tree.file("to/IMG_0001.xmp", bytes: 12)
+        let store = try IndexStore.inMemory()
+        try index(raw, into: store)
+        try index(occupantRaw, into: store)
+        try index(occupantXmp, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .move, sources: [raw], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        let resolved = plan.resolvingAllCollisions(with: .replace)
+        #expect(resolved.items[0].replacements.count == 2)
+        try FileManager.default.removeItem(at: occupantRaw)
+
+        let results = try await op.execute(resolved)
+        #expect(results[0].outcome == .completed)
+
+        let rows = try store.journalRows(batchID: plan.batchID)
+        let rawAside = try #require(rows.first { $0.kind == .trash && $0.src == occupantRaw.path })
+        let xmpAside = try #require(rows.first { $0.kind == .trash && $0.src == occupantXmp.path })
+        // The file that was never trashed names no Trash URL and is terminal:
+        // it was not displaced, and nothing about it changed.
+        #expect(rawAside.trashURL == nil)
+        #expect(rawAside.state == .failed)
+        // The file that *was* trashed says so, and says where.
+        #expect(xmpAside.state == .complete)
+        let trashed = try #require(xmpAside.trashURL)
+        // The bytes at that URL are the ones that row is about, which is the
+        // whole failure: 12 was the xmp's, 11 the RAW's.
+        #expect(try bytes(URL(fileURLWithPath: trashed)) == 12)
+    }
+
+    /// The index twin. A vanished occupant's row still names the exact path the
+    /// move is about to write, so leaving it turns a move that fully succeeded
+    /// on disk into `indexWriteFailed(UNIQUE files.path)` with two stale rows —
+    /// one carrying a dead photo's `content_hash` at a path now holding
+    /// different bytes.
+    @Test func aVanishedOccupantsStaleRowIsRetiredSoTheMoveLands() async throws {
+        let source = try tree.file("a/IMG_0001.jpg", bytes: 20)
+        let destination = try tree.directory("to")
+        let occupant = try tree.file("to/IMG_0001.jpg", bytes: 10)
+        let store = try IndexStore.inMemory()
+        try index(source, into: store)
+        try index(occupant, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .move, sources: [source], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        let resolved = plan.resolvingAllCollisions(with: .replace)
+        try FileManager.default.removeItem(at: occupant)
+
+        let results = try await op.execute(resolved)
+        #expect(results[0].outcome == .completed)
+        #expect(try bytes(occupant) == 20)
+        #expect(!exists(source))
+
+        #expect(try store.count() == 1)
+        let row = try #require(try store.record(atPath: occupant.path))
+        #expect(row.contentHash == "hash-IMG_0001.jpg")
+        let rows = try store.journalRows(batchID: plan.batchID)
+        #expect(rows.first { $0.kind == .move }?.state == .complete)
+        #expect(rows.first { $0.kind == .trash }?.state == .failed)
+    }
+}
+
+// MARK: - I2: marks already earned are never discarded
+
+struct FileOperatorDisposalMarkTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// A displaced file that has already reached the Trash must keep its row,
+    /// even when a *later* replacement's disposal fails and the item is
+    /// abandoned. Dropping the mark leaves that photo in the Trash under a row
+    /// naming nothing, and the Trash renames on collision, so nothing derives
+    /// the path.
+    @Test func aFailedDisposalStillWritesTheMarksItAlreadyEarned() async throws {
+        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
+        _ = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        let destination = try tree.directory("to")
+        let occupantRaw = try tree.file("to/IMG_0001.CR2", bytes: 11)
+        let occupantXmp = try tree.file("to/IMG_0001.xmp", bytes: 12)
+        let store = try IndexStore.inMemory()
+        try index(raw, into: store)
+
+        // The stash paths are deterministic, so the second one can be removed
+        // between the transfer and the disposal — the shape of a crash in that
+        // window, and the only seam that reaches it.
+        let stashBox = LockBox<URL?>(nil)
+        let op = FileOperator(store: store, volumeReader: { url in
+            VolumeIdentity(device: url.path.hasSuffix("/to") ? 2 : 1,
+                           uuid: url.path.hasSuffix("/to") ? "VOL-B" : "VOL-A")
+        }, copier: { source, target, _ in
+            try FileManager.default.copyItem(at: source, to: target)
+            if source.pathExtension == "xmp", let doomed = stashBox.withLock({ $0 }) {
+                try? FileManager.default.removeItem(at: doomed)
+            }
+        })
+        let plan = try await op.plan(kind: .move, sources: [raw], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        let resolved = plan.resolvingAllCollisions(with: .replace)
+        #expect(resolved.items[0].replacements.count == 2)
+        stashBox.withLock { $0 = resolved.items[0].replacements[1].stash }
+
+        let results = try await op.execute(resolved)
+        guard case .failed(.rollbackIncomplete) = results[0].outcome else {
+            Issue.record("expected .rollbackIncomplete, got \(results[0].outcome)")
+            return
+        }
+
+        let rows = try store.journalRows(batchID: plan.batchID)
+        // The first occupant really did reach the Trash. Its row says so and
+        // names where, despite the item as a whole being abandoned.
+        let rawAside = try #require(rows.first { $0.src == occupantRaw.path })
+        #expect(rawAside.state == .complete)
+        let trashed = try #require(rawAside.trashURL)
+        #expect(try bytes(URL(fileURLWithPath: trashed)) == 11)
+        // The second's fate is genuinely unknown, and the item's own rows with
+        // it: `in_flight` is how that is said.
+        #expect(rows.first { $0.src == occupantXmp.path }?.state == .inFlight)
+        #expect(rows.filter { $0.kind == .move }.allSatisfy { $0.state == .inFlight })
+    }
+}
+
+// MARK: - I3: the last swallowed failures
+
+struct FileOperatorSwallowedFailureTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// A partial copy that cannot be cleared is not "nothing changed". Before
+    /// this, the `try?` left a half-written file at the destination under a row
+    /// saying `failed` — the state the reconcile is defined never to re-examine.
+    @Test func aPartialCopyThatCannotBeClearedIsReportedNotSwallowed() async throws {
+        let source = try tree.file("from/IMG_0001.jpg", bytes: 64)
+        let destination = try tree.directory("to")
+        try tree.chmod("to", 0o755)
+        let store = try IndexStore.inMemory()
+        try index(source, into: store)
+
+        let destinationPath = destination.path
+        let op = FileOperator(store: store, copier: { source, target, _ in
+            // Write half the bytes, seal the directory, then fail: the partial
+            // file is now unremovable.
+            let data = try Data(contentsOf: source)
+            try data.prefix(data.count / 2).write(to: target)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o500)], ofItemAtPath: destinationPath)
+            throw POSIXError(.ENOSPC)
+        })
+        let plan = try await op.plan(kind: .copy, sources: [source], destination: destination)
+        let results = try await op.execute(plan)
+
+        guard case .failed(.rollbackIncomplete(let detail)) = results[0].outcome else {
+            Issue.record("expected .rollbackIncomplete, got \(results[0].outcome)")
+            return
+        }
+        #expect(detail.contains("IMG_0001.jpg"))
+        // Rows stay `in_flight`, because something really is at the destination.
+        #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.inFlight])
+        try tree.chmod("to", 0o755)
+    }
+
+    /// Staging that cannot complete puts back what it staged and reports.
+    /// Occupying the second replacement's stash path with a directory makes its
+    /// aside fail after the first has already been moved aside.
+    @Test func stagingThatFailsPartWayPutsBackWhatItAlreadyMoved() async throws {
+        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
+        _ = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        let destination = try tree.directory("to")
+        let occupantRaw = try tree.file("to/IMG_0001.CR2", bytes: 11)
+        let occupantXmp = try tree.file("to/IMG_0001.xmp", bytes: 12)
+        let store = try IndexStore.inMemory()
+        try index(raw, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .move, sources: [raw], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        let resolved = plan.resolvingAllCollisions(with: .replace)
+        // A directory where the second stash wants to go.
+        try FileManager.default.createDirectory(
+            at: resolved.items[0].replacements[1].stash, withIntermediateDirectories: true)
+
+        let results = try await op.execute(resolved)
+        guard case .failed = results[0].outcome else {
+            Issue.record("expected a failure, got \(results[0].outcome)")
+            return
+        }
+        // Both occupants are back where they were, and the sources never moved.
+        #expect(try bytes(occupantRaw) == 11)
+        #expect(try bytes(occupantXmp) == 12)
+        #expect(try bytes(raw) == 48)
+        #expect(try store.journalRows(batchID: plan.batchID)
+                .allSatisfy { $0.state == .failed })
+    }
+
+    /// A source directory that cannot be listed is not an empty one. Treating it
+    /// as empty moves the RAW and orphans the `.xmp` — silently.
+    @Test func aSourceDirectoryThatCannotBeListedFailsThePlan() async throws {
+        let source = try tree.file("from/IMG_0001.CR2", bytes: 48)
+        _ = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        let destination = try tree.directory("to")
+        let store = try IndexStore.inMemory()
+        let directory = try tree.chmod("from", 0o300)
+
+        let op = FileOperator(store: store)
+        await #expect(throws: FileOperatorError.sourceDirectoryUnreadable(directory.path)) {
+            _ = try await op.plan(kind: .move, sources: [source], destination: destination)
+        }
+        // With companions off there is nothing to list, so the plan stands.
+        let plan = try await op.plan(kind: .move, sources: [source],
+                                     destination: destination, includeCompanions: false)
+        #expect(plan.items.count == 1)
+        try tree.chmod("from", 0o755)
     }
 }

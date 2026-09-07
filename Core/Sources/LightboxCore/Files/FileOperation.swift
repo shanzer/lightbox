@@ -52,14 +52,21 @@ public enum FileOperationKind: String, Sendable, Codable, Hashable, CaseIterable
 /// dot-prefixed stash it waits in. It reaches `complete` with `trash_url` set
 /// once the stash has gone to the Trash, `failed` once the file has been put
 /// back, and stays `in_flight` in between — which is the window a crash lands
-/// in. **A reader that finds such a row `in_flight` finds the photo at `dst`**;
-/// without that row the file would be an unreferenced dot-file and the next
-/// tier 0 pass would prune its index row.
+/// in.
 ///
-/// **`trash_url` on a row that is not `complete`** is a forensic record of where
-/// a file briefly went during an attempt that was then undone, written the
-/// moment `trashItem` returned. It is not a claim that the file is still there:
-/// the row's `state` says what happened.
+/// **How to read an `in_flight` aside row: `stat` `dst` first, then fall back to
+/// `trash_url`.** The row covers two moments, and only the filesystem
+/// distinguishes them. Before the disposal the photo is at `dst`, the stash;
+/// after `trashItem` has returned but before the row could be settled it is at
+/// `trash_url` and `dst` is gone. Reading either field alone is wrong half the
+/// time — and without the row at all the file is an unreferenced dot-file whose
+/// index row the next tier 0 pass prunes.
+///
+/// **`trash_url` on a row that is not `complete`** is where the file went, not a
+/// promise that it is still there. On a `failed` row it is forensic: the file
+/// was put back, and the URL records where it briefly was. On an `in_flight` row
+/// it is live, and it is the second half of the rule above. The `state` says
+/// which.
 ///
 /// - `reconciled` — **written only by #6.** A row that was `in_flight` and has
 ///   since been resolved against the filesystem at launch. `FileOperator` never
@@ -130,6 +137,14 @@ public enum FileOperationFailure: Error, Sendable, Equatable, Hashable {
     /// original's `content_hash` would be a permanently wrong digest on a file
     /// nothing would ever re-hash.
     case copyIncomplete
+    /// A file reached the Trash and where it went could not be written down —
+    /// either the system declined to report the destination, or the journal
+    /// write failed. **The photo is in the Trash and nothing derivable names
+    /// it**: the Trash renames on collision, so the path cannot be reconstructed
+    /// from the original. The message carries whatever was known, and the item's
+    /// rows are left `in_flight` rather than `failed`, which would claim the
+    /// file never moved.
+    case trashURLNotRecorded(String)
     /// A rollback could not put things back. **This is the one failure that
     /// does not mean "nothing changed"** — part of the item is at the
     /// destination, or a replaced file is still in its stash, and the journal
@@ -195,6 +210,15 @@ public enum FileOperatorError: Error, Equatable, Sendable {
     case destinationNotAllowed
     /// The destination is not a directory that currently exists.
     case destinationUnreadable(String)
+    /// A source's own directory could not be listed, so its companions cannot
+    /// be found.
+    ///
+    /// Thrown rather than shrugged off with an empty listing. "No companions"
+    /// and "the companions could not be looked for" are different claims, and
+    /// acting on the first when the second is true moves a RAW and leaves its
+    /// `.xmp` behind — the exact orphaning companion handling exists to
+    /// prevent, arrived at silently.
+    case sourceDirectoryUnreadable(String)
     /// `execute` was handed a plan with collisions nobody resolved. The item
     /// indices are carried so the caller can say which.
     case unresolvedCollisions([Int])

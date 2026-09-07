@@ -45,7 +45,9 @@ public actor FileOperator {
     public typealias ProgressHandler =
         @Sendable (_ completed: Int, _ total: Int, _ current: URL) -> Void
 
-    private let store: IndexStore
+    /// Internal so the replacement machinery in `FileOperator+Replacements.swift`
+    /// can reach it. Nothing outside `FileOperator` holds one.
+    let store: IndexStore
     private let volumeReader: @Sendable (URL) -> VolumeIdentity?
     private let copier: Copying
     private let clock: @Sendable () -> Double
@@ -126,9 +128,16 @@ public actor FileOperator {
             if includeCompanions {
                 var siblings = siblingsByDirectory[directory.path]
                 if siblings == nil {
-                    siblings = (try? FileManager.default
-                        .contentsOfDirectory(atPath: directory.path)) ?? []
-                    siblingsByDirectory[directory.path] = siblings
+                    // Not `?? []`. An unlistable directory is not an empty one,
+                    // and treating it as empty moves the RAW and orphans the
+                    // `.xmp` — silently, which is the worst way to arrive at the
+                    // thing companion handling exists to prevent.
+                    guard let listed = try? FileManager.default
+                        .contentsOfDirectory(atPath: directory.path) else {
+                        throw FileOperatorError.sourceDirectoryUnreadable(directory.path)
+                    }
+                    siblings = listed
+                    siblingsByDirectory[directory.path] = listed
                 }
                 companions = CompanionFiles.companions(of: source,
                                                        siblingNames: siblings ?? [],
@@ -168,17 +177,21 @@ public actor FileOperator {
         }
 
         let dispositions = plan.items.map { Self.disposition(of: $0, kind: plan.kind) }
+        // **The plan-time degrade is the guard against displacing the batch's
+        // own photos** — a collision whose kind is `claimedInBatch` turns
+        // `replace` into `rename` before anything runs, and `PlannedItem`'s
+        // members are `let`s derived from `inputs`, so no caller can hand
+        // `execute` a plan that says otherwise.
+        //
+        // What remains here is narrower and is not a second copy of that rule: a
+        // replacement whose occupant is a *source* of this batch. The plan's rule
+        // covers every route to that but one — an earlier item resolved to `skip`
+        // claims no name, so a later item can meet that item's source as an
+        // ordinary on-disk occupant. A destination-based check was tried here and
+        // removed: an item's replacements are by construction at its own
+        // destinations, so subtracting its own destinations left the test unable
+        // to fire at all.
         let batchSources = Set(plan.items.flatMap(\.files).map(\.path))
-        // Every path this batch is going to write. A `replace` must never
-        // displace one of these: it would be either a source the batch is about
-        // to read or an earlier item's landed photo. The plan already refuses the
-        // second (`FileOperationCollision.Kind.claimedInBatch`); this is the
-        // execute-time backstop, so a plan assembled some other way cannot get
-        // past it either.
-        let batchDestinations = Set(plan.items.flatMap { item -> [String] in
-            guard let destination = item.destination else { return [] }
-            return ([destination] + item.companionDestinations).map(\.path)
-        })
 
         // The journal, up front and in one transaction: every file the batch
         // intends to touch, before the first one is touched. An item resolved to
@@ -256,19 +269,16 @@ public actor FileOperator {
                 continue
             }
 
-            // This item's own destinations are excluded from the backstop: the
-            // file a `replace` displaces is by definition at the path this item
-            // is writing to. What must never be displaced is a path *another*
-            // item reads from or writes to.
-            let ownDestinations = Set(([item.destination].compactMap { $0 }
-                + item.companionDestinations).map(\.path))
             var execution = perform(item, plan: plan, ops: ops, asideOps: asideOps,
-                                    batchSources: batchSources,
-                                    batchDestinations:
-                                        batchDestinations.subtracting(ownDestinations))
-            let marks = execution.marksJournal
-                ? Self.marks(ops, execution) + execution.asideMarks
-                : []
+                                    batchSources: batchSources)
+            // **Aside marks are written whatever became of the item.** They
+            // describe a photo the user did not select that really was displaced
+            // and really did reach the Trash; dropping them because the item
+            // that displaced it then failed leaves that photo in the Trash under
+            // a row naming nothing. The item's *own* rows still go unmarked when
+            // the operator cannot say what happened to them.
+            let marks = (execution.marksJournal ? Self.marks(ops, execution) : [])
+                + execution.asideMarks
             do {
                 if !execution.mutations.isEmpty || !marks.isEmpty {
                     // The applied count is deliberately not checked. A mutation a
@@ -365,7 +375,7 @@ public actor FileOperator {
 
     /// What one item's filesystem work produced, before any of it reaches the
     /// index.
-    private struct ItemExecution {
+    struct ItemExecution: Error {
         var outcome: FileOperationOutcome = .completed
         var mutations: [IndexMutation] = []
         /// Parallel to the item's files; nil for every kind but `trash`.
@@ -397,13 +407,11 @@ public actor FileOperator {
 
     private func perform(_ item: PlannedItem, plan: FileOperationPlan,
                          ops: [Int64], asideOps: [Int64],
-                         batchSources: Set<String>,
-                         batchDestinations: Set<String>) -> ItemExecution {
+                         batchSources: Set<String>) -> ItemExecution {
         switch plan.kind {
         case .move, .copy:
             performTransfer(item, kind: plan.kind, asideOps: asideOps,
-                            batchSources: batchSources,
-                            batchDestinations: batchDestinations)
+                            batchSources: batchSources)
         case .trash: performTrash(item, ops: ops)
         case .delete: performDelete(item)
         }
@@ -412,18 +420,17 @@ public actor FileOperator {
     // MARK: Move and copy
 
     private func performTransfer(_ item: PlannedItem, kind: FileOperationKind,
-                                 asideOps: [Int64], batchSources: Set<String>,
-                                 batchDestinations: Set<String>) -> ItemExecution {
+                                 asideOps: [Int64],
+                                 batchSources: Set<String>) -> ItemExecution {
         let files = item.files
         guard let destinations = Self.destinations(of: item) else {
             return .failure(.other("\(kind.rawValue) planned without a destination"))
         }
 
-        var stash: [PlannedReplacement] = []
-        switch prepareReplacements(item, batchSources: batchSources,
-                                   batchDestinations: batchDestinations) {
-        case .failure(let reason): return .failure(reason)
-        case .success(let prepared): stash = prepared
+        var staged: [StagedReplacement] = []
+        switch prepareReplacements(item, asideOps: asideOps, batchSources: batchSources) {
+        case .failure(let execution): return execution
+        case .success(let prepared): staged = prepared
         }
 
         let sourceDirectory = item.source.deletingLastPathComponent()
@@ -451,9 +458,20 @@ public actor FileOperator {
             } catch {
                 // A failed copy can leave a partial file; a failed `rename(2)`
                 // leaves nothing. Clear the one that just failed before undoing
-                // the ones that succeeded.
-                if !byRename { try? FileManager.default.removeItem(at: destination) }
-                return undo(moved, stash: stash, byRename: byRename,
+                // the ones that succeeded — and if it will not clear, say so: a
+                // partial file left at the destination under a row saying
+                // `failed` is the same lie every other swallowed cleanup told.
+                var cleanup: [String] = []
+                if !byRename, FileManager.default.fileExists(atPath: destination.path) {
+                    do {
+                        try FileManager.default.removeItem(at: destination)
+                    } catch {
+                        cleanup.append("a partial \(destination.lastPathComponent) is still "
+                                       + "at \(destination.path): \(error)")
+                    }
+                }
+                return undo(moved, staged: staged, byRename: byRename,
+                            extraProblems: cleanup,
                             failing: FileOperationErrorMap.classify(error))
             }
         }
@@ -478,18 +496,19 @@ public actor FileOperator {
         // because `replace` must be as undoable as `trash` is, and because a
         // journal row naming a Trash URL is a row #6 already knows how to
         // reverse.
-        switch disposeOfStash(stash, ops: asideOps) {
-        case .failure(let reason):
-            // The operation landed but the displaced file could not be disposed
-            // of. Nothing is lost — it is in its stash, and the aside row names
-            // it — but the operator cannot claim the item is settled.
-            _ = reason
-            return undoAfterDisposalFailure(moved, byRename: byRename)
-        case .success(let marks):
+        switch disposeOfStash(staged) {
+        case .refused(let reason, let earned):
+            // The operation landed but a displaced file could not be disposed
+            // of. Nothing is lost — it is in its stash or in the Trash, and its
+            // row names where — but the operator cannot claim the item is
+            // settled. The marks already earned travel out with the failure.
+            return undoAfterDisposalFailure(moved, byRename: byRename,
+                                            marks: earned, reason: reason)
+        case .settled(let marks):
             execution.asideMarks = marks
         }
 
-        execution.mutations = Self.replacedRowRemovals(stash, store: store)
+        execution.mutations = Self.replacedRowRemovals(item.replacements, store: store)
         for (offset, destination) in destinations.enumerated() {
             let source = files[offset]
             if isMove {
@@ -519,11 +538,11 @@ public actor FileOperator {
     /// `failed`, and `failed` is defined to mean "nothing changed" — a claim the
     /// reconcile is built never to re-examine. An item that could not be undone
     /// reports `.rollbackIncomplete` and keeps its rows `in_flight` instead.
-    private func undo(_ moved: [(from: URL, to: URL)], stash: [PlannedReplacement],
-                      byRename: Bool,
+    private func undo(_ moved: [(from: URL, to: URL)], staged: [StagedReplacement],
+                      byRename: Bool, extraProblems: [String] = [],
                       failing reason: FileOperationFailure) -> ItemExecution {
-        var problems = Self.rollbackMoves(moved, byRename: byRename)
-        problems += Self.restore(stash, rollbackSucceeded: problems.isEmpty)
+        var problems = extraProblems + Self.rollbackMoves(moved, byRename: byRename)
+        problems += Self.restore(staged, rollbackSucceeded: problems.isEmpty)
         guard problems.isEmpty else {
             return .failure(.rollbackIncomplete(problems.joined(separator: "; ")),
                             marksJournal: false)
@@ -534,19 +553,22 @@ public actor FileOperator {
     }
 
     private func undoAfterDisposalFailure(_ moved: [(from: URL, to: URL)],
-                                          byRename: Bool) -> ItemExecution {
+                                          byRename: Bool, marks: [JournalMark],
+                                          reason: FileOperationFailure) -> ItemExecution {
         let problems = Self.rollbackMoves(moved, byRename: byRename)
-        let combined = (problems + ["displaced file left in its stash"])
+        let combined = (problems + ["displaced file not disposed of: \(reason)"])
             .joined(separator: "; ")
-        return .failure(.rollbackIncomplete(combined), marksJournal: false)
+        return .failure(.rollbackIncomplete(combined), marksJournal: false,
+                        asideMarks: marks)
     }
 
     /// Whether `row`'s hashes describe the bytes now at `source`.
     ///
-    /// This is `setHashes(for:)`'s guard, read rather than written: the row's
-    /// `path`, `size` and `mtime` together are exactly the evidence tier 0 uses
-    /// to decide a file is unchanged, so anything else means the hashes on the
-    /// row predate the bytes being copied. A false costs one re-hash. A wrong
+    /// This is `setHashes(for:)`'s guard, read rather than written. `path` is
+    /// already established — the row was fetched by it — so what is left to
+    /// check is `size` and `mtime`, which together are exactly the evidence
+    /// tier 0 uses to decide a file is unchanged. Anything else means the hashes
+    /// on the row predate the bytes being copied. A false costs one re-hash. A wrong
     /// true writes a digest that describes different bytes onto a brand-new row
     /// that nothing will ever revisit — and the duplicate view deletes on those.
     private static func hashesStillDescribe(_ row: FileRecord, at source: URL) -> Bool {
@@ -563,7 +585,15 @@ public actor FileOperator {
             do {
                 var resulting: NSURL?
                 try FileManager.default.trashItem(at: file, resultingItemURL: &resulting)
-                guard let url = resulting as URL? else { throw POSIXError(.EIO) }
+                guard let url = resulting as URL? else {
+                    // The file is in the Trash and the system declined to say
+                    // where. Throwing here would put it under a `failed` row,
+                    // which claims it is still at `src`. Leave the row
+                    // `in_flight` — "ask the filesystem" — and name the file.
+                    return .failure(.trashURLNotRecorded(
+                        "\(file.lastPathComponent) was trashed but the system reported "
+                        + "no destination"), marksJournal: false)
+                }
                 trashed.append((file, url))
                 execution.trashURLs.append(url)
                 // Written now, in its own small transaction, rather than waiting
@@ -574,7 +604,17 @@ public actor FileOperator {
                 // index write that fails, or the rollback below discarding the
                 // in-memory results, would lose it for good.
                 if ops.indices.contains(offset) {
-                    try? store.recordTrashURL(opID: ops[offset], path: url.path)
+                    do {
+                        try store.recordTrashURL(opID: ops[offset], path: url.path)
+                    } catch {
+                        // The only record of where this photo went could not be
+                        // persisted. Fail loudly with the URL in the message,
+                        // and leave the row `in_flight` rather than `failed`,
+                        // which would claim the file never moved.
+                        return .failure(.trashURLNotRecorded(
+                            "\(file.lastPathComponent) is at \(url.path) but the journal "
+                            + "could not be told: \(error)"), marksJournal: false)
+                    }
                 }
             } catch {
                 // Undo the part that happened, so an image and its sidecar are
@@ -628,115 +668,6 @@ public actor FileOperator {
         }
         if let firstFailure { execution.outcome = .failed(firstFailure) }
         return execution
-    }
-
-    // MARK: - Replacement staging
-
-    /// Moves every file this item will displace aside.
-    ///
-    /// Aside rather than deleted, and sent to the Trash only once the item has
-    /// succeeded. The obvious implementation — unlink the destination, then
-    /// move — has a window in which the user has neither file, and it is reached
-    /// by something as ordinary as a full disk.
-    private func prepareReplacements(_ item: PlannedItem, batchSources: Set<String>,
-                                     batchDestinations: Set<String>)
-        -> Result<[PlannedReplacement], FileOperationFailure> {
-        guard item.effectiveResolution == .replace, !item.replacements.isEmpty else {
-            return .success([])
-        }
-        var stash: [PlannedReplacement] = []
-        for replacement in item.replacements {
-            // The execute-time backstop for the plan's `claimedInBatch` rule. A
-            // path this batch reads from, or that another item writes to, is
-            // never "the existing file": displacing it destroys one of the
-            // user's own selected photos. The plan already refuses to produce
-            // such a replacement; this refuses to act on one however it arrived.
-            let path = replacement.occupant.path
-            guard !batchSources.contains(path), !batchDestinations.contains(path) else {
-                _ = Self.restore(stash, rollbackSucceeded: true)
-                return .failure(.destinationNotReplaceable)
-            }
-            guard FileManager.default.fileExists(atPath: path) else { continue }
-            do {
-                try FileManager.default.moveItem(at: replacement.occupant,
-                                                 to: replacement.stash)
-                stash.append(replacement)
-            } catch {
-                _ = Self.restore(stash, rollbackSucceeded: true)
-                return .failure(FileOperationErrorMap.classify(error))
-            }
-        }
-        return .success(stash)
-    }
-
-    /// Sends each displaced file to the Trash and marks its aside row.
-    private func disposeOfStash(_ stash: [PlannedReplacement], ops: [Int64])
-        -> Result<[JournalMark], FileOperationFailure> {
-        guard !stash.isEmpty else { return .success([]) }
-        var marks: [JournalMark] = []
-        for (offset, entry) in stash.enumerated() {
-            do {
-                var resulting: NSURL?
-                try FileManager.default.trashItem(at: entry.stash, resultingItemURL: &resulting)
-                guard let url = resulting as URL?, ops.indices.contains(offset) else {
-                    throw POSIXError(.EIO)
-                }
-                try? store.recordTrashURL(opID: ops[offset], path: url.path)
-                marks.append(JournalMark(opID: ops[offset], state: .complete,
-                                         trashURL: url.path))
-            } catch {
-                return .failure(FileOperationErrorMap.classify(error))
-            }
-        }
-        return .success(marks)
-    }
-
-    /// Puts displaced files back, and reports what it could not.
-    ///
-    /// **It never deletes what is at the original path.** If the rollback that
-    /// should have cleared that path failed, whatever is sitting there may be the
-    /// user's own file — the source of a move that could not be undone — and
-    /// removing it to make room would be the very loss this whole path exists to
-    /// prevent. The stash is left where it is instead: it is journalled, so
-    /// nothing is stranded, and the caller reports `.rollbackIncomplete`.
-    /// Internal rather than private so the guard can be tested directly. The
-    /// loss it prevents needs a same-volume move whose mid-item rename fails
-    /// *and* whose rollback then fails, which is not constructible on demand
-    /// against a real filesystem — and a safety guard nothing can exercise is a
-    /// safety guard nothing will notice the removal of.
-    static func restore(_ stash: [PlannedReplacement],
-                        rollbackSucceeded: Bool) -> [String] {
-        var problems: [String] = []
-        for entry in stash.reversed() {
-            if !rollbackSucceeded || FileManager.default.fileExists(atPath: entry.occupant.path) {
-                problems.append("\(entry.occupant.lastPathComponent) is still set aside at "
-                                + entry.stash.path)
-                continue
-            }
-            do {
-                try FileManager.default.moveItem(at: entry.stash, to: entry.occupant)
-            } catch {
-                problems.append("\(entry.occupant.lastPathComponent) could not be put back "
-                                + "from \(entry.stash.path): \(error)")
-            }
-        }
-        return problems
-    }
-
-    /// The index rows of the files a `replace` displaced. They are removed in the
-    /// same transaction as the rows taking their place — a displaced file's row
-    /// left behind is a row for bytes that are no longer at that path, in a table
-    /// duplicate detection reads. The lookup is by the occupant's **real** path,
-    /// which is why the plan carries it: on a case-insensitive volume the
-    /// destination being written may differ in case from the file that is
-    /// actually there, and `record(atPath:)` matches exactly.
-    private static func replacedRowRemovals(_ stash: [PlannedReplacement],
-                                            store: IndexStore) -> [IndexMutation] {
-        stash.compactMap { entry in
-            guard let row = try? store.record(atPath: entry.occupant.path),
-                  let id = row.id else { return nil }
-            return .remove(id: id, path: entry.occupant.path)
-        }
     }
 
     /// Undoes the transfers this item already made, returning what it could not

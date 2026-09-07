@@ -125,9 +125,13 @@ extension IndexStore {
                                          destination.lastPathComponent, id, fromPath])
                     guard db.changesCount == 1 else { continue }
                     applied += 1
-                    // `files_fts` is a standalone FTS5 table: nothing but this
-                    // maintains it, so a move that leaves the old name behind
-                    // makes filename search answer with a path that is gone.
+                    // `files_fts` is a standalone FTS5 table, so a *rename* has
+                    // to be mirrored by hand: nothing else does it, and a move
+                    // that leaves the old name behind makes filename search
+                    // answer with a path that is gone. Deletes need no such
+                    // line — the `files_ad` trigger clears the FTS row and the
+                    // `analysis` row whenever a `files` row goes, whichever code
+                    // path removed it.
                     try db.execute(sql: "UPDATE files_fts SET name = ? WHERE rowid = ?",
                                    arguments: [destination.lastPathComponent, id])
                 case .insertCopy(let insert):
