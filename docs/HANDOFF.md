@@ -106,7 +106,7 @@ cd ~/src/lightbox
 # Core: 469 tests, 34 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 57 tests.
+# App: builds the SwiftUI target and runs its 63 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -167,6 +167,16 @@ where all the logic and all 469 tests live. `App/` only wires it to views.
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
+
+The App target is hosted in the app itself, so `xcodebuild test` runs
+`LightboxApp.main()` before a single test does. `App/Lightbox/LaunchEnvironment.swift`
+is what keeps that launch off the user's library: under XCTest's environment
+(`XCTestConfigurationFilePath` / `XCTestBundlePath` / `XCTestSessionIdentifier`,
+or an explicit `LIGHTBOX_TEST_HOST=1`) `launchIndexURL(in:)` returns nil and
+`BrowserView` renders an inert scene instead of building a `BrowserModel`.
+`BrowserModel.init(at:)` has no default argument, so `IndexStore.defaultURL` has
+exactly one caller. Before that guard (#15) every App test run created, migrated
+and WAL-switched the real `~/Library/Application Support/Lightbox/index.sqlite`.
 
 `App/Lightbox.xcodeproj/project.pbxproj` is **hand-written** (objectVersion 77,
 `PBXFileSystemSynchronizedRootGroup`). Adding a `.swift` file under

@@ -372,17 +372,23 @@ final class BrowserModel {
 
     /// Opens the on-disk index, checked for corruption first.
     ///
-    /// `url` defaults to `IndexStore.defaultURL` and is overridden only by a
-    /// test — production always takes the default, so this is the same path
-    /// `BrowserView` runs at launch, exercised without writing into the real
-    /// Application Support directory.
+    /// `url` has **no default** on purpose. It used to default to
+    /// `IndexStore.defaultURL`, which made the user's real index the value any
+    /// caller got for free — including `LightboxApp` running as the App
+    /// target's `TEST_HOST`, which is how an `xcodebuild test` came to create,
+    /// migrate and WAL-switch `~/Library/Application Support/Lightbox/
+    /// index.sqlite` (#15). The launch URL is now chosen in exactly one place,
+    /// `LaunchEnvironment.launchIndexURL(in:)`, and every test passes a
+    /// disposable one, so this is still the same path `BrowserView` runs at
+    /// launch — exercised without writing into the real Application Support
+    /// directory.
     ///
     /// A failed `IndexStore(url:)` and a store that opens but fails
     /// `checkIntegrity()` are handled the same way: the index is a derived
     /// cache, so neither case can lose anything a rebuild wouldn't also
     /// recompute, and leaving the app unable to open at all over either one
     /// would be strictly worse than a rescan.
-    init(at url: URL = IndexStore.defaultURL) throws {
+    init(at url: URL) throws {
         let store: IndexStore
         // Bound outside the `if` so a corrupt-but-openable connection is
         // still reachable in the `else` branch to be closed — see below.

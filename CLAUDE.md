@@ -80,7 +80,7 @@ four-phase breakdown.
 
 ```
 Core/     LightboxCore — headless SwiftPM package; all logic, all 469 tests. No AppKit/SwiftUI.
-App/      Lightbox.xcodeproj — SwiftUI shell over Core; 57 tests. Depends on Core as ../Core.
+App/      Lightbox.xcodeproj — SwiftUI shell over Core; 63 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
 ```
@@ -137,3 +137,12 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   surviving id" is wrong. Measure before prescribing.
 - **A test that passes without exercising the code is worse than none.** Five were caught
   in phase 1. Make it fail first.
+- **The App tests run inside the real app** (`TEST_HOST` in `project.pbxproj`), so
+  `xcodebuild test` executes `LightboxApp.main()` before any test does.
+  `App/Lightbox/LaunchEnvironment.swift` is the guard: under XCTest's environment — or an
+  explicit `LIGHTBOX_TEST_HOST=1`, the opt-in for a harness that sets none of XCTest's
+  variables — it hands `BrowserView` no index at all, and `BrowserModel.init(at:)` has
+  **no default argument**, so `IndexStore.defaultURL` is unreachable except through that
+  one function. Don't reintroduce the default, and don't hardcode
+  `BrowserView.launchIndexURL`: that is how a test run came to create, migrate and
+  WAL-switch the user's real `~/Library/Application Support/Lightbox/index.sqlite` (#15).
