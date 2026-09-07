@@ -163,16 +163,16 @@ struct PerceptualHashTests {
     func aRecompressedCopyStaysClose() throws {
         let original = try Fixtures.writeImage(to: tree.root.appendingPathComponent("a.png"),
                                                format: .png, width: 320, height: 240)
-        // Re-encode as a low-quality JPEG.
+        // Re-encode as a low-quality JPEG. Run through `BoundedProcess`, not a
+        // bare `waitUntilExit()`: an unbounded wait here parks a
+        // cooperative-pool thread, which is how #18's CI run hung for fourteen
+        // minutes with 141 tests unreported.
         let recompressed = tree.root.appendingPathComponent("a-lowq.jpg")
-        let sips = Process()
-        sips.executableURL = URL(fileURLWithPath: "/usr/bin/sips")
-        sips.arguments = ["-s", "format", "jpeg", "-s", "formatOptions", "30",
-                          original.path, "--out", recompressed.path]
-        sips.standardOutput = FileHandle.nullDevice
-        sips.standardError = FileHandle.nullDevice
-        try sips.run(); sips.waitUntilExit()
-        try #require(sips.terminationStatus == 0)
+        let sips = BoundedProcess.run("/usr/bin/sips",
+                                      ["-s", "format", "jpeg",
+                                       "-s", "formatOptions", "30",
+                                       original.path, "--out", recompressed.path])
+        try #require(sips.ok, "sips failed: \(sips)")
 
         let a = try PerceptualHash(gray: GrayscaleRenderer().gray32(from: original))
         let b = try PerceptualHash(gray: GrayscaleRenderer().gray32(from: recompressed))
