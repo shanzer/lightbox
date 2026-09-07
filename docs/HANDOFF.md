@@ -109,7 +109,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 543 tests, 58 suites.
+# Core: 602 tests, 75 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -163,18 +163,18 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 543 tests live. `App/` only wires it to views.
+where all the logic and all 602 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
 | Walk | `Walker.swift`, `MediaType.swift` | Recursive enumeration; extension + UTI classification (RAW, HEIC, JPEG, PNG, WebP) |
-| Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift`, `Index/IndexStore+FileOperations.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity; the `op_journal` writes and the guarded row move/copy/remove |
+| Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift`, `Index/IndexStore+{FileOperations,Reconcile}.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity; the `op_journal` writes and the guarded row move/copy/remove; the launch-time reconcile of `in_flight` rows and journal retention |
 | Metadata | `Metadata/{ImageMetadata,MetadataReader}.swift` | ImageIO `CGImageSource` reads — dimensions, camera, capture time |
 | Hashing | `Hashing/*.swift` | Three hashes: `content_hash` (whole file), `image_hash` (format-stripped pixel data), `phash` (DCT perceptual) |
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
-| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Transfer,FileOperator+Replacements}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results (§8) |
+| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Transfer,FileOperator+Replacements,FileOperator+Undo}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results; undo of the last batch as a new batch, and `undoability(of:)` (§8) |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
 | Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
 
@@ -531,6 +531,166 @@ all three are now done:
   path and the `COPYFILE_CLONE` path are the only ones a real drive would add
   coverage for. The archive holds no RAW and no `.xmp`, so the pair in that
   check was named rather than found.
+
+- ~~**The undo journal, read back.**~~ **Done** (issue #6). Two halves, both in
+  Core, both over the rows `FileOperator` already wrote.
+
+  **`FileOperator.undo(batch:)` reverses the last batch as a new batch.** Its
+  own `batch_id`, its own `op_journal` rows, journalled up front like any other
+  — which is what makes redo nothing but undo of the undo, with no history
+  state anywhere. Reversal per kind: a move moves back; a copy's destination is
+  **trashed, never unlinked** (`delete` is the only thing in this app that
+  destroys a file, and undo is not it — spec §8 amended, see below); a `trash`
+  row, plain or aside, is restored from `trash_url` to `src`; a `delete` is
+  refused for the whole batch, before it runs, by `undoability(of:)`. Steps run
+  in **descending `op_id`**, which is what puts a `replace`'s aside row after
+  the item that displaced its occupant: the item's own reversal has to vacate
+  the path before the displaced photo can come back to it.
+
+  **Only an all-`complete` batch is undoable.** `in_flight` means the outcome
+  was never written down; `reconciled` means it was reconstructed from two
+  `stat`s after a crash, and reversing an inference is how a half-finished
+  cross-volume move becomes a lost photo; `failed` means nothing changed but is
+  something the user was shown. `skipped` is the one non-`complete` state that
+  does *not* block — its contract is the strongest in the enumeration
+  (journalled, deliberately not attempted, nothing changed), so a batch that
+  lost its tail to an unplugged drive is still as undoable as the part that ran.
+
+  **Nothing is skipped silently**, which is the same rule as everywhere else
+  here. Three pre-checks, each a per-item failure that changes nothing: the file
+  is not where the row says (`sourceVanished`, or `trashEmptied` when it is the
+  Trash URL that is missing); the path it would return to is **occupied**
+  (`destinationNotReplaceable` — this is what stops an undone trash overwriting
+  the export the user saved there since); and its `files` row no longer
+  describes it (`modifiedSinceOperation`). The reversal itself goes through
+  `performTransfer` and `performTrash`, not a second copy of them, so the
+  cross-volume legs and the "the copies are the only copies" guard are the ones
+  already written and tested.
+
+  **The reconcile runs inside `IndexStore.init`**, before the initializer
+  returns, so no window can start a pass over rows a crash left describing files
+  that have moved. One read (the `in_flight` rows plus the `files` rows for
+  every path they name, chunked), every `stat` outside any transaction, then one
+  write for the corrections, the `reconciled` marks and retention together. It
+  **never throws out of `init`**: a store that will not open is an app that will
+  not launch, over a repair whose worst case is "the rows are wrong until the
+  next pass". The full decision table is the doc comment on
+  `IndexStore.decide`; three rules govern all of it — **never remove a file**,
+  **never remove a row whose file is there** (stale means the path holds nothing
+  or holds something with a different inode/size/mtime), and **never carry
+  hashes across a crash** (the one insert it makes has NULL hashes, because
+  nothing verified those bytes).
+
+  The row that matters is still `move` with **both** paths present: that is a
+  cross-volume copy whose delete leg did not run, and a `move` row plus a
+  destination that exists is exactly the inference that would unlink the source.
+  It is treated as a copy — both files stay, the destination gains a row without
+  hashes. Its test asserts both files are on disk, and the mutation that turns
+  the branch back into "believe the row" fails it.
+
+  **"Something is at `dst`" is not "the file that moved is at `dst`".** Every
+  branch that would write to a destination first checks `destinationMatches` —
+  the file's `size` and `mtime` against the source's row — and writes nothing
+  when it fails. `rename(2)` preserves both, and so do `copyfile(3)` with
+  `COPYFILE_ALL` and `clonefile`, so the check only rejects two things, and both
+  are real: a **stranger** that arrived in the plan/execute gap (widened, after a
+  crash, to however long the app was shut), and a **copy the crash left short**.
+  Without it a 999-byte stranger inherited a 64-byte photo's `content_hash` — a
+  digest describing bytes it does not contain, on a row nothing re-hashes, in
+  the table the duplicate view deletes on. It is deliberately a *different* test
+  from `removalIfStale`'s, which also requires the inode: there the path is
+  unchanged so a new inode is evidence of a different file, while here the path
+  changed by construction and a cross-volume copy lands on a new inode by
+  definition. A destination that fails the check gets **no row at all** rather
+  than a row with NULL dimensions: `needsReindex` keys on `size` and `mtime`
+  alone, so a row whose facts match its file is never re-read and its nulls
+  would be permanent, while an unindexed path is indexed completely by the next
+  walk.
+
+  **Every correction is one transaction, so one collision is not one bad row.**
+  Two `in_flight` rows naming one destination — two copies of the same photo,
+  two crashed batches, one name — used to raise `UNIQUE(files.path)`, roll the
+  whole pass back and leave *everything* `in_flight` for a next open that failed
+  identically, forever. Destination claims are now deduped: the first wins, the
+  loser is marked `reconciled` with a conclusion naming the path and still gets
+  the correction that cannot collide (retiring its own stale source row).
+
+  **Retention:** `IndexStore.journalRetentionDays` (30) and
+  `journalRetentionBatches` (200), an AND-keep — a row survives only if its
+  batch is inside both — run in the reconcile's write transaction and never
+  touching an `in_flight` row. A malformed row (a `move`/`copy` with a NULL
+  `dst`, which no `FileOperator` path produces) is left `in_flight` deliberately
+  and is therefore never retired: it is the only record that it exists.
+
+  **The age rule is floored at one batch** (`rn > 1`). Thirty idle days is an
+  ordinary holiday, and without the floor the last batch went with them: come
+  back after 31 days and ⌘Z answers `noSuchBatch` for an operation the user
+  still remembers doing. The count rule needs no such floor — at `rn > 200`
+  there are by definition 200 newer batches to undo instead.
+
+  **The reconcile's `stat`s do not run on the calling thread.** `init` is
+  synchronous and the reconcile still finishes before it returns, but the app
+  opens its store on the **main actor** (`BrowserView.start` →
+  `BrowserModel(at:)`), the rows name whatever volume the library lives on, and
+  one `stat` on a spun-down external drive parks its thread for seconds — before
+  the first window draws. The work goes to a dispatch queue and `init` waits on
+  it for `IndexStore.reconcileBudget` (3 s; five thousand rows reconcile in
+  about 0.19 s warm, so this only bites on a drive that has to spin up). Past
+  the budget the run is **abandoned, and the abandon is atomic with the write**:
+  the flag is read inside the transaction — on acquiring the writer and again
+  immediately before the commit — and leaves by throwing, which is the only
+  thing GRDB treats as a rollback. Checking merely *before* `pool.write` was not
+  enough, and was proven not to be: a deferred run still queued for the writer
+  behind the 5 s busy timeout and committed after `init` had returned saying
+  nothing landed, applying corrections from a snapshot up to `budget` old — and
+  `.insertCopy` goes through `upsertRow`'s `ON CONFLICT`, so one of those late
+  writes could overwrite a row a tier 0 pass had indexed properly in the
+  interim. Now every row stays `in_flight`, the report says `.deferred`, and the
+  next open finishes the job; that retry path has its own test.
+  `JournalReconcileDisposition` also distinguishes a run that threw from an
+  empty journal, which the counts alone could not.
+
+  **`destinationMatches` compares the timestamp with a tolerance and the length
+  without one**, because only one of the two is quantised by the filesystem.
+  "`copyfile` carries the times across" is an APFS sentence: measured against a
+  real `COPYFILE_ALL`, exFAT rounds a modification time to 10 ms and the FAT
+  family to 2 s, and SMB rounds either way. **Those are the ordinary volumes
+  here, not the exotic ones** — this app exists for a library on an external
+  drive — and an exact comparison failed identity on the user's own good copy,
+  retired the hashed source row, wrote no destination row, and reported
+  `destinationDiffersFromTheSource` about it. `destinationMtimeTolerance` is
+  2 s and symmetric; size stays exact, so a stranger still has to match byte for
+  byte in length *and* land within two seconds to be mistaken for the original.
+
+  **A missing `files` row for `src` is not a mismatched destination.** Both
+  `move` branches folded "no row to compare against" into
+  `destinationDiffersFromTheSource`, which is a claim *about the user's file*
+  made on the strength of an index row a walk had pruned. A pruned source row
+  now reports `happened` for the src-gone branch and `copyDoneDeleteNot` for the
+  both-present one — deliberately not `happened` there, because the source is
+  demonstrably still on disk — with no mutation either way.
+
+  Two things worth knowing. **Undoing a trash leaves the restored photo without
+  an index row** until the next tier 0 pass: the row was deleted when the file
+  was trashed, its hashes with it, and inserting a `stat`-derived row would be
+  worse than none — `needsReindex` compares size and mtime, so a row with NULL
+  dimensions would be considered up to date forever. Same reasoning for the
+  reconcile's copy insert when there is no source row to derive from. And
+  **undo is per journal row, not per item**: `execute` reports per item because
+  an image and its sidecar succeed together, but an undo has only rows, and a
+  sidecar whose reversal fails is a fact rather than something to fold into its
+  image's verdict.
+
+  Owed: the ⌘Z live check (move 20, quit, relaunch, undo; trash 5, empty the
+  Trash, undo). **It cannot be run yet** — there is no file-operation UI at all;
+  that is #7. The Core equivalents exist:
+  `aBatchSurvivesQuittingAndIsUndoneAfterRelaunch` closes a file-backed store and
+  undoes through a fresh one, and `anEmptiedTrashIsFivePerItemFailuresAndNothingElse`
+  trashes five real files, empties them from the real Trash and asserts five
+  `.trashEmptied` results with nothing else touched. Also owed: a genuinely
+  cross-volume undo. `performTransfer` is shared with the forward path, which is
+  where the cross-volume legs are tested, but no test drives an undo across two
+  real volumes.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And

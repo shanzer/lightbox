@@ -92,9 +92,26 @@ public enum FileOperationKind: String, Sendable, Codable, Hashable, CaseIterable
 /// it is live, and it is the second half of the rule above. The `state` says
 /// which.
 ///
-/// - `reconciled` — **written only by #6.** A row that was `in_flight` and has
-///   since been resolved against the filesystem at launch. `FileOperator` never
-///   writes it; it is defined here so both sides read one enumeration.
+/// - `reconciled` — **written only by the launch-time reconcile**
+///   (`IndexStore.reconcileJournal`). A row that was `in_flight` and has since
+///   been resolved against the filesystem at open: both its paths were
+///   re-`stat`ed, the `files` table was corrected to match what was found, and
+///   the row was retired from the set the next open examines. `FileOperator`
+///   never writes it; it is defined here so both sides read one enumeration.
+///
+///   **`reconciled` is terminal and is not `complete`.** It records that the
+///   filesystem was consulted because nothing had written down what happened —
+///   which is a different claim from "this operation succeeded", and it is why
+///   `FileOperator.undoability(of:)` refuses a batch containing one. Reversing a
+///   row whose outcome was reconstructed after a crash means acting on an
+///   inference; the reconcile's own conclusion (`JournalConclusion`) is the
+///   record to read instead.
+///
+///   A row the reconcile cannot reason about at all — a `move` or `copy` whose
+///   `dst` is NULL, which no `FileOperator` code path can produce — is left
+///   `in_flight` rather than marked, and retention never deletes it. There is
+///   nothing to believe the filesystem *about* when the row names only one of
+///   the two paths.
 public enum OpJournalState: String, Sendable, Codable, Hashable, CaseIterable {
     case inFlight = "in_flight"
     case complete
@@ -203,6 +220,21 @@ public enum FileOperationFailure: Error, Sendable, Equatable, Hashable {
     /// The index transaction failed after the filesystem operation succeeded.
     /// The files moved; the rows did not. The journal row stays `in_flight`.
     case indexWriteFailed(String)
+    /// **Undo only.** The file this step would reverse is not the file the batch
+    /// acted on: its `size`/`mtime` no longer match the `files` row that
+    /// recorded them. Something edited it — an external editor, a re-export, a
+    /// sync client — between the batch and the undo.
+    ///
+    /// A per-item failure rather than a silent skip, and rather than proceeding.
+    /// Moving it back would be undoing an operation that is no longer the last
+    /// thing to have happened to that photo, and the user asked to reverse a
+    /// batch, not to discard someone else's edit. Nothing changed.
+    case modifiedSinceOperation
+    /// **Undo only.** A `trash` row's `trash_url` names nothing: the user
+    /// emptied the Trash, or Finder aged the item out of it. The photo is gone
+    /// and undo cannot conjure it back. Nothing changed — this is the reason the
+    /// summary sheet shows for each of those items.
+    case trashEmptied
     /// Anything else, described by the underlying error.
     case other(String)
 }

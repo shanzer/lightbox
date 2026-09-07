@@ -101,52 +101,71 @@ extension IndexStore {
     /// longer describes the file that was planned against.
     @discardableResult
     func applyAndMark(_ mutations: [IndexMutation], marks: [JournalMark]) throws -> Int {
-        try pool.write { db in
-            var applied = 0
-            for case .remove(let id, let path) in mutations {
-                try db.execute(sql: "DELETE FROM files WHERE id = ? AND path = ?",
-                               arguments: [id, path])
-                applied += db.changesCount
-            }
-            for mutation in mutations {
-                switch mutation {
-                case .remove:
-                    continue
-                case .move(let id, let fromPath, let destination):
-                    // `parent_dir` carries no trailing slash, matching what
-                    // `FileRecord.init(entry:…)` and `pathScope` produce; a
-                    // trailing slash here would make the moved row invisible to
-                    // the non-recursive folder scope.
-                    try db.execute(sql: """
-                        UPDATE files SET path = ?, parent_dir = ?, name = ?
-                        WHERE id = ? AND path = ?
-                        """, arguments: [destination.path,
-                                         destination.deletingLastPathComponent().path,
-                                         destination.lastPathComponent, id, fromPath])
-                    guard db.changesCount == 1 else { continue }
-                    applied += 1
-                    // `files_fts` is a standalone FTS5 table, so a *rename* has
-                    // to be mirrored by hand: nothing else does it, and a move
-                    // that leaves the old name behind makes filename search
-                    // answer with a path that is gone. Deletes need no such
-                    // line — the `files_ad` trigger clears the FTS row and the
-                    // `analysis` row whenever a `files` row goes, whichever code
-                    // path removed it.
-                    try db.execute(sql: "UPDATE files_fts SET name = ? WHERE rowid = ?",
-                                   arguments: [destination.lastPathComponent, id])
-                case .insertCopy(let insert):
-                    _ = try Self.upsertRow(db, insert.record)
-                    applied += 1
-                }
-            }
-            for mark in marks {
-                try db.execute(sql: """
-                    UPDATE op_journal SET state = ?, trash_url = COALESCE(?, trash_url)
-                    WHERE op_id = ?
-                    """, arguments: [mark.state.rawValue, mark.trashURL, mark.opID])
-            }
-            return applied
+        try pool.write { db in try Self.apply(db, mutations: mutations, marks: marks) }
+    }
+
+    /// The body of `applyAndMark`, on a caller's `Database`.
+    ///
+    /// Extracted so the launch-time reconcile can put its `files` corrections,
+    /// its `reconciled` marks **and** its retention delete in one write
+    /// transaction rather than three. The rules the mutations obey — removals
+    /// first, the id-and-path guard on every write, the hand-maintained
+    /// `files_fts` rename — are the same rules whichever side is calling, and
+    /// duplicating them in the reconcile is how the two would drift.
+    @discardableResult
+    static func apply(_ db: Database, mutations: [IndexMutation],
+                      marks: [JournalMark]) throws -> Int {
+        var applied = 0
+        // **Removals first, and it is load-bearing rather than tidy.** A
+        // `replace` retires the row of the file it overwrote before the row
+        // taking that path is written, or `UNIQUE(files.path)` refuses the
+        // second — and the launch-time reconcile leans on the same order, where
+        // one pass can carry a `.remove` of a row and a `.move` onto the path it
+        // just vacated. Both are one transaction, so "before" here means this
+        // loop, not an earlier call.
+        for case .remove(let id, let path) in mutations {
+            try db.execute(sql: "DELETE FROM files WHERE id = ? AND path = ?",
+                           arguments: [id, path])
+            applied += db.changesCount
         }
+        for mutation in mutations {
+            switch mutation {
+            case .remove:
+                continue
+            case .move(let id, let fromPath, let destination):
+                // `parent_dir` carries no trailing slash, matching what
+                // `FileRecord.init(entry:…)` and `pathScope` produce; a
+                // trailing slash here would make the moved row invisible to
+                // the non-recursive folder scope.
+                try db.execute(sql: """
+                    UPDATE files SET path = ?, parent_dir = ?, name = ?
+                    WHERE id = ? AND path = ?
+                    """, arguments: [destination.path,
+                                     destination.deletingLastPathComponent().path,
+                                     destination.lastPathComponent, id, fromPath])
+                guard db.changesCount == 1 else { continue }
+                applied += 1
+                // `files_fts` is a standalone FTS5 table, so a *rename* has
+                // to be mirrored by hand: nothing else does it, and a move
+                // that leaves the old name behind makes filename search
+                // answer with a path that is gone. Deletes need no such
+                // line — the `files_ad` trigger clears the FTS row and the
+                // `analysis` row whenever a `files` row goes, whichever code
+                // path removed it.
+                try db.execute(sql: "UPDATE files_fts SET name = ? WHERE rowid = ?",
+                               arguments: [destination.lastPathComponent, id])
+            case .insertCopy(let insert):
+                _ = try Self.upsertRow(db, insert.record)
+                applied += 1
+            }
+        }
+        for mark in marks {
+            try db.execute(sql: """
+                UPDATE op_journal SET state = ?, trash_url = COALESCE(?, trash_url)
+                WHERE op_id = ?
+                """, arguments: [mark.state.rawValue, mark.trashURL, mark.opID])
+        }
+        return applied
     }
 
     /// Records where `trashItem` put a file, on its own, immediately.
@@ -205,11 +224,33 @@ extension IndexStore {
         }
     }
 
+    /// The `batch_id` of the most recently journalled batch, or nil if the
+    /// journal is empty.
+    ///
+    /// By `op_id`, not by `timestamp`: `timestamp` is one clock reading shared
+    /// by every row a batch writes up front, so two batches started inside the
+    /// same tick tie, and the injected clock in tests can repeat a value
+    /// outright. `op_id` is the rowid — monotonic by construction, and the
+    /// order the rows were really written in.
+    ///
+    /// This is what "undo the last batch" means: the newest batch, whatever
+    /// state it is in. Deliberately not "the newest *undoable* batch" —
+    /// stepping silently back to an older one would reverse an operation the
+    /// user was not looking at. `FileOperator.undoability(of:)` says why the
+    /// newest one cannot be undone instead.
+    public func lastJournalBatchID() throws -> String? {
+        try pool.read { db in
+            try String.fetchOne(db, sql: """
+                SELECT batch_id FROM op_journal ORDER BY op_id DESC LIMIT 1
+                """)
+        }
+    }
+
     /// A row whose `kind` or `state` this build does not know is dropped rather
     /// than trapped. The journal is persisted and read by later builds; a
     /// string nobody recognises is a reason to leave that row to whoever wrote
     /// it, not a reason to crash on launch.
-    private static func decodeJournal(_ rows: [Row]) -> [OpJournalRow] {
+    static func decodeJournal(_ rows: [Row]) -> [OpJournalRow] {
         rows.compactMap { row in
             guard let opID = row["op_id"] as Int64?,
                   let batchID = row["batch_id"] as String?,

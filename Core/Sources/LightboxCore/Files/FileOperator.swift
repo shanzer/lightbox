@@ -373,7 +373,10 @@ public actor FileOperator {
                             outcome: outcome)
     }
 
-    private static func marks(_ ops: [Int64], _ execution: ItemExecution) -> [JournalMark] {
+    /// Internal, not private: `FileOperator+Undo.swift` marks its own rows by
+    /// exactly this rule, and a second copy of "per-file state overrides the
+    /// item's, and only `trash` carries a URL" is a second copy to get wrong.
+    static func marks(_ ops: [Int64], _ execution: ItemExecution) -> [JournalMark] {
         ops.enumerated().map { offset, opID in
             JournalMark(opID: opID,
                         state: execution.perFileState.indices.contains(offset)
@@ -468,7 +471,13 @@ public actor FileOperator {
 
     // MARK: Trash
 
-    private func performTrash(_ item: PlannedItem, ops: [Int64]) -> ItemExecution {
+    /// Internal, not private, for the same reason `performTransfer` is: undo
+    /// reverses a `copy` by trashing the copy, and it does it through *this*
+    /// function rather than a second one. A separate trash path in the undo
+    /// would be a second place to forget that the Trash URL is written in its
+    /// own transaction before the item's, and that the row may only go once the
+    /// file is confirmed to be in the Trash.
+    func performTrash(_ item: PlannedItem, ops: [Int64]) -> ItemExecution {
         var execution = ItemExecution()
         var trashed: [(original: URL, trash: URL)] = []
         for (offset, file) in item.files.enumerated() {

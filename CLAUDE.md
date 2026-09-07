@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 543 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 602 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 63 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -152,6 +152,35 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   `FileOperationFailure` names the four cases that cannot make the promise. The same
   rule kills `try?` on any cleanup: a swallowed rollback is exactly how a row comes to
   claim `failed` over a filesystem that moved.
+- **A `move` journal row plus a destination that exists is not permission to unlink the
+  source.** That shape is a cross-volume move whose copy landed and whose delete leg did
+  not, and the launch-time reconcile (`IndexStore+Reconcile.swift`, run inside
+  `IndexStore.init` and never throwing out of it) treats it as a *copy*: both files stay,
+  the destination gains a row **without hashes**. Three rules govern every correction —
+  never remove a file, never remove a row whose path still holds the file it describes
+  (stale = nothing there, or a different inode/size/mtime), never carry hashes across a
+  crash. `IndexStore.decide`'s doc comment is the whole decision table.
+- **"Something is at `dst`" is never "the file that moved is at `dst`".** Every reconcile
+  branch that writes to a destination first checks `destinationMatches` (the file's size
+  and mtime against the source's row) — `rename(2)`, `copyfile` with `COPYFILE_ALL` and
+  `clonefile` all preserve both, so it only rejects a stranger that arrived in the
+  plan/execute gap or a copy the crash left short. Without it a 999-byte stranger inherits
+  a 64-byte photo's `content_hash`. A destination that fails gets **no row at all**, not a
+  NULL-dimensioned one: `needsReindex` keys on size and mtime, so a row matching its file
+  is never re-read and its nulls would be permanent. Retention floors the age rule at one
+  batch (`rn > 1`) for the same reason ⌘Z exists — 31 idle days must not eat the last
+  batch. And the reconcile's `stat`s run off the calling thread on a bounded wait, because
+  the app opens its store on the main actor before the first window draws — with the
+  abandon flag read **inside** the write transaction and left by throwing, since a check
+  merely before `pool.write` still commits after `init` has returned saying it did not.
+  The mtime half of the identity check carries a 2 s tolerance: "`copyfile` carries the
+  times across" is APFS-only, and exFAT/FAT/SMB quantise — which is every drive this app
+  is actually for. Size stays exact.
+- **`reconciled` is not `complete`, and undo knows the difference.** A `reconciled` row's
+  outcome was reconstructed from two `stat`s after a crash, so `undoability(of:)` refuses
+  the batch — as it refuses `in_flight` and `failed`. Only `skipped` is harmless enough to
+  ignore. A permanent delete is refused **before** it runs, which is the only moment the
+  answer is any use, and undo trashes a copy rather than unlinking it (spec §8 amended).
 - **Swift 6.3.3 times out on dense bit-twiddling one-liners** that 6.3.2 accepted. Split
   into named steps; don't fight the type checker.
 - **`width>=1920` costs 474 ms at 50k.** That is row materialisation, not a missing index.
