@@ -151,20 +151,62 @@ struct IntegrityTests {
     /// A rebuild must also clear the SQLite sidecars, or a fresh database can
     /// inherit a write-ahead log or shared-memory file left over from the
     /// corrupt one — the exact failure mode `rebuild(at:)` exists to avoid.
+    ///
+    /// The index is a WAL database, so the rebuilt store immediately makes its
+    /// own `-wal` and `-shm`. "Removed" therefore has to be observed as
+    /// *unlinked and replaced* — a different inode — and not as absence or as
+    /// changed bytes. Both weaker forms are vacuous here: absence would be
+    /// asserting the replacement never opened, and the bytes change either way
+    /// because GRDB's `setUpWALMode()` rewrites the log header at open.
+    ///
+    /// The `-shm` leg is the one that pins `rebuild(at:)`. Deleting a stale
+    /// `-wal` is belt and braces that SQLite performs anyway — it unlinks a log
+    /// whose database is missing — so that leg is asserted for symmetry and
+    /// cannot fail on its own. Verified by mutation: shortening the suffix list
+    /// to `[""]` leaves the `-shm` inode unchanged and takes this test red.
     @Test func rebuildRemovesTheWriteAheadLogAndSharedMemorySidecars() throws {
         let tree = try TempTree()
         let url = tree.root.appendingPathComponent("index.sqlite")
-        _ = try IndexStore(url: url)          // create and close
-
         let walURL = URL(fileURLWithPath: url.path + "-wal")
         let shmURL = URL(fileURLWithPath: url.path + "-shm")
-        try Data([0xFF]).write(to: walURL)
-        try Data([0xFF]).write(to: shmURL)
 
-        _ = try IndexStore.rebuild(at: url)
+        // Seeded from a live connection rather than from junk bytes: a one-byte
+        // "log" has no valid header, so SQLite discards it on sight and the
+        // test would pass without the rebuild having done anything.
+        let store = try IndexStore(url: url)
+        for i in 0..<5 {
+            _ = try store.upsert(FileRecord(
+                id: nil, path: "/a/\(i).jpg", parentDir: "/a", name: "\(i).jpg", ext: "jpg",
+                size: 1, mtime: 1, device: 1, inode: Int64(i), width: nil, height: nil,
+                captureTime: nil, captureOffset: nil, cameraMake: nil, cameraModel: nil,
+                orientation: nil, contentHash: nil, imageHash: nil, imageHashKind: nil,
+                phash: nil, hashedAt: nil, indexedAt: 1))
+        }
+        let liveWAL = try Data(contentsOf: walURL)
+        let liveSHM = try Data(contentsOf: shmURL)
+        #expect(!liveWAL.isEmpty)
+        #expect(!liveSHM.isEmpty)
+        // Closing checkpoints and removes the sidecars, so they are written
+        // back to stand in for the pair a crash would have left behind.
+        try store.close()
+        try liveWAL.write(to: walURL)
+        try liveSHM.write(to: shmURL)
 
-        #expect(!FileManager.default.fileExists(atPath: walURL.path))
-        #expect(!FileManager.default.fileExists(atPath: shmURL.path))
+        func inode(_ url: URL) -> UInt64? {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+            return (attributes?[.systemFileNumber] as? NSNumber)?.uint64Value
+        }
+        let staleWALInode = inode(walURL)
+        let staleSHMInode = inode(shmURL)
+        #expect(staleWALInode != nil)
+        #expect(staleSHMInode != nil)
+
+        let rebuilt = try IndexStore.rebuild(at: url)
+
+        #expect(inode(shmURL) != staleSHMInode, "the rebuild kept the stale -shm")
+        #expect(inode(walURL) != staleWALInode, "the rebuild kept the stale -wal")
+        #expect(try rebuilt.count() == 0)
+        #expect(rebuilt.checkIntegrity() == .ok)
     }
 }
 

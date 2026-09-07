@@ -20,7 +20,20 @@ public enum IndexStoreError: Error, Equatable, Sendable {
 }
 
 public final class IndexStore: Sendable {
-    private let dbq: DatabaseQueue
+    private let pool: DatabasePool
+
+    /// The database file this store is open on.
+    ///
+    /// Every store is file-backed, including the one `inMemory()` returns: a
+    /// `DatabasePool` needs a real file, because WAL's shared-memory index has
+    /// nowhere to live otherwise. Exposed internally so tests can observe the
+    /// three files WAL leaves on disk.
+    let fileURL: URL
+
+    /// The throwaway directory `inMemory()` created for this store, removed
+    /// when the store is released. Nil for a store opened at a caller's URL,
+    /// which owns nothing and must delete nothing.
+    private let ownedDirectory: URL?
 
     public static var defaultURL: URL {
         FileManager.default
@@ -30,55 +43,113 @@ public final class IndexStore: Sendable {
     }
 
     /// One configuration for the file-backed and in-memory stores, so tests
-    /// exercise the same database production runs. Every future setting (WAL,
-    /// busy timeout, custom functions) belongs here and nowhere else.
+    /// exercise the same database production runs. Every future setting
+    /// (journal mode, busy timeout, custom functions) belongs here and nowhere
+    /// else.
     private static func makeConfiguration() -> Configuration {
         var config = Configuration()
         config.foreignKeysEnabled = true
         // `WindowGroup` gives File → New Window (⌘N) for free, and every window
-        // builds its own `BrowserModel` → `IndexStore` → `DatabaseQueue` on the
-        // same `index.sqlite`. GRDB's default busy mode is `.immediateError`,
-        // so the moment two windows scan or search at once the second one takes
-        // `SQLITE_BUSY` straight into `status = .failed` mid-pass. Nothing is
-        // lost when that happens — `indexTier0` throws before its reconcile,
-        // `deleteRows` is a single transaction, and `setHashes(for:)` is
-        // guarded — but an ordinary gesture should not degrade the app.
+        // builds its own `BrowserModel` → `IndexStore` → `DatabasePool` on the
+        // same `index.sqlite`. The pool is the reason two windows can work at
+        // once: it opens a writer connection and a small set of read-only ones
+        // against a WAL database, so a reader takes a snapshot instead of a
+        // lock and never waits for a writer — not the writer in its own window
+        // (a search behind that window's tier 1 hash batch), and not the one in
+        // the other window. GRDB's `DatabasePool` puts the database into WAL
+        // itself, which is why nothing here sets `journalMode`; leaving it at
+        // `.default` is what asks for that.
+        //
+        // That hands one setting to GRDB rather than to this function, and the
+        // "here and nowhere else" rule is only honest if it is named: GRDB's
+        // `setUpWALMode()` also issues `PRAGMA synchronous = NORMAL`. Under WAL
+        // that trades an fsync per commit for the possibility of losing the
+        // last few commits to a power cut or a kernel panic — it cannot corrupt
+        // the file, because a torn WAL frame fails its checksum and is ignored.
+        // For a derived cache whose worst case is "rescan the folder" that is
+        // the right trade, and it is the reason a rebuild is a one-button
+        // operation rather than a repair tool. Anything that ever stores
+        // something *not* recomputable from the filesystem has to revisit it.
+        //
+        // The busy timeout is still needed, for the one case WAL does not fix:
+        // two *writers*. SQLite allows exactly one at a time whatever the
+        // journal mode, so two windows scanning at once still serialise, and
+        // GRDB's default busy mode is `.immediateError` — the second window
+        // would take `SQLITE_BUSY` straight into `status = .failed` mid-pass.
+        // Nothing is lost when that happens (`indexTier0` throws before its
+        // reconcile, `deleteRows` is a single transaction, and `setHashes(for:)`
+        // is guarded), but an ordinary gesture should not degrade the app.
         //
         // Five seconds is chosen against what actually contends: writes are
         // batched and short, so a window waits milliseconds in practice, and
         // the timeout only has to outlast one batch rather than a whole pass.
         // Long enough to be invisible, short enough that a genuinely stuck
         // writer still surfaces as an error instead of hanging the window.
-        //
-        // This is the cheap fix, not the durable one. Phase 2's answer is
-        // `DatabasePool` + WAL: readers then never block on the writer at all,
-        // and the busy timeout is left covering only writer-versus-writer
-        // contention, which is the one case a rollback-journal `DatabaseQueue`
-        // cannot avoid.
         config.busyMode = .timeout(5)
         return config
     }
 
+    /// Opens, or creates, the index at `url`.
+    ///
+    /// Write access is required even to open one for reading: activating WAL
+    /// writes the journal-mode change and the `-wal` and `-shm` files beside
+    /// the database. A read-only file, or one on a read-only or WAL-hostile
+    /// volume (some network mounts), therefore throws here rather than opening.
+    /// The app's own index lives in Application Support on the boot volume, but
+    /// this initializer is public and takes any URL.
     public init(url: URL) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        dbq = try DatabaseQueue(path: url.path, configuration: Self.makeConfiguration())
-        try Self.migrator.migrate(dbq)
+        fileURL = url
+        ownedDirectory = nil
+        pool = try Self.openPool(at: url)
+        try Self.migrator.migrate(pool)
     }
 
-    private init() throws {
-        dbq = try DatabaseQueue(configuration: Self.makeConfiguration())
-        try Self.migrator.migrate(dbq)
+    private init(temporaryDirectory: URL) throws {
+        let url = temporaryDirectory.appendingPathComponent("index.sqlite")
+        fileURL = url
+        ownedDirectory = temporaryDirectory
+        pool = try Self.openPool(at: url)
+        try Self.migrator.migrate(pool)
     }
 
-    public static func inMemory() throws -> IndexStore { try IndexStore() }
-
-    /// Closes the underlying SQLite connection synchronously.
+    /// A store nothing else can reach, on a file nothing else will find.
     ///
-    /// Not required for ordinary use — GRDB closes the connection when the
-    /// `DatabaseQueue` deinitializes, and that is sufficient for a store an
-    /// `IndexStore` owns for its own lifetime. It matters for exactly one
-    /// case in this codebase: `BrowserModel.init(at:)` opens a connection to
+    /// It was a genuine in-memory database until phase 2: a `DatabasePool`
+    /// cannot be one, because WAL needs a `-shm` file for the shared index that
+    /// coordinates its connections. Tests get a private temporary directory
+    /// each — `swift test` runs suites in parallel, so a shared path would have
+    /// them treading on one another — and the directory is removed when the
+    /// store is released.
+    public static func inMemory() throws -> IndexStore {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("lightbox-index-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return try IndexStore(temporaryDirectory: directory)
+    }
+
+    deinit {
+        guard let ownedDirectory else { return }
+        // Closed first, and explicitly: unlinking a file SQLite still has open
+        // is a client API violation even where it happens to work, and `deinit`
+        // is the last moment anything can be ordered.
+        try? pool.close()
+        try? FileManager.default.removeItem(at: ownedDirectory)
+    }
+
+    private static func openPool(at url: URL) throws -> DatabasePool {
+        try DatabasePool(path: url.path, configuration: makeConfiguration())
+    }
+
+    /// Closes the underlying SQLite connections synchronously.
+    ///
+    /// Not required for ordinary use — GRDB closes its connections when the
+    /// `DatabasePool` deinitializes, and that is sufficient for a store an
+    /// `IndexStore` owns for its own lifetime. It matters wherever a file is
+    /// about to be unlinked under a live connection — `deinit` on a store that
+    /// owns its temporary directory, and one case in the app:
+    /// `BrowserModel.init(at:)` opens a connection to
     /// check its integrity, and, if that check fails, discards it in favor of
     /// a fresh one at the same path. `deinit` is not synchronous enough for
     /// that — the old connection's file descriptor can still be open when
@@ -86,7 +157,7 @@ public final class IndexStore: Sendable {
     /// as a client API violation even though it happens to tolerate it. This
     /// makes closing the old connection an explicit, ordered step instead of
     /// a race with ARC.
-    public func close() throws { try dbq.close() }
+    public func close() throws { try pool.close() }
 
     // MARK: - Schema
 
@@ -187,7 +258,7 @@ public final class IndexStore: Sendable {
     /// by later phases survive a re-scan.
     @discardableResult
     public func upsert(_ record: FileRecord) throws -> Int64 {
-        try dbq.write { db in
+        try pool.write { db in
             guard let id = try Int64.fetchOne(db, sql: """
                 INSERT INTO files
                     (path, parent_dir, name, ext, size, mtime, device, inode, width, height,
@@ -281,7 +352,7 @@ public final class IndexStore: Sendable {
     public func setHashes(for record: FileRecord, content: String?, image: String?,
                           imageKind: String?, phash: String?, hashedAt: Double) throws -> Bool {
         guard let id = record.id else { return false }
-        return try dbq.write { db in
+        return try pool.write { db in
             try db.execute(sql: """
                 UPDATE files SET content_hash = ?, image_hash = ?, image_hash_kind = ?,
                                  phash = ?, hashed_at = ?
@@ -306,7 +377,7 @@ public final class IndexStore: Sendable {
                            onDevice device: Int64? = nil) throws -> Int {
         let scope = try Self.pathScope(prefix)
         var args: [any DatabaseValueConvertible] = [scope.exact, scope.lower, scope.upper]
-        return try dbq.write { db in
+        return try pool.write { db in
             let stale = try String.fetchAll(db, sql: Self.scopedSQL(Self.pathsInScopeSQL,
                                                                     device: device, into: &args),
                                             arguments: StatementArguments(args))
@@ -331,7 +402,7 @@ public final class IndexStore: Sendable {
                            onDevice device: Int64? = nil) throws -> Int {
         let normalized = try Self.pathScope(folder).exact
         var args: [any DatabaseValueConvertible] = [normalized]
-        return try dbq.write { db in
+        return try pool.write { db in
             let stale = try String.fetchAll(db, sql: Self.scopedSQL(Self.staleInFolderSQL,
                                                                     device: device, into: &args),
                                             arguments: StatementArguments(args))
@@ -352,14 +423,14 @@ public final class IndexStore: Sendable {
     /// exact where narrowing the delete's byte-range scope would not be.
     public func paths(under prefix: String) throws -> [String] {
         let scope = try Self.pathScope(prefix)
-        return try dbq.read { db in
+        return try pool.read { db in
             try String.fetchAll(db, sql: Self.pathsInScopeSQL,
                                 arguments: [scope.exact, scope.lower, scope.upper])
         }
     }
 
     public func record(atPath path: String) throws -> FileRecord? {
-        try dbq.read { db in
+        try pool.read { db in
             try FileRecord.fetchOne(db, sql: "SELECT * FROM files WHERE path = ?", arguments: [path])
         }
     }
@@ -371,7 +442,7 @@ public final class IndexStore: Sendable {
 
     public func filesMissingHashes(under prefix: String, limit: Int) throws -> [FileRecord] {
         let scope = try Self.pathScope(prefix)
-        return try dbq.read { db in
+        return try pool.read { db in
             try FileRecord.fetchAll(db, sql: Self.missingHashesSQL,
                                     arguments: [scope.exact, scope.lower, scope.upper, limit])
         }
@@ -383,7 +454,7 @@ public final class IndexStore: Sendable {
     /// drains cannot describe different sets of rows.
     public func countMissingHashes(under prefix: String) throws -> Int {
         let scope = try Self.pathScope(prefix)
-        return try dbq.read { db in
+        return try pool.read { db in
             try Int.fetchOne(db, sql: Self.countMissingHashesSQL,
                              arguments: [scope.exact, scope.lower, scope.upper])!
         }
@@ -391,13 +462,13 @@ public final class IndexStore: Sendable {
 
     public func search(_ query: SearchQuery) throws -> [FileRecord] {
         let compiled = try QueryCompiler.compile(query)
-        return try dbq.read { db in
+        return try pool.read { db in
             try FileRecord.fetchAll(db, sql: compiled.sql, arguments: compiled.arguments)
         }
     }
 
     public func count() throws -> Int {
-        try dbq.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM files")! }
+        try pool.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM files")! }
     }
 
     // MARK: - Facets
@@ -421,7 +492,7 @@ public final class IndexStore: Sendable {
     /// error signal.
     public func facets(for query: SearchQuery) throws -> Facets {
         let filter = try QueryCompiler.compileFilter(query)
-        return try dbq.read { db in
+        return try pool.read { db in
             // `column` is a compiler-side literal chosen below, never user
             // text; every value in the query is still a bound parameter.
             func counts(_ column: String) throws -> [String: Int] {
@@ -501,19 +572,19 @@ public final class IndexStore: Sendable {
     // MARK: - Test support
 
     func tableNames() throws -> Set<String> {
-        try dbq.read { db in
+        try pool.read { db in
             Set(try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type IN ('table')"))
         }
     }
 
     func ftsRowCount() throws -> Int {
-        try dbq.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM files_fts")! }
+        try pool.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM files_fts")! }
     }
 
     /// Row ids of files whose FTS row matches `pattern` — what Task 13's
     /// filename search actually depends on.
     func ftsMatchRowIDs(_ pattern: String) throws -> [Int64] {
-        try dbq.read { db in
+        try pool.read { db in
             try Int64.fetchAll(db, sql: "SELECT rowid FROM files_fts WHERE files_fts MATCH ? ORDER BY rowid",
                                arguments: [pattern])
         }
@@ -524,15 +595,19 @@ public final class IndexStore: Sendable {
     /// Runs outside an automatic transaction so statements like
     /// `PRAGMA foreign_keys`, which are no-ops mid-transaction, take effect.
     func testExecute(sql: String, arguments: StatementArguments = []) throws {
-        try dbq.writeWithoutTransaction { db in try db.execute(sql: sql, arguments: arguments) }
+        try pool.writeWithoutTransaction { db in try db.execute(sql: sql, arguments: arguments) }
     }
 
+    /// Reads on one of the pool's *reader* connections, not the writer that
+    /// `testExecute` uses, so a connection-scoped pragma set through one is not
+    /// visible through the other. `journal_mode` is a property of the file and
+    /// reads the same either way; `foreign_keys` is per-connection and does not.
     func testFetchOne<T: DatabaseValueConvertible>(sql: String, arguments: StatementArguments = []) throws -> T? {
-        try dbq.read { db in try T.fetchOne(db, sql: sql, arguments: arguments) }
+        try pool.read { db in try T.fetchOne(db, sql: sql, arguments: arguments) }
     }
 
     func queryPlan(sql: String, arguments: StatementArguments = []) throws -> [String] {
-        try dbq.read { db in
+        try pool.read { db in
             try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
                 .map { $0["detail"] as String? ?? "" }
         }
@@ -541,10 +616,10 @@ public final class IndexStore: Sendable {
 
 // MARK: - Integrity
 
-// An extension rather than free functions, because both members need `dbq`
-// (or, for `rebuild`, the initializer that opens it) and `dbq` is private to
+// An extension rather than free functions, because both members need `pool`
+// (or, for `rebuild`, the initializer that opens it) and `pool` is private to
 // this file on purpose — nothing outside `IndexStore` gets to hold a
-// `DatabaseQueue` and bypass the API above.
+// `DatabasePool` and bypass the API above.
 extension IndexStore {
     /// Runs SQLite's own consistency check against the file backing this
     /// store.
@@ -565,7 +640,7 @@ extension IndexStore {
     /// so a bug report says what actually failed.
     public func checkIntegrity() -> IndexHealth {
         do {
-            let result = try dbq.read { db in
+            let result = try pool.read { db in
                 try String.fetchOne(db, sql: "PRAGMA quick_check")
             }
             return result == "ok" ? .ok : .corrupt(result ?? "quick_check returned no result")

@@ -79,7 +79,11 @@ a model.
 
 ## 4. Data model
 
-Database at `~/Library/Application Support/Lightbox/index.sqlite`.
+Database at `~/Library/Application Support/Lightbox/index.sqlite`, in WAL mode
+through a GRDB `DatabasePool`, so a window's reads never wait for its own or
+another window's writes. WAL keeps two sidecars — `index.sqlite-wal` and
+`index.sqlite-shm` — beside it; the three are one database and are deleted
+together.
 
 **`files`** — `id`, `path` (unique), `parent_dir`, `name`, `ext`, `size`,
 `mtime`, `inode`, `width`, `height`, `capture_time`, `capture_offset`,
