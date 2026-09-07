@@ -81,11 +81,12 @@ neither prefix, with `LIGHTBOX_EXIFTOOL` as an override for a non-standard
 install or a test stub. `MetadataWriter.availability` is the single answer to
 "can we edit?", and the round-trip tests gate on that same property so a machine
 without exiftool (every CI runner) skips them visibly instead of failing. It was
-also used during design to empirically verify the image-hash denylists survive
+also used during design to empirically verify the image-hash rules survive
 metadata edits; `postWriteImageHashEqualsPreWriteImageHash` now checks that
-automatically on every run **that has exiftool** — on a runner without it, that
-test and the rest of the round-trip suite skip, so the tripwire is only armed
-where the binary exists.
+automatically for JPEG, PNG, WebP **and HEIC** — so §6's newest rule is held to
+the same exiftool round-trip as the others — on every run **that has exiftool**.
+On a runner without it, that test and the rest of the round-trip suite skip, so
+the tripwire is only armed where the binary exists.
 
 Sole dependency: **GRDB.swift 7.11.1**, pinned in
 `App/Lightbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
@@ -102,7 +103,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 389 tests, 23 suites.
+# Core: 420 tests, 32 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 57 tests.
@@ -154,7 +155,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 389 tests live. `App/` only wires it to views.
+where all the logic and all 420 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|

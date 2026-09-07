@@ -534,12 +534,13 @@ struct MetadataWriterRoundTripTests {
     /// it is checked automatically. If this fails, the format's denylist or
     /// allowlist is wrong — that is a bug to file, not to paper over by
     /// loosening the rule.
-    @Test(needsExiftool, arguments: ["jpg", "png", "webp"])
+    @Test(needsExiftool, arguments: ["jpg", "png", "webp", "heic"])
     func postWriteImageHashEqualsPreWriteImageHash(_ ext: String) async throws {
         let url = tree.root.appendingPathComponent("a.\(ext)")
         switch ext {
         case "jpg": try Fixtures.writeImage(to: url, format: .jpeg)
         case "png": try Fixtures.writeImage(to: url, format: .png)
+        case "heic": try Fixtures.writeImage(to: url, format: .heic)
         default: try FileManager.default.copyItem(at: Fixtures.url("simple.webp"), to: url)
         }
         let mediaType = try #require(MediaType.forExtension(ext))
@@ -616,27 +617,46 @@ struct MetadataWriterRoundTripTests {
         #expect(!FileManager.default.fileExists(atPath: sidecar.path + "_original"))
     }
 
-    /// The HEIC caveat, made visible. HEIC has no `image_hash` rule, so its
-    /// duplicate grouping rests on `content_hash` — which this write just
-    /// invalidated. That is acceptable, but the writer must say so rather than
-    /// let the inspector pretend a HEIC edit costs the same as a JPEG one.
-    @Test(needsExiftool) func aFormatWithNoImageHashRuleSaysSo() async throws {
-        let heic = try Fixtures.writeImage(
-            to: tree.root.appendingPathComponent("nohash.heic"), format: .heic)
-        let writer = MetadataWriter()
-        let outcomes = await writer.write(MetadataEdit(rating: 3), to: [heic])
-        try #require(outcomes[0].error == nil)
-        #expect(outcomes[0].success?.rehash?.imageHash == nil)
-        #expect(outcomes[0].success?.warnings.contains(.imageHashUnavailable(kind: "heic")) == true)
+    /// A format with no `image_hash` rule loses its duplicate grouping to the
+    /// `content_hash` this write just invalidated. That is acceptable, but the
+    /// writer must say so rather than let the inspector pretend the edit costs
+    /// the same as one on a format that does have a rule.
+    ///
+    /// This was HEIC until the HEIC rule landed; it is now TIFF, GIF and PSD.
+    /// The HEIC arm below is the regression guard for that change: a warning
+    /// that keeps firing for a format that has since gained a hash is a lie the
+    /// inspector would repeat.
+    @Test(needsExiftool, arguments: [Fixtures.Format.tiff, .gif, .psd])
+    func aFormatWithNoImageHashRuleSaysSo(_ format: Fixtures.Format) async throws {
+        let url = try Fixtures.writeImage(
+            to: tree.root.appendingPathComponent("nohash.\(format.ext)"), format: format)
+        let kind = try #require(MediaType.forExtension(format.ext)).kind
+        try #require(MediaType.forExtension(format.ext)?.imageHashKind == nil,
+                     "\(format.ext) has gained an image-hash rule; move it to the tripwire test")
 
-        // A JPEG, which does have a rule, must not carry the warning.
-        let jpeg = try Fixtures.writeImage(to: tree.root.appendingPathComponent("hash.jpg"))
-        let jpegOutcomes = await writer.write(MetadataEdit(rating: 3), to: [jpeg])
-        try #require(jpegOutcomes[0].error == nil)
-        #expect(jpegOutcomes[0].success?.warnings.contains { warning in
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(MetadataEdit(rating: 3), to: [url])
+        try #require(outcomes[0].error == nil,
+                     "\(format.ext) write failed: \(String(describing: outcomes[0].error))")
+        #expect(outcomes[0].success?.rehash?.imageHash == nil)
+        #expect(outcomes[0].success?.warnings
+            .contains(.imageHashUnavailable(kind: kind.rawValue)) == true)
+    }
+
+    @Test(needsExiftool, arguments: [Fixtures.Format.jpeg, .png, .heic])
+    func aFormatWithAnImageHashRuleDoesNotWarn(_ format: Fixtures.Format) async throws {
+        let url = try Fixtures.writeImage(
+            to: tree.root.appendingPathComponent("hashed.\(format.ext)"), format: format)
+        try #require(MediaType.forExtension(format.ext)?.imageHashKind != nil)
+
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(MetadataEdit(rating: 3), to: [url])
+        try #require(outcomes[0].error == nil)
+        #expect(outcomes[0].success?.rehash?.imageHash != nil)
+        #expect(outcomes[0].success?.warnings.contains { warning in
             if case .imageHashUnavailable = warning { return true }
             return false
-        } == false)
+        } == false, "\(format.ext) has an image hash and must not warn that it has none")
     }
 
     /// An empty value clears the field out of all three families, and must
