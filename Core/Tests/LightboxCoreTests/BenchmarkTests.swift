@@ -24,11 +24,11 @@ private let benchmarksEnabled = ProcessInfo.processInfo.environment["LIGHTBOX_BE
 private let benchmarkRoot = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("lightbox-bench")
 
-@Test(.disabled(if: !benchmarksEnabled, "benchmark: set LIGHTBOX_BENCH=1 to run"))
+// Traits are evaluated in order, and the absent library is the more useful
+// thing to be told about; see `measureDuplicateGroupingOverTheFixtureLibrary`.
+@Test(.disabled(if: !benchmarkLibraryPresent, missingLibraryReason),
+      .disabled(if: !benchmarksEnabled, "benchmark: set LIGHTBOX_BENCH=1 to run"))
 func measureIndexingOfFiftyThousandImages() async throws {
-    try #require(FileManager.default.fileExists(atPath: benchmarkRoot.path),
-                 "run scripts/make-fixture-library.swift first")
-
     let result = try await Benchmark.indexingPass(root: benchmarkRoot)
     print("files:        \(result.fileCount)")
     print("rows:         \(result.rowCount)")
@@ -242,11 +242,11 @@ func measureDuplicateGroupingOverTheFixtureLibrary() async throws {
 /// the first screenful pays to bring up QuickLook's out-of-process generator,
 /// the second is what a user scrolling into fresh images actually waits for,
 /// and the third is a pure cache hit.
-@Test(.disabled(if: !benchmarksEnabled, "benchmark: set LIGHTBOX_BENCH=1 to run"))
+// Traits are evaluated in order, and the absent library is the more useful
+// thing to be told about; see `measureDuplicateGroupingOverTheFixtureLibrary`.
+@Test(.disabled(if: !benchmarkLibraryPresent, missingLibraryReason),
+      .disabled(if: !benchmarksEnabled, "benchmark: set LIGHTBOX_BENCH=1 to run"))
 func measureFirstScreenOfThumbnails() async throws {
-    try #require(FileManager.default.fileExists(atPath: benchmarkRoot.path),
-                 "run scripts/make-fixture-library.swift first")
-
     let directory = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("lightbox-bench-thumbs-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
