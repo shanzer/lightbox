@@ -161,7 +161,25 @@ public final class IndexStore: Sendable {
 
     // MARK: - Schema
 
-    private static let migrator: DatabaseMigrator = {
+    /// The newest schema version this build knows how to produce.
+    static let currentSchemaVersion = 2
+
+    private static let migrator = makeMigrator()
+
+    /// The schema, one registration per version.
+    ///
+    /// Parameterised by the last version to apply, and internal, so a test can
+    /// build a database as it stood at an earlier version — GRDB's own
+    /// `grdb_migrations` bookkeeping included — and then open it through
+    /// `init(url:)` to exercise the real upgrade path. That matters more than
+    /// it sounds: v2 is the first migration to run against a populated
+    /// `index.sqlite`, and a migration that only ever ran against an empty
+    /// database has been tested against the one case that cannot fail.
+    ///
+    /// Production always uses the default. A registered migration is never
+    /// edited: GRDB records that it ran, so a change to it reaches only
+    /// databases created after the change.
+    static func makeMigrator(upTo lastVersion: Int = currentSchemaVersion) -> DatabaseMigrator {
         var m = DatabaseMigrator()
         m.registerMigration("v1") { db in
             try db.execute(sql: """
@@ -248,8 +266,30 @@ public final class IndexStore: Sendable {
                 END;
                 """)
         }
+        guard lastVersion >= 2 else { return m }
+
+        // Schema v2: a stable volume identity.
+        //
+        // `device` is `st_dev`, which is assigned at mount time and renumbered
+        // when an external drive is replugged; a row's *identity* has to
+        // outlive that. See `VolumeIdentity` for the two ids and why both are
+        // kept.
+        //
+        // Nullable, with no backfill, because a backfill is not possible: the
+        // row records which volume it came from and nothing on the row can
+        // recover a UUID for a volume that may not even be mounted. Rows stay
+        // NULL until a tier 0 pass walks them and stamps the volume it found
+        // them on, and until then they are matched by `device` exactly as they
+        // were before this migration — see `deleteRows(under:keeping:…)`.
+        //
+        // No index on it. Nothing queries by volume alone: the reconcile's
+        // predicate is already anchored on the `path` scope, and an index that
+        // no query plan chooses is a write cost on every upsert for nothing.
+        m.registerMigration("v2") { db in
+            try db.execute(sql: "ALTER TABLE files ADD COLUMN volume_uuid TEXT")
+        }
         return m
-    }()
+    }
 
     // MARK: - Writes
 
@@ -261,14 +301,15 @@ public final class IndexStore: Sendable {
         try pool.write { db in
             guard let id = try Int64.fetchOne(db, sql: """
                 INSERT INTO files
-                    (path, parent_dir, name, ext, size, mtime, device, inode, width, height,
+                    (path, parent_dir, name, ext, size, mtime, device, inode, volume_uuid,
+                     width, height,
                      capture_time, capture_offset, camera_make, camera_model, orientation,
                      content_hash, image_hash, image_hash_kind, phash, hashed_at, indexed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET
                     parent_dir=excluded.parent_dir, name=excluded.name, ext=excluded.ext,
                     size=excluded.size, mtime=excluded.mtime, device=excluded.device,
-                    inode=excluded.inode,
+                    inode=excluded.inode, volume_uuid=excluded.volume_uuid,
                     width=excluded.width, height=excluded.height,
                     capture_time=excluded.capture_time, capture_offset=excluded.capture_offset,
                     camera_make=excluded.camera_make, camera_model=excluded.camera_model,
@@ -295,7 +336,7 @@ public final class IndexStore: Sendable {
                 """, arguments: [
                     record.path, record.parentDir, record.name, record.ext,
                     record.size, record.mtime, record.device, record.inode,
-                    record.width, record.height,
+                    record.volumeUUID, record.width, record.height,
                     record.captureTime, record.captureOffset, record.cameraMake,
                     record.cameraModel, record.orientation, record.contentHash,
                     record.imageHash, record.imageHashKind, record.phash,
@@ -363,23 +404,87 @@ public final class IndexStore: Sendable {
         }
     }
 
+    /// Records the volume a set of already-indexed files was just seen on, and
+    /// returns how many rows that changed.
+    ///
+    /// This is the backfill for schema v2. The migration cannot fill
+    /// `volume_uuid` — nothing on a row can name a UUID for a volume that may
+    /// not even be mounted — and tier 0 re-reads a file only when its size or
+    /// mtime changed, so a row written before v2 would otherwise keep no volume
+    /// identity for as long as its bytes never change, which for a photo
+    /// archive is forever. Instead every pass stamps the rows whose files it
+    /// actually walked. `device` is stamped alongside, because a replug
+    /// renumbers it and the NULL-UUID half of the reconcile's matching rule
+    /// reads it.
+    ///
+    /// `paths` must be paths the walk *saw*. Not the whole scope: a row for a
+    /// file on another volume that happens to sit under the same prefix keeps
+    /// its own identity, or the next reconcile would start judging it.
+    ///
+    /// One transaction, chunked only to stay inside SQLite's bound-variable
+    /// limit. A stamp per file would be a write transaction per file, which on
+    /// a 50k library is the whole pass; rows already carrying this stamp are
+    /// excluded in SQL, so a steady-state pass dirties no pages at all.
+    @discardableResult
+    public func setVolume(_ volume: VolumeIdentity, forPaths paths: [String]) throws -> Int {
+        guard !paths.isEmpty else { return 0 }
+        let uuid = volume.uuid?.databaseValue ?? .null
+        return try pool.write { db in
+            var stamped = 0
+            for start in stride(from: 0, to: paths.count, by: Self.stampChunkSize) {
+                let slice = paths[start..<min(start + Self.stampChunkSize, paths.count)]
+                let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
+                var args: [any DatabaseValueConvertible] = [uuid, volume.device]
+                args.append(contentsOf: slice.map { $0 as any DatabaseValueConvertible })
+                args.append(uuid)
+                args.append(volume.device)
+                try db.execute(sql: """
+                    UPDATE files SET volume_uuid = ?, device = ?
+                    WHERE path IN (\(placeholders))
+                      AND (volume_uuid IS NOT ? OR device <> ?)
+                    """, arguments: StatementArguments(args))
+                stamped += db.changesCount
+            }
+            return stamped
+        }
+    }
+
+    /// Paths per `setVolume` statement. Well under SQLite's default limit of
+    /// 999 bound variables, which the four fixed parameters also come out of.
+    private static let stampChunkSize = 500
+
     /// Removes rows under `prefix` whose paths are not in `keeping`.
     /// FTS and `analysis` rows follow via the `files_ad` trigger and the
     /// `ON DELETE CASCADE` foreign key.
     ///
-    /// `onDevice` restricts the delete to rows recorded on one volume. A row
-    /// carrying a different `device` was indexed from a filesystem that is not
-    /// the one currently answering at this path, so a walk of that path is no
-    /// evidence about it. Nil means every device, which is only right when the
-    /// caller has no volume to compare against.
+    /// `onDevice` and `onVolume` restrict the delete to rows recorded on one
+    /// volume. A row from a different filesystem was not indexed from the one
+    /// currently answering at this path, so a walk of that path is no evidence
+    /// about it. Nil `onDevice` means every volume, which is only right when
+    /// the caller has none to compare against; `onVolume` is ignored then.
+    ///
+    /// **The matching rule, in full: a row is prunable if its `volume_uuid`
+    /// equals the root's, or its `volume_uuid` is NULL and its `device` equals
+    /// the root's `st_dev`.** The first clause is the identity that matters —
+    /// a volume UUID survives the unmount that renumbers `st_dev`, so a
+    /// replugged drive still reconciles and a different filesystem handed the
+    /// old `st_dev` still does not. The second is the pre-migration case: rows
+    /// written before schema v2 carry no UUID, and matching them on `device`
+    /// is exactly the behaviour they were written under. A root that publishes
+    /// no UUID binds NULL for `onVolume`, which makes the first clause always
+    /// false (`volume_uuid = NULL` never holds) and leaves the whole rule as
+    /// the `device` comparison it was before — the intended fallback, not an
+    /// accident of SQL.
     @discardableResult
     public func deleteRows(under prefix: String, keeping: Set<String>,
-                           onDevice device: Int64? = nil) throws -> Int {
+                           onDevice device: Int64? = nil,
+                           onVolume volume: String? = nil) throws -> Int {
         let scope = try Self.pathScope(prefix)
         var args: [any DatabaseValueConvertible] = [scope.exact, scope.lower, scope.upper]
         return try pool.write { db in
             let stale = try String.fetchAll(db, sql: Self.scopedSQL(Self.pathsInScopeSQL,
-                                                                    device: device, into: &args),
+                                                                    device: device, volume: volume,
+                                                                    into: &args),
                                             arguments: StatementArguments(args))
                 .filter { !keeping.contains($0) }
             for path in stale {
@@ -395,16 +500,19 @@ public final class IndexStore: Sendable {
     ///
     /// `folder` is validated and normalized exactly as a recursive scope is, so
     /// a trailing slash matches the stored `parent_dir` and a relative or empty
-    /// setting throws rather than matching nothing. `onDevice` restricts the
-    /// delete to one volume, as in `deleteRows(under:keeping:onDevice:)`.
+    /// setting throws rather than matching nothing. `onDevice` and `onVolume`
+    /// restrict the delete to one volume by exactly the rule spelled out on
+    /// `deleteRows(under:keeping:onDevice:onVolume:)`.
     @discardableResult
     public func deleteRows(inFolder folder: String, keeping: Set<String>,
-                           onDevice device: Int64? = nil) throws -> Int {
+                           onDevice device: Int64? = nil,
+                           onVolume volume: String? = nil) throws -> Int {
         let normalized = try Self.pathScope(folder).exact
         var args: [any DatabaseValueConvertible] = [normalized]
         return try pool.write { db in
             let stale = try String.fetchAll(db, sql: Self.scopedSQL(Self.staleInFolderSQL,
-                                                                    device: device, into: &args),
+                                                                    device: device, volume: volume,
+                                                                    into: &args),
                                             arguments: StatementArguments(args))
                 .filter { !keeping.contains($0) }
             for path in stale {
@@ -540,15 +648,20 @@ public final class IndexStore: Sendable {
         SELECT count(*) FROM files WHERE hashed_at IS NULL AND \(scopePredicateSQL)
         """
 
-    /// Appends the optional device restriction to a scope query, keeping the
+    /// Appends the optional volume restriction to a scope query, keeping the
     /// bind order in step with the SQL. One copy, so the two delete paths
     /// cannot drift apart on the check that guards against reconciling
-    /// against the wrong volume.
-    private static func scopedSQL(_ sql: String, device: Int64?,
+    /// against the wrong volume. The rule itself is documented on
+    /// `deleteRows(under:keeping:onDevice:onVolume:)`.
+    private static func scopedSQL(_ sql: String, device: Int64?, volume: String?,
                                   into args: inout [any DatabaseValueConvertible]) -> String {
         guard let device else { return sql }
+        // Bound even when nil, so the SQL is one string rather than two: with
+        // NULL bound, `volume_uuid = ?` is never true and the predicate is the
+        // `device` comparison alone.
+        args.append(volume?.databaseValue ?? .null)
         args.append(device)
-        return sql + " AND device = ?"
+        return sql + " AND (volume_uuid = ? OR (volume_uuid IS NULL AND device = ?))"
     }
 
     /// Bounds for "every path at or under `prefix`" as byte comparisons.

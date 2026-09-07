@@ -86,9 +86,9 @@ another window's writes. WAL keeps two sidecars — `index.sqlite-wal` and
 together.
 
 **`files`** — `id`, `path` (unique), `parent_dir`, `name`, `ext`, `size`,
-`mtime`, `inode`, `width`, `height`, `capture_time`, `capture_offset`,
-`camera_make`, `camera_model`, `orientation`, `content_hash`, `image_hash`,
-`image_hash_kind`, `phash`, `hashed_at`, `indexed_at`.
+`mtime`, `device`, `inode`, `volume_uuid`, `width`, `height`, `capture_time`,
+`capture_offset`, `camera_make`, `camera_model`, `orientation`, `content_hash`,
+`image_hash`, `image_hash_kind`, `phash`, `hashed_at`, `indexed_at`.
 
 **`files_fts`** — FTS5 external-content table over `name` and `ocr_text`.
 
@@ -102,6 +102,38 @@ bounding boxes as a fraction of the frame), `top_labels` (JSON),
 
 **`op_journal`** — `op_id`, `batch_id`, `kind`, `src`, `dst`, `trash_url`,
 `timestamp`, `state`.
+
+### Volume identity
+
+*(Amended: schema v2.)* A row records which volume it was seen on, so a walk of
+a path is never taken as evidence about rows that came from a different
+filesystem — a stale mount point, a share that mounts empty, or a drive back
+with a fresh filesystem otherwise reads as "every file here was deleted" from a
+clean, complete, zero-entry pass.
+
+Two columns, because neither id is sufficient alone:
+
+- **`volume_uuid`** — `URLResourceValues.volumeUUIDString`, read once per pass
+  from the scan's root. It is a property of the filesystem, assigned when it is
+  created, and it survives unmounts, reboots and replugs. This is the identity.
+- **`device`** — `st_dev`, assigned at *mount* time and renumbered when a drive
+  comes back. It cannot be the identity, and is kept because an inode is unique
+  only within a volume and because rows written before v2 have nothing else.
+
+**The matching rule for the reconcile's delete: a row is prunable if its
+`volume_uuid` equals the root's, or its `volume_uuid` is NULL and its `device`
+equals the root's `st_dev`.** The second clause is the pre-migration case, and
+it is also what a filesystem that publishes no UUID (SMB, some FAT) falls back
+to — such a root binds NULL, the first clause can never hold, and the rule is
+the `st_dev` comparison it was before v2. The tier 1 hashing pass guards its
+writes with the same identity, comparing the UUID where one exists and `st_dev`
+where it does not.
+
+v2 adds the column nullable and backfills nothing: no row can name a UUID for a
+volume that may not be mounted. Each tier 0 pass instead stamps the rows whose
+files it actually walked — not the whole path scope, because a row the walk
+could not look at is not evidence of anything. A volume whose UUID *changes* (a
+reformat) is out of scope; that is a new library.
 
 ### Staleness
 

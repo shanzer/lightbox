@@ -109,8 +109,12 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   lands on another photo's row, and duplicate detection deletes on it. Not optional.
 - **Motion photos and chunk-flood files are guarded and tested.** Any new format parser
   needs both: strip trailing data past EOI/IEND, and coalesce ranges before reading.
-- **`st_dev` is a mount-time id**, not a volume identity — it changes on replug. Phase 2
-  adds a volume-UUID column; until then don't lean on it.
+- **`st_dev` is a mount-time id**, not a volume identity — it changes on replug. Since
+  schema v2 the identity is `files.volume_uuid` (`VolumeIdentity`), and `device` is kept
+  only for inode uniqueness and for rows written before v2. The reconcile's matching rule
+  is on `IndexStore.deleteRows`: **a row is prunable if its `volume_uuid` equals the
+  root's, or its `volume_uuid` is NULL and its `device` equals the root's `st_dev`.** Don't
+  reintroduce a device-only comparison as "simpler"; it is the ghost-rows bug.
 - **GRDB is on a `DatabasePool` in WAL mode, with a 5 s busy timeout.** Readers take a
   snapshot and never wait for a writer; the timeout is there for writer-versus-writer,
   which SQLite serialises whatever the journal mode. All DB configuration goes in

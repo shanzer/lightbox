@@ -152,7 +152,7 @@ where all the logic and all 341 tests live. `App/` only wires it to views.
 | Area | Files | What it does |
 |---|---|---|
 | Walk | `Walker.swift`, `MediaType.swift` | Recursive enumeration; extension + UTI classification (RAW, HEIC, JPEG, PNG, WebP) |
-| Index | `Index/{FileRecord,IndexStore}.swift` | SQLite via GRDB, schema + migrations, FTS5, path scoping |
+| Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity |
 | Metadata | `Metadata/{ImageMetadata,MetadataReader}.swift` | ImageIO `CGImageSource` reads — dimensions, camera, capture time |
 | Hashing | `Hashing/*.swift` | Three hashes: `content_hash` (whole file), `image_hash` (format-stripped pixel data), `phash` (DCT perceptual) |
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
@@ -263,9 +263,16 @@ Five things automated tests could not cover. **None done yet** as of the
    ⌘N while tier 1 is hashing, open the same folder in the second window. Both
    windows should stay responsive, neither pass should fail, and
    `log stream --predicate 'process == "Lightbox"'` should show no `SQLITE_BUSY`.
-3. **Unplug the Seagate mid-hash.** The unreachable-root guards were only ever
-   tested against *simulated* unmounts. This is the one that lost the whole
-   index twice during development, so it is worth doing for real.
+3. **Unplug the Seagate mid-hash, and replug it.** The unreachable-root guards
+   were only ever tested against *simulated* unmounts. This is the one that lost
+   the whole index twice during development, so it is worth doing for real.
+   Issue #4 (volume UUID) landed the replug half of it in code and in tests, but
+   both live checks are still owed:
+   - Delete a file in Finder, eject the drive, replug it, reopen the folder. The
+     row should be gone — before #4 it survived forever, because the replug
+     renumbered `st_dev` and the prune guard read every row as another volume's.
+   - Unplug it *during* a hashing pass. The pass must abort (`rootUnreadable`)
+     and the index must survive.
 4. **⌘A with the search field focused.** Should select the field's text, not the
    grid. Tests could only warn, never assert.
 5. **Cold folder open shows an empty grid** for the entire first index pass
@@ -286,10 +293,21 @@ Two things belong at the *front* of phase 2 rather than in a backlog:
   carrying forward: the index is now three files (§4), and `IndexStore.inMemory()`
   is a private temporary file rather than a true in-memory database, because a
   pool cannot be one.
-- **A volume-UUID column.** `st_dev` is currently used as the device identity,
-  but it is a *mount-time* id — it changes across reboots and replugs, which
-  matters a great deal for a library that lives on an external Seagate. This is
-  a schema migration, and phase 2 is the last cheap moment to add one.
+- ~~**A volume-UUID column.**~~ **Done** (issue #4, schema v2). `files.volume_uuid`
+  holds `URLResourceValues.volumeUUIDString`, which is a property of the
+  filesystem and survives the replug that renumbers `st_dev`; `device` is kept
+  for inode uniqueness and for rows written before v2. `VolumeIdentity` is the
+  one place the two ids are compared, and the reconcile's matching rule is
+  written out on `IndexStore.deleteRows`: a row is prunable if its `volume_uuid`
+  equals the root's, or its `volume_uuid` is NULL and its `device` equals the
+  root's `st_dev`. Three things worth carrying forward: the migration adds a
+  nullable column and backfills nothing (no row can name a UUID for a volume
+  that may not be mounted), so `IndexStore.setVolume(_:forPaths:)` stamps the
+  rows each tier 0 pass actually walked — that is the backfill, and it is why it
+  does not wait for a file's bytes to change; a filesystem that publishes no
+  UUID (SMB, some FAT) falls back to `st_dev` exactly as before v2; and a volume
+  whose UUID *changes* (a reformat) is deliberately out of scope — that is a new
+  library.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And

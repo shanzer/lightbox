@@ -48,14 +48,16 @@ private func makeCoordinator(_ store: IndexStore,
 }
 
 /// A row for a file the coordinator never walked, so a test can plant an index
-/// that predates the current mount. `device` is the point of it.
-private func plantedRecord(path: String, device: Int64) -> FileRecord {
+/// that predates the current mount. The volume identity is the point of it.
+private func plantedRecord(path: String, device: Int64,
+                           volumeUUID: String? = nil) -> FileRecord {
     FileRecord(id: nil, path: path,
                parentDir: (path as NSString).deletingLastPathComponent,
                name: (path as NSString).lastPathComponent,
                ext: (path as NSString).pathExtension.lowercased(),
                size: 8, mtime: 1_700_000_000, device: device, inode: 1,
-               width: 640, height: 480, captureTime: nil, captureOffset: nil,
+               volumeUUID: volumeUUID, width: 640, height: 480,
+               captureTime: nil, captureOffset: nil,
                cameraMake: nil, cameraModel: nil, orientation: 1,
                contentHash: nil, imageHash: nil, imageHashKind: nil,
                phash: nil, hashedAt: nil, indexedAt: 1_700_000_000)
@@ -64,6 +66,18 @@ private func plantedRecord(path: String, device: Int64) -> FileRecord {
 /// No real volume gets this device id, so a row carrying it can only have come
 /// from a filesystem that is not the one the test is walking.
 private let foreignDevice: Int64 = 999_999_999
+
+/// No real volume gets this UUID either. It is the shape of a real one so a
+/// comparison is doing the same work it does in production.
+private let foreignVolumeUUID = "00000000-0000-0000-0000-000000000000"
+
+/// The temporary directory's volume UUID, or nil on a filesystem that
+/// publishes none (SMB, some FAT). Read through the same resource key the code
+/// under test reads, so a skip guard cannot disagree with the behaviour it is
+/// guarding: the tests that prove UUID identity have nothing to prove on a
+/// volume that has no UUID.
+private let temporaryVolumeUUID: String? = (try? URL(fileURLWithPath: NSTemporaryDirectory())
+    .resourceValues(forKeys: [.volumeUUIDStringKey]))?.volumeUUIDString
 
 /// A `struct` suite so swift-testing builds a fresh instance per test and
 /// releases it afterwards: teardown of `tree` is then the framework's
@@ -275,6 +289,26 @@ struct IndexCoordinatorTests {
         #expect(try store.record(atPath: path("locked/deep/nested/y.jpg")) != nil)
     }
 
+    /// The stamp is evidence, and evidence needs a look. Rows the walk could
+    /// not see keep the volume identity they had — restating it would let the
+    /// *next* pass reconcile rows on the strength of a subtree nobody entered.
+    @Test(.enabled(if: getuid() != 0, "requires a non-root user"))
+    func rowsInASubtreeTheWalkCouldNotEnterKeepTheirVolume() async throws {
+        try tree.file("a.jpg")
+        try tree.directory("locked")
+        let store = try IndexStore.inMemory()
+        try store.upsert(plantedRecord(path: path("locked/planted.jpg"),
+                                       device: foreignDevice, volumeUUID: foreignVolumeUUID))
+
+        try tree.chmod("locked", 0o000)
+        _ = try await makeCoordinator(store).indexTier0(root: tree.root, recursive: true,
+                                                        onProgress: nil)
+
+        let row = try #require(try store.record(atPath: path("locked/planted.jpg")))
+        #expect(row.volumeUUID == foreignVolumeUUID)
+        #expect(row.device == foreignDevice)
+    }
+
     /// An unreadable root must not read as "the folder is empty now".
     @Test(.enabled(if: getuid() != 0, "requires a non-root user"))
     func anUnreadableRootThrowsAndDeletesNothing() async throws {
@@ -394,6 +428,107 @@ struct IndexCoordinatorTests {
             #expect(try store.record(atPath: path("photos/old\(i).jpg")) != nil)
         }
         #expect(try store.count() == 5)
+    }
+
+    /// The upgrade end to end: a populated v1 index, migrated by opening it,
+    /// then a tier 0 pass over the tree it describes.
+    ///
+    /// The planted rows' size and mtime match the files on disk exactly, so
+    /// tier 0 re-reads none of them — which is the point. Tier 0 only upserts a
+    /// file whose bytes changed, so a backfill that rode along on the upsert
+    /// would leave `volume_uuid` NULL on a real library until the user edited
+    /// every photo in it.
+    @Test(.enabled(if: temporaryVolumeUUID != nil,
+                   "the temporary directory's volume publishes no UUID"))
+    func aTier0PassFillsTheVolumeOfRowsMigratedFromV1() async throws {
+        let photos = try tree.directory("photos")
+        var planted: [(path: String, size: Int64, mtime: Double)] = []
+        for i in 0..<4 {
+            let url = try tree.file("photos/img\(i).jpg", bytes: 16 + i)
+            var st = stat()
+            #expect(stat(url.path, &st) == 0)
+            // The same arithmetic `Walker` does, or the rows would read stale
+            // and the pass would re-upsert them — proving nothing.
+            let mtime = Double(st.st_mtimespec.tv_sec)
+                + Double(st.st_mtimespec.tv_nsec) / 1_000_000_000
+            planted.append((url.path, Int64(st.st_size), mtime))
+        }
+
+        let indexURL = tree.root.appendingPathComponent("v1/index.sqlite")
+        try makeV1Index(at: indexURL) { db in
+            for file in planted {
+                try insertV1Row(db, path: file.path, size: file.size, mtime: file.mtime,
+                                device: foreignDevice)
+            }
+        }
+
+        let store = try IndexStore(url: indexURL)
+        for file in planted {
+            #expect(try store.record(atPath: file.path)?.volumeUUID == nil)
+        }
+
+        let progress = try await makeCoordinator(store)
+            .indexTier0(root: photos, recursive: true, onProgress: nil)
+        #expect(progress.total == 4)
+        #expect(progress.completed == 0)      // nothing was stale, so nothing was re-read
+        #expect(try store.count() == 4)
+        for file in planted {
+            let row = try #require(try store.record(atPath: file.path))
+            #expect(row.volumeUUID == temporaryVolumeUUID)
+            #expect(row.device != foreignDevice)   // the stale mount id is refreshed with it
+        }
+        try store.close()
+    }
+
+    /// The sharper form of the test above, and the one `st_dev` alone cannot
+    /// pass: the rows claim a *different* volume while carrying the device id
+    /// of the one that is actually mounted. A replug renumbers `st_dev`, so
+    /// this collision is not hypothetical — a device-only check would read
+    /// these rows as its own and delete every one of them.
+    @Test func rowsFromAnotherVolumeSurviveEvenWhenTheDeviceIDCollides() async throws {
+        let scanRoot = try tree.directory("photos")
+        var st = stat()
+        #expect(stat(scanRoot.path, &st) == 0)
+        let store = try IndexStore.inMemory()
+        for i in 0..<7 {
+            try store.upsert(plantedRecord(path: scanRoot.appendingPathComponent("img\(i).jpg").path,
+                                           device: Int64(st.st_dev),
+                                           volumeUUID: foreignVolumeUUID))
+        }
+        #expect(try store.count() == 7)
+
+        let progress = try await makeCoordinator(store)
+            .indexTier0(root: scanRoot, recursive: true, onProgress: nil)
+        #expect(progress.total == 0)          // the walk really did see an empty folder
+        #expect(try store.count() == 7)
+    }
+
+    /// The case this app's own hardware produces every time the Seagate is
+    /// replugged: `st_dev` is handed out at mount time, so the same volume
+    /// comes back with a different one and every existing row starts to look
+    /// like it came from another filesystem. Under a device-only check the
+    /// reconcile then silently stops pruning — files deleted outside the app
+    /// stay in the grid as ghosts until the index is rebuilt. The volume UUID
+    /// is what survives the replug, so the prune must still happen.
+    @Test(.enabled(if: temporaryVolumeUUID != nil,
+                   "the temporary directory's volume publishes no UUID"))
+    func aReplugThatRenumbersTheDeviceStillReconciles() async throws {
+        let doomed = try tree.file("gone.jpg")
+        try tree.file("stays.jpg")
+        let store = try IndexStore.inMemory()
+        let coordinator = makeCoordinator(store)
+        _ = try await coordinator.indexTier0(root: tree.root, recursive: true, onProgress: nil)
+        #expect(try store.count() == 2)
+
+        // The replug, as the index sees it: same volume, same files, a
+        // mount-time device id that now matches nothing.
+        try store.testExecute(sql: "UPDATE files SET device = ?", arguments: [foreignDevice])
+        try FileManager.default.removeItem(at: doomed)
+
+        _ = try await coordinator.indexTier0(root: tree.root, recursive: true, onProgress: nil)
+        #expect(try store.record(atPath: doomed.path) == nil)
+        #expect(try store.record(atPath: path("stays.jpg")) != nil)
+        #expect(try store.count() == 1)
     }
 
     @Test func theVolumeCheckAppliesToANonRecursiveScanToo() async throws {
