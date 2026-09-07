@@ -247,11 +247,17 @@ final class ExiftoolRunner {
             Self.endProcess(process, force: true)
             throw error
         }
-        process.waitUntilExit()
+        // Bounded, for the reason `endProcess` documents: both pipes are at EOF
+        // by now, so the child has finished, but Foundation has been observed
+        // to miss the termination anyway.
+        let exited = Self.endProcess(process)
 
         return ExiftoolRun(stdout: String(decoding: drained.first, as: UTF8.self),
                            stderr: String(decoding: drained.second, as: UTF8.self),
-                           ok: process.terminationStatus == 0,
+                           // An exit status can only be read from a process
+                           // known to have exited; anything else is reported as
+                           // a failure rather than guessed at.
+                           ok: exited && process.terminationStatus == 0,
                            route: .oneShot)
     }
 

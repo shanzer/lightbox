@@ -110,6 +110,40 @@ struct ExiftoolLocatorTests {
         }
     }
 
+    /// **The CI hang.** A `-ver` probe used to be read with
+    /// `readDataToEndOfFile()` and waited on with `waitUntilExit()`, neither of
+    /// which has a bound. A binary that prints its version and then keeps the
+    /// pipe open — or simply never exits — parked the calling thread forever.
+    /// That thread is a cooperative-pool thread, and on a three-core runner
+    /// three such blocks starved the pool: 141 tests never ran, every suite
+    /// showed "started" and none showed "passed", and the job had to be killed
+    /// after fourteen minutes.
+    ///
+    /// A probe that does not answer is *unusable*, which is a true statement
+    /// about the binary and a message the user can act on.
+    @Test(arguments: ["#!/bin/sh\nsleep 60\n",                    // never exits
+                      "#!/bin/sh\necho 13.55\nsleep 60\n",        // answers, holds the pipe
+                      "#!/bin/sh\nexec sleep 60\n"])              // no output at all
+    func aVersionProbeThatNeverAnswersIsBoundedNotHung(_ script: String) throws {
+        let directory = try tree.directory("hangs-\(abs(script.hashValue % 100_000))")
+        let binary = directory.appendingPathComponent("exiftool")
+        try script.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: binary.path)
+
+        let started = Date()
+        let availability = ExiftoolLocator.check(environment: ["PATH": directory.path],
+                                                 probeTimeout: 0.75)
+        let elapsed = Date().timeIntervalSince(started)
+
+        #expect(elapsed < 20, "the version probe must be bounded; it took \(elapsed)s")
+        #expect(!availability.isAvailable)
+        guard case .unusable = availability else {
+            Issue.record("expected .unusable for a probe that never answers, got \(availability)")
+            return
+        }
+    }
+
     /// exiftool's versions are `13.9`, `13.10`, `13.55`. A lexical compare puts
     /// `13.9` *after* `13.55`, so a minimum-version check written with `>=` on
     /// strings would reject a newer exiftool than the one it demands.
@@ -1195,28 +1229,41 @@ struct MetadataWriterTeardownTests {
     }
 
     /// And it must not wait on a child that is already gone.
+    ///
+    /// Note what this test does *not* do: call `waitUntilExit()` to settle the
+    /// child first. That is the very call under indictment, and using it here
+    /// blocked a cooperative-pool thread on CI — with a three-core runner and
+    /// several suites spawning processes at once, three such blocks starved the
+    /// pool and 141 tests never ran at all. `endProcess` is bounded, so it is
+    /// safe to use it to reach the state this test is about.
     @Test func endingAnAlreadyExitedProcessReturnsImmediately() throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
         process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         try process.run()
-        process.waitUntilExit()
+        #expect(ExiftoolRunner.endProcess(process), "/usr/bin/true should exit on its own")
 
         let started = Date()
         #expect(ExiftoolRunner.endProcess(process, cooperative: 5, afterSignal: 5))
-        #expect(Date().timeIntervalSince(started) < 1)
+        #expect(Date().timeIntervalSince(started) < 1,
+                "a second call on an exited process must not wait")
     }
 
     /// The real-world path, exercised end to end: nothing calls `close()`, so
     /// every writer reaches teardown by being released on the cooperative pool.
     /// This does not reliably reproduce the race — it is a smoke test that the
     /// ordinary path stays quick.
-    @Test(needsExiftool) func tearingDownWritersByReleaseIsBounded() throws {
+    @Test(needsExiftool) func tearingDownWritersByReleaseIsBounded() async throws {
         let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("td.jpg"))
-        let finished = DispatchSemaphore(value: 0)
         let source = url
 
-        Task.detached {
+        // Awaited, not waited on. A `DispatchSemaphore.wait` here would block
+        // the very cooperative-pool thread whose starvation this suite exists
+        // to prevent — and on a small runner, blocking to *check* for a hang is
+        // how you cause one.
+        let finished = await completes(within: 90) {
             for _ in 0..<6 {
                 let a = MetadataWriter()
                 let b = MetadataWriter()
@@ -1224,11 +1271,8 @@ struct MetadataWriterTeardownTests {
                 _ = await b.write(MetadataEdit(rating: 2), to: [source])
                 // Both drop here, on the cooperative pool.
             }
-            finished.signal()
         }
-
-        #expect(finished.wait(timeout: .now() + 90) == .success,
-                "writer teardown blocked the cooperative pool")
+        #expect(finished, "writer teardown blocked the cooperative pool")
     }
 }
 

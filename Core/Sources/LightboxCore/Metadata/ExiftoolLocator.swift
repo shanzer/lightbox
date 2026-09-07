@@ -91,12 +91,15 @@ public enum ExiftoolLocator {
     }
 
     /// Locates exiftool and asks it for its version.
+    /// - Parameter probeTimeout: how long `-ver` may take. Injectable so the
+    ///   bound itself can be tested in well under the production budget.
     public static func check(
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        probeTimeout: TimeInterval = ExiftoolLocator.versionProbeTimeout
     ) -> ExiftoolAvailability {
         guard let path = locate(environment: environment) else { return .notFound }
         let version: String
-        switch versionProbe(of: path) {
+        switch versionProbe(of: path, timeout: probeTimeout) {
         case .ok(let reported): version = reported
         case .failed(let reason): return .unusable(path: path, reason: reason)
         }
@@ -121,24 +124,53 @@ public enum ExiftoolLocator {
         case failed(String)
     }
 
-    private static func versionProbe(of path: String) -> VersionProbe {
+    /// How long the version probe may take before the binary is called unusable.
+    ///
+    /// Generous for a program whose whole job here is to print one line, and
+    /// short enough that a wedged probe is a message rather than a hang. Not a
+    /// number to tune downward to make anything pass: it exists because the
+    /// probe used to have *no* bound at all.
+    public static let versionProbeTimeout: TimeInterval = 10
+
+    private static func versionProbe(of path: String,
+                                     timeout: TimeInterval) -> VersionProbe {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = ["-ver"]
-        let out = Pipe()
+        let out = Pipe(), err = Pipe()
         // A prompting exiftool must fail rather than block on a tty.
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = out
-        process.standardError = FileHandle.nullDevice
+        process.standardError = err
         do { try process.run() } catch {
             return .failed("it could not be launched (\(error.localizedDescription))")
         }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+
+        // **Neither `readDataToEndOfFile()` nor `waitUntilExit()`.** Both are
+        // unbounded, and this function is called from ordinary test and app
+        // code on a cooperative-pool thread; a thread blocked there never comes
+        // back, and enough of them starve the pool so that unrelated work stops
+        // dead. `PipeDrain` reads both descriptors against a deadline —
+        // draining stderr too, so a chatty probe cannot fill its pipe and wedge
+        // — and `endProcess` bounds the reaping.
+        let deadline = Date().addingTimeInterval(timeout)
+        let drained: PipeDrain.Result
+        do {
+            drained = try PipeDrain.readToEnd(
+                first: out.fileHandleForReading.fileDescriptor,
+                second: err.fileHandleForReading.fileDescriptor,
+                deadline: deadline)
+        } catch {
+            ExiftoolRunner.endProcess(process, force: true)
+            return .failed("`-ver` did not answer within \(Int(timeout))s")
+        }
+        guard ExiftoolRunner.endProcess(process) else {
+            return .failed("`-ver` did not exit")
+        }
         guard process.terminationStatus == 0 else {
             return .failed("`-ver` exited \(process.terminationStatus)")
         }
-        let text = String(decoding: data, as: UTF8.self)
+        let text = String(decoding: drained.first, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? .failed("`-ver` printed nothing") : .ok(text)
     }
