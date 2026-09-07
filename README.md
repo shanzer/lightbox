@@ -28,7 +28,7 @@ fetched on first build.
 
 ```bash
 cd Core && swift test                                                     # 469 tests
-cd App  && xcodebuild -scheme Lightbox -destination 'platform=macOS' test  # 57 tests
+cd App  && xcodebuild -scheme Lightbox -destination 'platform=macOS' test  # 61 tests
 ```
 
 The app is unsigned and unsandboxed by design; macOS will ask for folder access the first

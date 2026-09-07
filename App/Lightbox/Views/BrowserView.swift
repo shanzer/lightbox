@@ -5,6 +5,12 @@ struct BrowserView: View {
     @State private var model: BrowserModel?
     @State private var loadError: String?
 
+    /// The index this window is to open, or nil when this launch must not open
+    /// one — see `LaunchEnvironment`. Resolved once, as a stored property, so
+    /// the branch that renders the inert scene and the branch that builds the
+    /// model cannot disagree about which launch this is.
+    private let launchIndexURL = LaunchEnvironment.launchIndexURL()
+
     var body: some View {
         Group {
             if let model {
@@ -52,6 +58,15 @@ struct BrowserView: View {
                         }
                     }
                 }
+            } else if launchIndexURL == nil {
+                // The window an `xcodebuild test` run puts on screen. Inert on
+                // purpose, and worded rather than blank: this scene is visible
+                // for the length of the run, and "no index was opened" is the
+                // one thing worth saying about it.
+                ContentUnavailableView("No index opened",
+                                       systemImage: "exclamationmark.triangle",
+                                       description: Text("Lightbox is hosting a test "
+                                           + "bundle and will not open the index."))
             } else if let loadError {
                 ContentUnavailableView("Could not open the index",
                                        systemImage: "exclamationmark.triangle",
@@ -73,8 +88,14 @@ struct BrowserView: View {
     }
 
     private func start() {
+        // Unreachable under a test host — the view renders the inert scene
+        // instead of the `ProgressView` that calls this — but the guard is
+        // repeated rather than assumed, because `BrowserModel` opens, migrates
+        // and WAL-switches whatever URL it is handed, and this is the only
+        // caller that gets to choose one.
+        guard let launchIndexURL else { return }
         do {
-            model = try BrowserModel()
+            model = try BrowserModel(at: launchIndexURL)
         } catch {
             loadError = error.localizedDescription
         }

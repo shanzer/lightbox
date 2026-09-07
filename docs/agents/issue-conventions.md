@@ -99,7 +99,7 @@ The automated checks, in the order to run them:
 
 ```bash
 cd Core && swift test                                             # 469 tests, ~15 s on M4
-cd App  && xcodebuild -scheme Lightbox -destination 'platform=macOS' test   # 57 tests
+cd App  && xcodebuild -scheme Lightbox -destination 'platform=macOS' test   # 61 tests
 cd Core && LIGHTBOX_BENCH=1 swift test --filter Benchmark --no-parallel     # needs ~/lightbox-bench
 ```
 
