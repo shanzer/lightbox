@@ -86,7 +86,13 @@ metadata edits; `postWriteImageHashEqualsPreWriteImageHash` now checks that
 automatically for JPEG, PNG, WebP **and HEIC** — so §6's newest rule is held to
 the same exiftool round-trip as the others — on every run **that has exiftool**.
 On a runner without it, that test and the rest of the round-trip suite skip, so
-the tripwire is only armed where the binary exists.
+the tripwire is only armed where the binary exists. Every exiftool-gated test now
+consults that one property — the image-hash round-trips included, which used to
+fork their own `/usr/bin/env exiftool -ver` and so held a second opinion about
+`PATH` — and every child a test spawns is drained and reaped against a deadline
+through `Core/Tests/LightboxCoreTests/Support/BoundedProcess.swift`. An unbounded
+`waitUntilExit()` anywhere, test code included, is the fourteen-minute CI hang of
+#18, not a style preference.
 
 Sole dependency: **GRDB.swift 7.11.1**, pinned in
 `App/Lightbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
@@ -103,7 +109,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 473 tests, 35 suites.
+# Core: 477 tests, 36 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -155,7 +161,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 473 tests live. `App/` only wires it to views.
+where all the logic and all 477 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
