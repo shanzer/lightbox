@@ -232,7 +232,7 @@ struct ExiftoolRoutingTests {
 struct MetadataWriterPlanTests {
     @Test func keywordsAreClearedBeforeTheyAreSetSoAssignmentReplaces() {
         let plan = MetadataWriter.plan(MetadataEdit(keywords: ["alpha", "beta"]),
-                                       target: .inPlace, options: WriteOptions())
+                                       families: .all, options: WriteOptions())
         let keywordArguments = plan.writeArguments.filter { $0.hasPrefix("-MWG:Keywords") }
         #expect(keywordArguments == ["-MWG:Keywords=", "-MWG:Keywords=alpha", "-MWG:Keywords=beta"])
     }
@@ -241,7 +241,7 @@ struct MetadataWriterPlanTests {
         let edit = MetadataEdit(artist: "Jane", copyright: "(c)", description: "d",
                                 keywords: ["k"], gps: GPSCoordinate(latitude: 1, longitude: 2),
                                 rating: 3, label: "Red")
-        let plan = MetadataWriter.plan(edit, target: .inPlace, options: WriteOptions())
+        let plan = MetadataWriter.plan(edit, families: .all, options: WriteOptions())
         let arguments = plan.writeArguments
         #expect(arguments.contains("-MWG:Description=d"))
         #expect(arguments.contains("-MWG:Creator=Jane"))
@@ -258,7 +258,7 @@ struct MetadataWriterPlanTests {
 
     @Test func southernAndWesternHemispheresGetTheRightReferences() {
         let edit = MetadataEdit(gps: GPSCoordinate(latitude: -33.8688, longitude: -70.6693))
-        let arguments = MetadataWriter.plan(edit, target: .inPlace,
+        let arguments = MetadataWriter.plan(edit, families: .all,
                                             options: WriteOptions()).writeArguments
         #expect(arguments.contains("-EXIF:GPSLatitudeRef=S"))
         #expect(arguments.contains("-EXIF:GPSLongitudeRef=W"))
@@ -274,19 +274,38 @@ struct MetadataWriterPlanTests {
         let capture = CaptureTime(date: Date(), offset: "+00:00", subSeconds: "250")
         let edit = MetadataEdit(captureTime: capture,
                                 gps: GPSCoordinate(latitude: 1, longitude: 2))
-        let sidecar = URL(fileURLWithPath: "/tmp/a.xmp")
-        let plan = MetadataWriter.plan(edit, target: .sidecar(sidecar), options: WriteOptions())
+        let plan = MetadataWriter.plan(edit, families: .xmpOnly, options: WriteOptions())
         #expect(!plan.writeArguments.contains { $0.hasPrefix("-EXIF:") })
         #expect(!plan.expectations.contains { $0.key.hasPrefix("GPS:") })
         #expect(plan.expectations.contains { $0.key == "XMP-exif:GPSLatitude" })
     }
 
+    /// GIF is written in place but has nowhere to put an EXIF block. Planning
+    /// `-EXIF:*` for it made every GIF edit carrying a capture time or a
+    /// position fail its own verification and roll back a write that had
+    /// actually stored everything a GIF can store.
+    @Test func aGIFIsPlannedForXMPOnlyEvenThoughItIsWrittenInPlace() {
+        #expect(MetadataWriter.TagFamilies.of(.gif) == .xmpOnly)
+        for kind in [MediaKind.jpeg, .png, .webp, .heic, .tiff, .psd] {
+            #expect(MetadataWriter.TagFamilies.of(kind) == .all, "\(kind) should carry EXIF")
+        }
+
+        let capture = CaptureTime(date: Date(), offset: "+00:00")
+        let edit = MetadataEdit(captureTime: capture,
+                                gps: GPSCoordinate(latitude: 1, longitude: 2))
+        let plan = MetadataWriter.plan(edit, families: .xmpOnly, options: WriteOptions())
+        #expect(!plan.writeArguments.contains { $0.hasPrefix("-EXIF:") })
+        #expect(!plan.expectations.contains { $0.key.hasPrefix("GPS:") })
+        #expect(!plan.expectations.contains { $0.key.hasPrefix("ExifIFD:") })
+        #expect(!plan.expectations.contains { $0.key.hasPrefix("Composite:") })
+    }
+
     @Test func preserveModificationTimeAddsDashP() {
-        let plain = MetadataWriter.plan(MetadataEdit(rating: 1), target: .inPlace,
+        let plain = MetadataWriter.plan(MetadataEdit(rating: 1), families: .all,
                                         options: WriteOptions())
         #expect(!plain.writeArguments.contains("-P"))
         let preserving = MetadataWriter.plan(
-            MetadataEdit(rating: 1), target: .inPlace,
+            MetadataEdit(rating: 1), families: .all,
             options: WriteOptions(preserveModificationTime: true))
         #expect(preserving.writeArguments.contains("-P"))
     }
@@ -294,7 +313,7 @@ struct MetadataWriterPlanTests {
     /// A cleared field must verify as *absent*, not as the empty string —
     /// exiftool removes the tag rather than storing "".
     @Test func clearingAFieldExpectsTheTagToBeGone() {
-        let plan = MetadataWriter.plan(MetadataEdit(description: ""), target: .inPlace,
+        let plan = MetadataWriter.plan(MetadataEdit(description: ""), families: .all,
                                        options: WriteOptions())
         #expect(plan.expectations.contains(
             MetadataWriter.Expectation(argument: "-MWG:Description",
@@ -472,7 +491,7 @@ struct MetadataWriterRoundTripTests {
 
     /// Spec §9 lists JPEG, HEIC, TIFF and PNG as edited in place; WebP is here
     /// too because the image-hash tripwire below has to cover it.
-    @Test(needsExiftool, arguments: [Fixtures.Format.jpeg, .png, .heic, .tiff])
+    @Test(needsExiftool, arguments: [Fixtures.Format.jpeg, .png, .heic, .tiff, .gif, .psd])
     func writesInPlaceForEveryNonRAWContainer(_ format: Fixtures.Format) async throws {
         let url = try Fixtures.writeImage(
             to: tree.root.appendingPathComponent("a.\(format.ext)"), format: format)
@@ -490,6 +509,8 @@ struct MetadataWriterRoundTripTests {
         #expect(read["MWG:Keywords"] as? [String] == ["alpha", "beta"])
         #expect(read["XMP-xmp:Label"] as? String == "Red")
         #expect(read["MWG:DateTimeOriginal"] as? String == "2021:07:08 09:10:11.250-04:00")
+        // Whatever the container, the write is verified before it commits, so
+        // a format that silently dropped a field would have failed above.
     }
 
     @Test(needsExiftool) func writesInPlaceForWebP() async throws {
@@ -1093,5 +1114,271 @@ struct PipeDrainSentinelTests {
     /// A longer id must not be matched by a shorter one's sentinel.
     @Test func doesNotMatchADifferentCommandsSentinel() {
         #expect(find("out\n{ready71}\n", "{ready7}") == nil)
+    }
+}
+
+// MARK: - Teardown must be bounded
+
+/// A hasher that fails the *first* call — the pre-write one — and then returns
+/// a deliberately different image hash. Models a mid-read I/O error on a flaky
+/// external volume, which is this project's actual deployment.
+private struct FailsFirstReadHasher: FileHashing {
+    let calls = LockBox(0)
+    let real = FileHasher()
+
+    func hashes(for url: URL, mediaType: MediaType) throws -> FileHashes {
+        let n = calls.withLock { (count: inout Int) -> Int in count += 1; return count }
+        if n == 1 { throw HashError.unreadable }
+        let actual = try real.hashes(for: url, mediaType: mediaType)
+        return FileHashes(contentHash: actual.contentHash, imageHash: "totally-different",
+                          imageHashKind: actual.imageHashKind)
+    }
+}
+
+@Suite(.serialized)
+struct MetadataWriterTeardownTests {
+    let tree: TempTree
+    init() throws { tree = try TempTree() }
+
+    /// **Teardown must never block indefinitely.** `ExiftoolRunner.deinit` runs
+    /// wherever the last reference is dropped — for an actor's stored property
+    /// that is an arbitrary cooperative-pool thread — and `waitUntilExit` has no
+    /// bound. It was sampled parked in a runloop for ten minutes with the
+    /// exiftool child *already dead*: two `Process` objects reaped concurrently
+    /// and Foundation missed the termination. A blocked cooperative thread does
+    /// not come back.
+    ///
+    /// The race itself is rare (roughly one run in three for the reviewer, and
+    /// it did not reproduce in sixty iterations here), so this pins the
+    /// *property* instead: a child that traps SIGTERM and would otherwise sleep
+    /// for 30 s must be dealt with in about a second. A reintroduced
+    /// `waitUntilExit` fails this by taking the full 30 s.
+    @Test func endingAProcessIsBoundedEvenWhenTheChildIgnoresSIGTERM() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "trap '' TERM; sleep 30"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+
+        let started = Date()
+        let ended = ExiftoolRunner.endProcess(process, force: true,
+                                              cooperative: 0.2, afterSignal: 0.4)
+        let elapsed = Date().timeIntervalSince(started)
+
+        #expect(elapsed < 5,
+                "teardown must be bounded; it took \(elapsed)s against a 30s child")
+        // SIGTERM is trapped, SIGKILL cannot be, so the escalation does finish
+        // the job — which is why the escalation is there.
+        #expect(ended, "escalation must reach SIGKILL when SIGTERM is ignored")
+    }
+
+    /// And it must not wait on a child that is already gone.
+    @Test func endingAnAlreadyExitedProcessReturnsImmediately() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        process.standardInput = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+
+        let started = Date()
+        #expect(ExiftoolRunner.endProcess(process, cooperative: 5, afterSignal: 5))
+        #expect(Date().timeIntervalSince(started) < 1)
+    }
+
+    /// The real-world path, exercised end to end: nothing calls `close()`, so
+    /// every writer reaches teardown by being released on the cooperative pool.
+    /// This does not reliably reproduce the race — it is a smoke test that the
+    /// ordinary path stays quick.
+    @Test(needsExiftool) func tearingDownWritersByReleaseIsBounded() throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("td.jpg"))
+        let finished = DispatchSemaphore(value: 0)
+        let source = url
+
+        Task.detached {
+            for _ in 0..<6 {
+                let a = MetadataWriter()
+                let b = MetadataWriter()
+                _ = await a.write(MetadataEdit(rating: 1), to: [source])
+                _ = await b.write(MetadataEdit(rating: 2), to: [source])
+                // Both drop here, on the cooperative pool.
+            }
+            finished.signal()
+        }
+
+        #expect(finished.wait(timeout: .now() + 90) == .success,
+                "writer teardown blocked the cooperative pool")
+    }
+}
+
+// MARK: - Failure paths must not lie about what happened
+
+@Suite(.serialized)
+struct MetadataWriteFailurePathTests {
+    let tree: TempTree
+    init() throws { tree = try TempTree() }
+
+    /// **A pre-write hash that cannot be read disables the tripwire.** With
+    /// `try?` the comparison is skipped and the post-write hash — whatever it
+    /// is — goes into the index with nothing to check it against. `image_hash`
+    /// is what the duplicate view deletes on, so an unverifiable one must fail
+    /// the item, not be recorded on trust.
+    @Test(needsExiftool) func aPreWriteHashThatCannotBeReadFailsTheItem() async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("unreadable.jpg"))
+        let originalBytes = try Data(contentsOf: url)
+
+        let writer = MetadataWriter(hasher: FailsFirstReadHasher())
+        let outcomes = await writer.write(MetadataEdit(description: "x"), to: [url])
+
+        #expect(outcomes[0].success == nil,
+                "a write whose image hash cannot be verified must not report success")
+        #expect(outcomes[0].error != nil)
+        // Nothing was written, so nothing needs rolling back.
+        #expect(try Data(contentsOf: url) == originalBytes)
+        #expect(!FileManager.default.fileExists(atPath: url.path + "_original"))
+    }
+
+    /// Every error that follows a write must say whether the file was put back.
+    /// Spec §11's summary sheet reports "what failed and why", and "verification
+    /// failed" reads as "your file is fine" — which is false when there was no
+    /// backup to restore from.
+    @Test func everyErrorExplainsItself() {
+        let errors: [MetadataWriteError] = [
+            .exiftoolUnavailable("x"), .captureTimeRequiresTimeZone,
+            .invalidTimeZoneOffset("+5"), .invalidSubSeconds("a"), .invalidRating(9),
+            .invalidCoordinate(latitude: 91, longitude: 0), .nothingToWrite,
+            .unsupportedFormat("txt"), .fileMissing("/a/b.jpg"), .exiftoolFailed("boom"),
+            .verificationFailed(["MWG:Description"]),
+            .restoreFailed(tags: ["MWG:Description"], reason: "denied"),
+            .verificationFailedWithoutRollback(tags: ["MWG:Description"]),
+            .backupPathOccupied("/a/b.jpg_original"),
+            .imageHashChanged(kind: "jpeg-scan-v1", before: "a", after: "b"),
+            .imageHashUnreadable("/a/b.jpg"),
+        ]
+        for error in errors {
+            #expect(!error.explanation.isEmpty, "\(error) has no explanation")
+            #expect(error.explanation.last == "." , "\(error) is not a sentence")
+        }
+        // The three-way distinction a summary sheet has to preserve.
+        #expect(MetadataWriteError.verificationFailed(["a"]).explanation
+            .localizedCaseInsensitiveContains("restored"))
+        #expect(MetadataWriteError.verificationFailedWithoutRollback(tags: ["a"]).explanation
+            .localizedCaseInsensitiveContains("no backup"))
+        #expect(MetadataWriteError.restoreFailed(tags: ["a"], reason: "denied").explanation
+            .localizedCaseInsensitiveContains("could not be restored"))
+    }
+
+    /// A rehash that fails *after* the write used to call `restore` directly
+    /// and then report `exiftoolFailed`. `restore` is a silent no-op when there
+    /// is no backup, so that path could leave the edited file on disk while
+    /// reporting an error that implies it had been put back. Every post-write
+    /// failure now goes through the same rollback, and says which of the three
+    /// things actually happened.
+    @Test(needsExiftool) func aRehashFailureAfterTheWriteRollsTheFileBack() async throws {
+        struct FailsSecondReadHasher: FileHashing {
+            let calls = LockBox(0)
+            let real = FileHasher()
+            func hashes(for url: URL, mediaType: MediaType) throws -> FileHashes {
+                let n = calls.withLock { (count: inout Int) -> Int in count += 1; return count }
+                if n >= 2 { throw HashError.unreadable }
+                return try real.hashes(for: url, mediaType: mediaType)
+            }
+        }
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("rehashfail.jpg"))
+        let originalBytes = try Data(contentsOf: url)
+
+        let writer = MetadataWriter(hasher: FailsSecondReadHasher())
+        let outcomes = await writer.write(MetadataEdit(description: "rolled back"), to: [url])
+
+        #expect(outcomes[0].error == .imageHashUnreadable(url.path))
+        #expect(try Data(contentsOf: url) == originalBytes,
+                "a post-write rehash failure must roll the edit back")
+        #expect(!FileManager.default.fileExists(atPath: url.path + "_original"))
+    }
+
+    /// A leftover stash from a killed run must not accumulate beside the photo,
+    /// and must not be mistaken for anything else.
+    @Test(needsExiftool) func aLeftoverStashIsSweptOnTheNextWrite() async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("swept.jpg"))
+        let leftover = URL(fileURLWithPath:
+            url.path + "_original.lightbox-stash-DEADBEEF-0000-0000-0000-000000000000")
+        try Data("orphaned by a killed run".utf8).write(to: leftover)
+        // A file that merely looks similar must survive.
+        let bystander = URL(fileURLWithPath: url.path + "_original.mine")
+        try Data("not ours".utf8).write(to: bystander)
+
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(MetadataEdit(description: "sweeps"), to: [url])
+        try #require(outcomes[0].error == nil)
+
+        #expect(!FileManager.default.fileExists(atPath: leftover.path),
+                "an orphaned stash must be swept, not left to accumulate")
+        #expect(FileManager.default.fileExists(atPath: bystander.path),
+                "the sweep must only match its own suffix pattern")
+        #expect(outcomes[0].success?.warnings.contains(
+            .sweptOrphanedBackup(leftover.lastPathComponent)) == true)
+    }
+
+    /// A row the store cannot produce means the index was *not* updated, and
+    /// silently swallowing that is how an index drifts out of step with disk.
+    @Test(needsExiftool) func anAbsentIndexRowIsReportedNotSwallowed() async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("norow.jpg"))
+        let store = try IndexStore.inMemory()   // nothing indexed at this path
+
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(MetadataEdit(rating: 1), to: [url], updating: store)
+        try #require(outcomes[0].error == nil)
+        #expect(outcomes[0].success?.warnings.contains(.indexRowNotUpdated) == true,
+                "a missing row must be reported, not silently skipped")
+    }
+
+    /// Cancelling a batch stops it; the items already written stay written.
+    @Test(needsExiftool) func aCancelledBatchStopsAndKeepsCompletedItems() async throws {
+        var urls: [URL] = []
+        for index in 0..<6 {
+            urls.append(try Fixtures.writeImage(
+                to: tree.root.appendingPathComponent("batch\(index).jpg")))
+        }
+        let writer = MetadataWriter()
+        let progress = LockBox([Int]())
+
+        let task = Task { () -> [WriteOutcome] in
+            await writer.write(MetadataEdit(description: "batched"), to: urls) { done, total in
+                progress.withLock { (seen: inout [Int]) in seen.append(done) }
+                #expect(total == 6)
+            }
+        }
+        let outcomes = await task.value
+        #expect(outcomes.count == 6)
+        // The callback fires once per item, in order.
+        #expect(progress.withLock { (seen: inout [Int]) in seen } == [1, 2, 3, 4, 5, 6])
+    }
+
+    @Test(needsExiftool) func aCancelledBatchReportsCancellationForTheRest() async throws {
+        var urls: [URL] = []
+        for index in 0..<40 {
+            urls.append(try Fixtures.writeImage(
+                to: tree.root.appendingPathComponent("cancel\(index).jpg")))
+        }
+        let writer = MetadataWriter()
+        let started = LockBox(false)
+
+        let task = Task { () -> [WriteOutcome] in
+            await writer.write(MetadataEdit(description: "cancelled"), to: urls) { done, _ in
+                if done == 1 { started.withLock { (flag: inout Bool) in flag = true } }
+            }
+        }
+        // Wait for the first item to land, then cancel mid-batch.
+        for _ in 0..<300 where !started.withLock({ (flag: inout Bool) in flag }) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        task.cancel()
+        let outcomes = await task.value
+
+        #expect(outcomes.count == 40)
+        #expect(outcomes[0].error == nil, "the item already done stays done")
+        #expect(outcomes.contains { $0.error == .cancelled },
+                "the rest must report cancellation rather than being written")
     }
 }

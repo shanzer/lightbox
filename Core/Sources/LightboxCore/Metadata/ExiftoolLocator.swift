@@ -39,20 +39,20 @@ public enum ExiftoolAvailability: Sendable, Equatable {
         case .notFound:
             """
             Metadata editing needs exiftool, which was not found on your PATH. \
-            Install it (`brew install exiftool`) and reopen the window. \
+            Install it (`brew install exiftool`), then try again. \
             Browsing and search do not need it.
             """
         case .tooOld(let path, let version, let minimum):
             """
             Metadata editing needs exiftool \(minimum) or newer; \(path) reports \
-            \(version). Upgrade it (`brew upgrade exiftool`) and reopen the window. \
+            \(version). Upgrade it (`brew upgrade exiftool`), then try again. \
             Browsing and search do not need it.
             """
         case .unusable(let path, let reason):
             """
             Metadata editing needs exiftool. \(path) is on your PATH but did not \
-            run: \(reason). Reinstall it (`brew reinstall exiftool`) and reopen \
-            the window. Browsing and search do not need it.
+            run: \(reason). Reinstall it (`brew reinstall exiftool`), then try \
+            again. Browsing and search do not need it.
             """
         }
     }

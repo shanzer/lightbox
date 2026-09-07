@@ -492,7 +492,9 @@ Four deliberate constraints:
    TIFF, PNG, WebP, GIF, PSD — is edited in place. RAW gets a `<basename>.xmp`
    sidecar, as Lightroom and Bridge do, and its container is never opened for
    writing. Writing into proprietary RAW containers is where files get
-   corrupted.
+   corrupted. GIF is the one in-place format with no EXIF block, so its fields
+   are written to XMP alone; a GIF's capture time and position live there and
+   nowhere else.
 3. **Write, verify, then commit.** exiftool writes with its `_original` backup;
    the tag is re-read to confirm it took, and the image hash is re-run and shown
    to have survived; only then is the backup removed. Any failure restores from

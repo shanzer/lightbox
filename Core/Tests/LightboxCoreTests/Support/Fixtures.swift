@@ -5,13 +5,17 @@ import UniformTypeIdentifiers
 
 enum Fixtures {
     enum Format {
-        case jpeg, png, heic, tiff
+        case jpeg, png, heic, tiff, gif, psd
         var utType: UTType {
             switch self {
             case .jpeg: .jpeg
             case .png: .png
             case .heic: .heic
             case .tiff: .tiff
+            case .gif: .gif
+            // No `UTType.photoshop`; the identifier is stable and ImageIO does
+            // write it.
+            case .psd: UTType("com.adobe.photoshop-image")!
             }
         }
         var ext: String {
@@ -20,6 +24,8 @@ enum Fixtures {
             case .png: "png"
             case .heic: "heic"
             case .tiff: "tiff"
+            case .gif: "gif"
+            case .psd: "psd"
             }
         }
     }

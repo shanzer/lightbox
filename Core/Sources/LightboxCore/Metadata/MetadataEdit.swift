@@ -120,6 +120,10 @@ public enum WriteWarning: Sendable, Hashable {
     /// longer describes the file that was edited. Safe — the row keeps NULL
     /// hashes and gets re-read — but worth reporting.
     case indexRowNotUpdated
+    /// An orphaned `…_original.lightbox-stash-*` left beside the destination by
+    /// a run that was killed between stashing and restoring. Swept, and named
+    /// so the sweep is visible rather than silent.
+    case sweptOrphanedBackup(String)
     /// Text exiftool wrote to stderr while succeeding.
     case exiftool(String)
 }
@@ -183,6 +187,110 @@ public enum MetadataWriteError: Error, Equatable, Sendable {
     /// alongside a hash the app has just proved it cannot trust. A bug to file,
     /// not to paper over by loosening the rule.
     case imageHashChanged(kind: String, before: String, after: String)
+    /// The image hash could not be read *before* the write, so there is nothing
+    /// to check the post-write hash against. The write is refused rather than
+    /// performed with the tripwire silently disabled: `image_hash` is what the
+    /// duplicate view deletes on, and recording one that was never verified is
+    /// worse than not editing the file. A mid-read I/O error on an external
+    /// volume is the realistic cause.
+    case imageHashUnreadable(String)
+    /// The batch was cancelled before this item was reached. Items already
+    /// written stay written — a metadata edit is not a transaction.
+    case cancelled
+
+    /// A sentence for the summary sheet (spec §11: "reports what failed and
+    /// why"), in the same shape as `ExiftoolAvailability.explanation`.
+    ///
+    /// The three post-write cases keep their distinction deliberately, because
+    /// they call for different actions: the file was put back, the file could
+    /// not be put back, or there was never anything to put back. Collapsing
+    /// them into "verification failed" tells a user their photo is fine when it
+    /// may not be.
+    public var explanation: String {
+        switch self {
+        case .exiftoolUnavailable(let why):
+            why.hasSuffix(".") ? why : why + "."
+        case .captureTimeRequiresTimeZone:
+            """
+            A capture time needs a time zone. Without one the timestamp means a \
+            different moment on every machine that reads it.
+            """
+        case .invalidTimeZoneOffset(let offset):
+            "\"\(offset)\" is not a time-zone offset. It must look like -05:00."
+        case .invalidSubSeconds(let value):
+            "\"\(value)\" is not a sub-second value. It must be digits only."
+        case .invalidRating(let rating):
+            "A rating of \(rating) is out of range. Ratings run from 0 to 5."
+        case .invalidCoordinate(let latitude, let longitude):
+            """
+            \(latitude), \(longitude) is not a position on Earth. Latitude runs \
+            -90 to 90 and longitude -180 to 180.
+            """
+        case .nothingToWrite:
+            "Nothing to write: no field was changed."
+        case .unsupportedFormat(let ext):
+            "Lightbox does not edit .\(ext) files."
+        case .fileMissing(let path):
+            "\((path as NSString).lastPathComponent) is no longer there."
+        case .exiftoolFailed(let detail):
+            "exiftool could not write the file: \(detail.oneLine)."
+        case .verificationFailed(let tags):
+            """
+            \(tags.tagList) did not read back correctly, so nothing was changed \
+            — the file was restored from its backup.
+            """
+        case .restoreFailed(let tags, let reason):
+            """
+            \(tags.tagList) did not read back correctly and the file could not be \
+            restored from its backup (\(reason.oneLine)). It may be half-written; \
+            check it before using it.
+            """
+        case .verificationFailedWithoutRollback(let tags):
+            """
+            \(tags.tagList) did not read back correctly and there was no backup to \
+            restore from, so the file is as exiftool left it. Check it before \
+            using it.
+            """
+        case .backupPathOccupied(let path):
+            """
+            Another file is already at \((path as NSString).lastPathComponent) and \
+            could not be moved aside, so this edit would have had no way back. \
+            Nothing was changed.
+            """
+        case .imageHashChanged(let kind, _, _):
+            """
+            The image data changed when only the metadata should have \
+            (\(kind)). The edit was rolled back; please report this, because \
+            duplicate detection depends on that hash.
+            """
+        case .imageHashUnreadable(let path):
+            """
+            \((path as NSString).lastPathComponent) could not be read for hashing, \
+            so the edit could not be verified. Nothing was changed.
+            """
+        case .cancelled:
+            "Cancelled before this file was reached."
+        }
+    }
+}
+
+private extension String {
+    /// Collapses a multi-line diagnostic so it fits one row of a summary sheet.
+    var oneLine: String {
+        split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .joined(separator: "; ")
+    }
+}
+
+private extension [String] {
+    var tagList: String {
+        switch count {
+        case 0: "The metadata"
+        case 1: self[0]
+        default: dropLast().joined(separator: ", ") + " and " + self[count - 1]
+        }
+    }
 }
 
 /// Knobs for one batch.

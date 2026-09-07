@@ -83,7 +83,9 @@ install or a test stub. `MetadataWriter.availability` is the single answer to
 without exiftool (every CI runner) skips them visibly instead of failing. It was
 also used during design to empirically verify the image-hash denylists survive
 metadata edits; `postWriteImageHashEqualsPreWriteImageHash` now checks that
-automatically on every run.
+automatically on every run **that has exiftool** — on a runner without it, that
+test and the rest of the round-trip suite skip, so the tripwire is only armed
+where the binary exists.
 
 Sole dependency: **GRDB.swift 7.11.1**, pinned in
 `App/Lightbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`

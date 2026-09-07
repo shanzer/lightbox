@@ -73,16 +73,7 @@ final class ExiftoolRunner {
     ///
     /// Best effort: if it cannot be created the runner simply does without,
     /// because this is hardening, not correctness.
-    private lazy var emptyConfig: URL? = {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("lightbox-exiftool-\(UUID().uuidString).config")
-        do {
-            try Data("1;\n".utf8).write(to: url)
-            return url
-        } catch {
-            return nil
-        }
-    }()
+    private let emptyConfig: URL?
 
     /// Options that must precede everything else on the command line.
     private var leadingArguments: [String] {
@@ -92,6 +83,12 @@ final class ExiftoolRunner {
 
     init(executable: String) {
         self.executable = executable
+        // Written eagerly rather than lazily: a lazy var would let `deinit`
+        // create the file only to delete it again on a runner that never ran
+        // anything.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lightbox-exiftool-\(UUID().uuidString).config")
+        emptyConfig = (try? Data("1;\n".utf8).write(to: url)) == nil ? nil : url
     }
 
     deinit {
@@ -153,6 +150,50 @@ final class ExiftoolRunner {
         return whitespace.contains(first) || whitespace.contains(last)
     }
 
+    /// Ends `process` within a bounded time, escalating, and gives up rather
+    /// than waiting forever.
+    ///
+    /// **Never `waitUntilExit()`.** This runs from `deinit`, which for an
+    /// actor's stored property means an arbitrary cooperative-pool thread, and
+    /// `waitUntilExit` has no bound. It was sampled parked in a runloop for ten
+    /// minutes with the exiftool child *already dead*: two `Process` objects
+    /// reaped concurrently and Foundation missed the termination. A blocked
+    /// cooperative thread is not recoverable, so the contract here is "bounded",
+    /// not "successful" — if the process cannot be confirmed gone, this gives up
+    /// and returns false rather than holding the thread.
+    ///
+    /// Polling `isRunning` rather than waiting on it is the price of that
+    /// bound, and it is only paid at teardown.
+    ///
+    /// - Returns: whether the process is known to have exited.
+    @discardableResult
+    static func endProcess(_ process: Process, force: Bool = false,
+                           cooperative: TimeInterval = 2.0,
+                           afterSignal: TimeInterval = 0.5) -> Bool {
+        if !force, waitForExit(process, within: cooperative) { return true }
+
+        // `terminate()` rather than a raw `kill`, so Foundation's own record of
+        // whether this is still its child is what decides — a pid it has
+        // already reaped could have been recycled onto an unrelated process.
+        guard process.isRunning else { return true }
+        process.terminate()
+        if waitForExit(process, within: afterSignal) { return true }
+
+        // SIGTERM can be trapped; SIGKILL cannot. Same guard, same reason.
+        guard process.isRunning else { return true }
+        kill(process.processIdentifier, SIGKILL)
+        return waitForExit(process, within: afterSignal)
+    }
+
+    private static func waitForExit(_ process: Process, within seconds: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if !process.isRunning { return true }
+            usleep(5_000)
+        }
+        return !process.isRunning
+    }
+
     func run(arguments: [String], files: [String]) throws -> ExiftoolRun {
         if Self.requiresOneShot(arguments: arguments, files: files) {
             return try runOneShot(arguments: arguments, files: files)
@@ -201,9 +242,9 @@ final class ExiftoolRunner {
                 deadline: deadline)
         } catch {
             // A timed-out one-shot must not be left running: it still holds the
-            // file open and may still be part-way through rewriting it.
-            process.terminate()
-            process.waitUntilExit()
+            // file open and may still be part-way through rewriting it. Bounded
+            // for the same reason as `endProcess`'s doc comment gives.
+            Self.endProcess(process, force: true)
             throw error
         }
         process.waitUntilExit()
@@ -308,9 +349,9 @@ final class ExiftoolRunner {
                     String(decoding: drained.second, as: UTF8.self))
         }
 
-        /// - Parameter force: terminate rather than asking. Used when the
-        ///   session is being torn down *because* it stopped answering, where
-        ///   waiting on a cooperative exit would hang the caller.
+        /// - Parameter force: skip the polite `-stay_open False` and signal
+        ///   straight away. Used when the session is being torn down *because*
+        ///   it stopped answering.
         func shutdown(force: Bool = false) {
             guard !isShutDown else { return }
             isShutDown = true
@@ -318,16 +359,13 @@ final class ExiftoolRunner {
                 try? stdin.close()
                 return
             }
-            if force {
-                process.terminate()
-            } else {
-                // exiftool exits on `-stay_open False`, and closing stdin makes
-                // that unconditional, so `waitUntilExit` returns promptly
-                // without polling for it.
+            if !force {
                 try? stdin.write(contentsOf: Data("-stay_open\nFalse\n".utf8))
             }
+            // EOF on stdin makes exiftool exit whether or not it read the
+            // command, so this is the real teardown signal.
             try? stdin.close()
-            process.waitUntilExit()
+            ExiftoolRunner.endProcess(process, force: force)
         }
     }
 }

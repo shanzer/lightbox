@@ -32,10 +32,32 @@ extension MetadataWriter {
         case absent
     }
 
-    static func plan(_ edit: MetadataEdit, target: WriteTarget,
+    /// Which tag families a destination can actually hold.
+    enum TagFamilies {
+        /// EXIF, IPTC and XMP: a real photo container.
+        case all
+        /// XMP only. Two destinations qualify: an `.xmp` sidecar, and **GIF**,
+        /// whose container has nowhere to put an EXIF block. Measured on 13.55:
+        /// exiftool accepts `-EXIF:*` directives against a GIF, reports
+        /// success, and stores nothing — so planning them made every GIF edit
+        /// carrying a capture time or a position fail its own verification and
+        /// roll back a write that was otherwise fine.
+        case xmpOnly
+
+        static func of(_ kind: MediaKind) -> TagFamilies {
+            switch kind {
+            case .jpeg, .png, .webp, .heic, .tiff, .psd: .all
+            case .gif: .xmpOnly
+            // RAW is never written in place; its sidecar is planned as
+            // `.xmpOnly` by the caller.
+            case .raw: .xmpOnly
+            }
+        }
+    }
+
+    static func plan(_ edit: MetadataEdit, families: TagFamilies,
                      options: WriteOptions) -> Plan {
-        let toSidecar: Bool
-        if case .sidecar = target { toSidecar = true } else { toSidecar = false }
+        let toSidecar = families == .xmpOnly
 
         var arguments: [String] = []
         var expectations: [Expectation] = []
