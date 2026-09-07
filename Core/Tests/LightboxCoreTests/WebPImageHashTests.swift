@@ -41,10 +41,20 @@ private func inserting(_ chunk: Data, afterHeaderIn base: Data) -> Data {
     var out = Data(base.prefix(12))
     out.append(chunk)
     out.append(base.dropFirst(12))
-    let grown = UInt32(Int(base[4]) | Int(base[5]) << 8 | Int(base[6]) << 16
-                       | Int(base[7]) << 24) + UInt32(chunk.count)
-    out.replaceSubrange(4..<8, with: [UInt8(grown & 0xFF), UInt8((grown >> 8) & 0xFF),
-                                      UInt8((grown >> 16) & 0xFF), UInt8(grown >> 24)])
+    // Split into steps: Swift 6.3.3's type checker times out on the one-liner.
+    let b4 = UInt32(base[4])
+    let b5 = UInt32(base[5]) << 8
+    let b6 = UInt32(base[6]) << 16
+    let b7 = UInt32(base[7]) << 24
+    let declared: UInt32 = b4 | b5 | b6 | b7
+    let grown: UInt32 = declared + UInt32(chunk.count)
+    let bytes: [UInt8] = [
+        UInt8(truncatingIfNeeded: grown),
+        UInt8(truncatingIfNeeded: grown >> 8),
+        UInt8(truncatingIfNeeded: grown >> 16),
+        UInt8(truncatingIfNeeded: grown >> 24),
+    ]
+    out.replaceSubrange(4..<8, with: bytes)
     return out
 }
 
