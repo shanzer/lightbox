@@ -315,6 +315,32 @@ with its path, size, dimensions, orientation, and capture time, and supports
 keeping one and acting on the rest through the ordinary `FileOperator` path, so
 duplicate removal is journalled and undoable like any other operation.
 
+The grouping itself is `DuplicateFinder`, and the scope is the *same compiled
+`WHERE` the grid uses*, so "duplicates in this folder" and "duplicates in the
+whole library" are one code path. A group spanning two volumes is legitimate —
+a backup copy is a duplicate, and the view shows both rather than hiding one.
+
+Three semantics the threshold alone does not fix:
+
+- **A row is in at most one group, in either tier.** "Which group is this file
+  in?" has to have one answer, because the answer is what the user acts on.
+- **The near tier is star-shaped, not a transitive cluster.** Every match is
+  stated as a distance from one seed, and seeds are taken in the grid's order
+  (name, then path — never row id, which SQLite reuses). Chaining A–B–C would
+  put two files 24 bits apart into one set of "duplicates", which is how a
+  near-duplicate view starts recommending the deletion of a different
+  photograph.
+- **The near tier never repeats a pair the exact tier already reported**, or
+  every metadata-edited copy would appear as two findings.
+
+The near tier compares every pair in the scope — `n(n-1)/2` XOR + popcount, no
+index — so it is bounded by `DuplicateFinder.nearTierCeiling`, above which it
+reports that it was *skipped* rather than returning an empty result. There is
+deliberately no approximate prefix-bucketing fast path: it would silently drop
+real near-duplicates from a view whose output is a deletion. See
+`docs/superpowers/notes/2026-09-07-duplicate-grouping.md` for the measurement
+behind the ceiling and the pigeonhole argument against bucketing.
+
 ## 6. Indexing pipeline
 
     walk -> stat/diff -> ImageIO metadata          (tier 0, on folder open)

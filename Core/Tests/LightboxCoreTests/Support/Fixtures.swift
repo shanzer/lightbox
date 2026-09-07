@@ -43,13 +43,19 @@ enum Fixtures {
         return ctx.makeImage()!
     }
 
+    /// `quality` is the lossy compression quality ImageIO is asked for, or nil
+    /// for its default. Exists so a test can produce a *re-encoded* copy of the
+    /// same pixels — same picture, different compressed bytes, so a different
+    /// `image_hash` and a near-zero perceptual distance — without shelling out
+    /// to `sips`, which CI would have to skip.
     @discardableResult
     static func writeImage(to url: URL, format: Format = .jpeg,
                            width: Int = 64, height: Int = 48, seed: Int = 0,
                            captureTime: String? = "2019:03:04 10:11:12",
                            offset: String? = "-05:00",
                            make: String? = "TestCam", model: String? = "T1",
-                           orientation: Int = 1) throws -> URL {
+                           orientation: Int = 1,
+                           quality: Double? = nil) throws -> URL {
         var exif: [CFString: Any] = [:]
         if let captureTime { exif[kCGImagePropertyExifDateTimeOriginal] = captureTime }
         if let offset { exif[kCGImagePropertyExifOffsetTimeOriginal] = offset }
@@ -60,6 +66,7 @@ enum Fixtures {
         var props: [CFString: Any] = [kCGImagePropertyOrientation: orientation]
         if !exif.isEmpty { props[kCGImagePropertyExifDictionary] = exif }
         if !tiff.isEmpty { props[kCGImagePropertyTIFFDictionary] = tiff }
+        if let quality { props[kCGImageDestinationLossyCompressionQuality] = quality }
 
         guard let dest = CGImageDestinationCreateWithURL(
             url as CFURL, format.utType.identifier as CFString, 1, nil) else {
