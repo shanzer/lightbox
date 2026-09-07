@@ -109,14 +109,16 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 477 tests, 36 suites.
+# Core: 543 tests, 58 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
-Verified on the mini, 2026-09-06, on the rewritten `main`:
+Verified on the mini, 2026-09-06, on the rewritten `main`. **Pre-phase-2
+counts** — this table is a record of that day's run and is deliberately not
+updated; the live counts are in §4 and in `CLAUDE.md`:
 
 | | Intel iMac | M4 mini |
 |---|---|---|
@@ -161,17 +163,18 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 477 tests live. `App/` only wires it to views.
+where all the logic and all 543 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
 | Walk | `Walker.swift`, `MediaType.swift` | Recursive enumeration; extension + UTI classification (RAW, HEIC, JPEG, PNG, WebP) |
-| Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity |
+| Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift`, `Index/IndexStore+FileOperations.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity; the `op_journal` writes and the guarded row move/copy/remove |
 | Metadata | `Metadata/{ImageMetadata,MetadataReader}.swift` | ImageIO `CGImageSource` reads — dimensions, camera, capture time |
 | Hashing | `Hashing/*.swift` | Three hashes: `content_hash` (whole file), `image_hash` (format-stripped pixel data), `phash` (DCT perceptual) |
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
+| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Transfer,FileOperator+Replacements}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results (§8) |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
 | Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
 
@@ -278,7 +281,7 @@ row — which duplicate detection then deletes on.
 
 ## 7. Verify by hand on the mini
 
-Six things automated tests could not cover. **None done yet** as of the
+Seven things automated tests could not cover. **None done yet** as of the
 2026-09-06 update. In rough priority:
 
 1. **Re-run the 50k benchmark.** All current numbers are Intel, and the choice of
@@ -302,7 +305,19 @@ Six things automated tests could not cover. **None done yet** as of the
    ⌘N while tier 1 is hashing, open the same folder in the second window. Both
    windows should stay responsive, neither pass should fail, and
    `log stream --predicate 'process == "Lightbox"'` should show no `SQLITE_BUSY`.
-3. **Unplug the Seagate mid-hash, and replug it.** The unreachable-root guards
+3. **Move files off the Seagate and onto the boot volume, with a collision.**
+   The whole `FileOperator` cross-volume path — copy, then unlink the sources —
+   has only ever run against two *simulated* volumes over one real directory
+   tree, because a test cannot mount a second drive. That path is the one where
+   a photo has the fewest copies at any moment: between the copy landing and the
+   source being unlinked there are two, and immediately after there is one. Do
+   it for real, with a destination that already holds a same-named file so
+   `replace` runs too, and check `op_journal` afterwards — every row `complete`,
+   and every `trash_url` naming a file that is really in the Trash. Worth
+   repeating once onto an exFAT or SMB destination, where `.Trashes` cannot be
+   created and the disposal fails: nothing may be lost, and the rows should be
+   `in_flight` naming both paths.
+4. **Unplug the Seagate mid-hash, and replug it.** The unreachable-root guards
    were only ever tested against *simulated* unmounts. This is the one that lost
    the whole index twice during development, so it is worth doing for real.
    Issue #4 (volume UUID) landed the replug half of it in code and in tests, but
@@ -316,11 +331,11 @@ Six things automated tests could not cover. **None done yet** as of the
      the root, so there is no identity to match), but an unplug followed by a
      replug before the next batch does **not** — the UUID says it is the same
      volume, and continuing is correct. To see the abort, leave it unplugged.
-4. **⌘A with the search field focused.** Should select the field's text, not the
+5. **⌘A with the search field focused.** Should select the field's text, not the
    grid. Tests could only warn, never assert.
-5. **Cold folder open shows an empty grid** for the entire first index pass
+6. **Cold folder open shows an empty grid** for the entire first index pass
    (~180 s at 50k). Known, ugly, deferred — the grid has no "indexing…" state.
-6. **A real index pass over the Seagate, under the new executors.** #28 moved
+7. **A real index pass over the Seagate, under the new executors.** #28 moved
    `IndexCoordinator` and `MetadataWriter` off the cooperative pool onto serial
    dispatch queues of their own. `CooperativePoolTests` proves *where* the work
    runs; it says nothing about the GUI path. Open a large folder on the external
@@ -335,7 +350,8 @@ Phase 2 per the spec: file operations (move/copy/delete with an undo journal),
 EXIF editing via exiftool, and the duplicate view built on the three hashes
 already being computed.
 
-Two things belong at the *front* of phase 2 rather than in a backlog:
+Three things belonged at the *front* of phase 2 rather than in a backlog, and
+all three are now done:
 
 - ~~**`DatabasePool` + WAL.**~~ **Done** (issue #3). Readers no longer block on
   the writer, in their own window or another's; the busy timeout stays for
@@ -362,6 +378,159 @@ Two things belong at the *front* of phase 2 rather than in a backlog:
   read refreshes `device` but never erases an established identity); and a
   volume whose UUID *changes* (a reformat) is deliberately out of scope — that
   is a new library.
+
+- ~~**`FileOperator`.**~~ **Done** (issue #5). Move, copy, trash and permanent
+  delete over a selection, spec §8. Five things worth carrying forward:
+
+  **The order is the type.** Journal (`state = 'in_flight'`, one transaction,
+  before a byte moves) → filesystem → index. The index write and the `complete`
+  mark are the *same* transaction, so there is no window in which the index has
+  moved on and the journal has not. `OpJournalState` documents the full state
+  set, which is the contract #6's undo and launch-time reconcile read:
+  `in_flight` (outcome unknown, ask the filesystem), `complete`, `failed`
+  (attempted, nothing changed), `skipped` (journalled, deliberately not
+  attempted — the volume went away), and `reconciled`, which only #6 writes.
+
+  **One journal row per *file*, not per item.** Issue #5 asked for a row per
+  item, and for a photo with no sidecar those are the same thing. They are not
+  the same thing for a RAW with an `.xmp`: the schema has one `src`/`dst` per
+  row and no way to name a companion, so a row per file is the only shape from
+  which undo can put a sidecar back. One `batch_id` keeps them one undoable
+  unit. The spec is untouched by this — §8 constrains the *ordering* ("every
+  operation is written to `op_journal` before it runs and marked complete
+  after"), not the row granularity.
+
+  **Hash carry-over on copy is guarded twice**, and both guards matter. The
+  destination's length must equal the source's (a `copyfile` that returns
+  success can still leave a short file behind a full disk), and the source's
+  `path`/`size`/`mtime` must still match the row that was hashed — the
+  `setHashes(for:)` rule, read rather than written. Either doubt leaves the new
+  row's hashes NULL and re-queues tier 1. A wrong carry-over is a permanent
+  digest for bytes a file does not contain, on a row nothing will revisit, in
+  the table duplicate deletion acts on.
+
+  **A cross-volume move is written out as copy-then-delete** rather than left
+  to `moveItem`, precisely so the intermediate state is reachable and
+  describable: copy landed, source removal refused, both paths present. That is
+  the one outcome the operator will not classify — `complete` and `failed` would
+  both be lies — so the row stays `in_flight` and the reconcile settles it.
+  `replace` likewise moves the existing file aside and removes it only once the
+  item has succeeded; unlinking first has a window in which the user has
+  neither file, reachable by something as ordinary as a full disk.
+
+  **`FileManager.contentsOfDirectory(at:)` resolves symlinks.** A companion of
+  a file under `/var/…` comes back under `/private/var/…`, and `files.path`
+  holds whatever the walker was given. Companion URLs are therefore built by
+  appending *names* to the source's own directory URL. The symptom of getting
+  this wrong is quiet: the `.xmp` moves and its row stays behind.
+
+  **Two things an adversarial review found, both of which lost a photo, and
+  both of which the code now refuses.** First, a collision carries its *kind*:
+  `occupied` (a real file is on disk) or `claimedInBatch` (an earlier item of
+  this same batch is going there). `replace` is only meaningful against the
+  first — against the second the "existing file" it would displace is a photo
+  the batch itself moved there moments ago, and honouring it destroyed one of
+  the user's own selected files while reporting `complete` for both. Two
+  same-named photos from two folders, Move, Replace, apply to all, was enough.
+  `replace` now degrades to `rename` wherever any claim is the batch's own, and
+  `PlannedItem.effectiveResolution` records that so the sheet can stop saying
+  "already exists at the destination" about a path nothing occupies. Second,
+  the file `replace` displaces gets its **own journal row** — it is a mutation
+  of a photo the user did not even select — written in the same up-front
+  transaction, with both its path and its stash path decided at plan time so
+  the row can exist before the file moves. It goes to the Trash rather than
+  being unlinked, which makes `replace` as undoable as `trash` and lets #6
+  reverse it by a rule it already needs.
+
+  **`try?` on a rollback is not a rollback.** Every undo path now reports what
+  it could not put back, and an item whose rollback was incomplete is
+  `.rollbackIncomplete` with its rows left `in_flight`. Swallowing it produced
+  the one genuinely unrecoverable record: a file at the destination under a row
+  saying `failed`, which means "nothing changed" and which the reconcile is
+  defined never to re-examine. Relatedly, putting a displaced file back never
+  deletes what is at its original path — after a failed rollback that may be
+  the user's own file, and clearing it to make room is the loss the guard
+  exists to prevent.
+
+  **`trashItem` reports OSStatus, never errno.** It is Carbon-backed and
+  surfaces `NSCocoaErrorDomain` over `NSOSStatusErrorDomain` (`-43 fnfErr`,
+  `-5000 afpAccessDenied`), so a failure taxonomy that reads only `errno`
+  classified every trash failure as `.other` — on the operation users run most.
+  errno is still consulted first; the Cocoa and OSStatus domains are walked
+  after it.
+
+  **Volume checks compare identity, not presence**, per distinct source
+  directory as well as at the destination, and for `trash` and `delete` too —
+  which had no check at all, so a permanent delete ran against whatever was
+  mounted at the path.
+
+  **Two more of the same class, found by a second review.** A `replace` whose
+  occupant vanishes in the plan/execute gap made the staged list a *subset* of
+  the replacements, while the aside rows had been written one per replacement —
+  so from the first gap onwards every row was attributed to the wrong file: the
+  row for a photo that was never trashed acquired another photo's Trash URL,
+  and the one that really was trashed recorded nothing. `StagedReplacement`
+  carries the `op_id` alongside the replacement now, paired before any
+  filtering, so there is no offset left to get wrong. The same gap left the
+  vanished occupant's *index* row in place, still naming the exact path the
+  move was about to write, which turned a move that fully succeeded on disk
+  into `indexWriteFailed(UNIQUE files.path)`; removals are emitted for every
+  replacement whose row exists, staged or not. The lesson both times: **a
+  subset and a list written before it was known to be a subset must never be
+  zipped by index.**
+
+  `FileOperator` runs its body on its own `DispatchSerialQueue` through
+  `unownedExecutor`, like `IndexCoordinator` and `MetadataWriter` (#28). A
+  batch is the largest single lump of blocking work in Core — a `rename(2)` or
+  a `copyfile(3)` per file, a `trashItem` that talks to another process, two
+  `stat`s around each — and none of it may sit on a pool that is
+  `activeProcessorCount` wide and never grows. An executor rather than hopping
+  each call through `BlockingWork.run`, because hopping would add a suspension
+  point per file and the item-level rollback argument is written in terms of
+  what cannot interleave with what.
+
+  **A third of the same class, and the worst: a cross-volume move that lost the
+  photo outright.** A cross-volume move copies and then unlinks the sources, so
+  from that moment the copies at the destination are the *only* copies — but the
+  undo path was still a list of `(from, to)` pairs whose non-rename branch
+  removed every `to`. A failed stash disposal after the unlink therefore deleted
+  the destination copies with the sources already gone: both paths empty, the
+  journal row `in_flight` naming two files that no longer exist, no `trash_url`,
+  nothing to recover from. The shipped test for the disposal path drove exactly
+  this and passed, because it only checked journal marks. Reachable on the app's
+  most ordinary gesture — the library is on an external drive, so every move off
+  it is cross-volume — whenever the destination cannot make a `.Trashes`
+  (exFAT, SMB, an unwritable folder), `trashItem` returns no URL, or the journal
+  write hits `SQLITE_BUSY`.
+
+  Two guards now, in `FileOperator+Transfer.swift`, and they cover **different**
+  paths rather than being redundant — the first draft of this claimed otherwise
+  and was wrong. `rollbackMoves`' non-rename branch `stat`s the source before
+  removing a copy and refuses when it is absent; that is what saves the photo
+  when a *disposal* failure abandons the item, because that path reaches
+  `abandon` directly. `TransferState.sourcesRemoved` governs the other path, a
+  source-removal failure part way through the unlink loop: if nothing has been
+  unlinked yet the copies are ordinary undoable work and come back off the
+  destination, and once anything has been unlinked they are the only copies and
+  the undo declines. Each has its own test and its own mutation. **The tests that
+  matter assert the photo exists at its source *or* its destination** — not what
+  the journal says, which is how the original bug shipped green.
+
+  A third file-losing path in the same function: `copyfileCopy` passes
+  `COPYFILE_EXCL`, so a destination occupied by a file that *arrived in the
+  plan/execute gap* fails with `EEXIST` — and the cleanup, seeing a file at the
+  destination, unlinked it. Not trashed, and under a row saying `failed`.
+  Whether the destination pre-existed is now read **before** the attempt, and
+  the gap arrival is reported as `destinationNotReplaceable` and left alone.
+  "There is a file here now" never means "we created it".
+
+  Owed: the Seagate live check. The batch was exercised over 50 real photos
+  copied off `03_DEDUPED_ARCHIVE/2019` into a scratch directory on the boot
+  volume — 53 journal rows, all `complete`, companions moved, `files_fts`
+  following the rename — but that is one volume, so the same-volume `rename(2)`
+  path and the `COPYFILE_CLONE` path are the only ones a real drive would add
+  coverage for. The archive holds no RAW and no `.xmp`, so the pair in that
+  check was named rather than found.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And
