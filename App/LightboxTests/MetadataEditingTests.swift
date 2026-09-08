@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AppKit
 import ImageIO
 import UniformTypeIdentifiers
 import LightboxCore
@@ -748,5 +749,56 @@ struct InspectorLiveWriteTests {
             // The write commits by removing its own backup.
             #expect(!FileManager.default.fileExists(atPath: url.path + "_original"))
         }
+    }
+}
+
+// MARK: - The focus contract
+
+/// **Every text field in the app must call `reportingTextFocus`.** A field that
+/// forgets leaves ⌘Z reversing the last file batch while the user types in it,
+/// and #9 added ten of them at once. `BrowserModel.TextField` is the checklist;
+/// this walks the rendered inspector against it.
+///
+/// Serialized for the reason `TextFocusReportingTests` is: it puts a real
+/// window on screen.
+@Suite(.serialized)
+@MainActor
+struct InspectorTextFocusTests {
+    /// The ten boxes the editable inspector renders, all of them reporting and
+    /// all of them reporting *distinctly* — asserted as a union, so nothing
+    /// depends on the order SwiftUI lays them out in.
+    @Test func everyInspectorFieldReportsItsFocus() async throws {
+        let tree = try TempDirectory()
+        let root = try tree.directory("library")
+        try tree.file("library/IMG_0001.jpg", bytes: 64)
+        let model = BrowserModel(store: try IndexStore.inMemory(),
+                                 preferences: MemoryPreferences())
+        // A stub in place of the probe: the test host's PATH has no exiftool,
+        // and with the fields rendered read-only there would be nothing to
+        // focus and this would pass by rendering nothing.
+        model.metadataWriter = RecordingMetadataWriter()
+        await model.open(root)
+        model.selectAll()
+        await model.resolveMetadataAvailability()
+        try #require(model.isMetadataEditingAvailable)
+
+        let expected: Set<BrowserModel.TextField> = [
+            .inspectorCaptureTime, .inspectorCaptureZone, .inspectorArtist,
+            .inspectorCopyright, .inspectorDescription, .inspectorKeywords,
+            .inspectorRating, .inspectorLabel, .inspectorLatitude, .inspectorLongitude]
+
+        let (window, fields) = renderFields(InspectorView(model: model),
+                                            count: expected.count)
+        defer { window.close() }
+        try #require(fields.count >= expected.count,
+                     "the inspector rendered \(fields.count) editable fields, expected \(expected.count)")
+
+        var seen: Set<BrowserModel.TextField> = []
+        for field in fields.prefix(expected.count) {
+            focus(field, in: model)
+            seen.formUnion(model.editingFields)
+        }
+        #expect(seen == expected,
+                "the inspector's fields reported \(seen.map(\.self)); every one must report, and distinctly")
     }
 }

@@ -112,7 +112,7 @@ cd ~/src/lightbox
 # Core: 619 tests, 78 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 141 tests.
+# App: builds the SwiftUI target and runs its 142 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -1076,6 +1076,14 @@ all three are now done:
   **What it does not share is `op_journal`** — there are no rows, so nothing
   writes `lastCompletedBatch`, and the panel says metadata edits are not ⌘Z-able
   in this phase rather than leaving "Undo Move 3 Items" looking like it applies.
+
+  **The focus contract is walked, not trusted.** #9 added ten text fields at
+  once, and a field that forgets `reportingTextFocus` leaves ⌘Z reversing the
+  last file batch while the user types in it.
+  `everyInspectorFieldReportsItsFocus` renders the real inspector in an
+  off-screen window, focuses each box and asserts the union against
+  `BrowserModel.TextField` — dropping the modifier from the one shared field
+  builder reddens it.
 
   **The exiftool probe is injected, not discovered, in tests.** `MetadataWriting`
   + `LiveMetadataWriter` is the seam: CI has no exiftool, so an availability
