@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 613 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 616 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 100 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -137,15 +137,26 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   `IndexStore.makeConfiguration()` and nowhere else. Two consequences: the index is
   three files (`index.sqlite`, `-wal`, `-shm`) and they are deleted together, and
   `IndexStore.inMemory()` is a private temporary file — a pool cannot be in-memory —
-  removed when the store is released. A test that mutates the file underneath a
-  URL-backed store — corrupting it, replacing its sidecars, anything done to the bytes
-  on disk rather than through the store's own API — must `close()` that store first
-  (and, since the writer closes before the readers, SQLite's checkpoint-on-last-close
-  never runs once a reader connection exists, so `close()` alone leaves `-wal` on disk
-  unchanged — force a checkpoint on the writer, e.g. `PRAGMA wal_checkpoint(TRUNCATE)`,
-  when what's still in `-wal` is exactly what the mutation needs to reach): otherwise
-  the pages it's about to corrupt can still be served out of `-wal` to whatever reopens
-  the file next, and the test never proves what it claims to (#39).
+  removed when the store is released. `IndexStore.close()` now checkpoints before it
+  closes — `Database.checkpoint(.truncate)` on the writer, via
+  `pool.barrierWriteWithoutTransaction`, then `pool.close()` (#40): GRDB's
+  `DatabasePool.close()` closes the writer before the read-only readers, so SQLite's
+  checkpoint-on-last-close never runs once a reader connection has ever existed, and
+  `close()` used to leave `-wal` on disk unchanged despite promising a file safe to
+  hand off (#39). It's idempotent — a second call is detected from GRDB's own
+  `DatabaseError.connectionIsClosed()`, not a flag this type tracks — and reports
+  rather than throws when the checkpoint can't fully complete — a second store's
+  reader still holding a snapshot on the same file, surfaced as `SQLITE_BUSY` —
+  because that describes the checkpoint, not the close: `pool.close()` still runs
+  either way. That test rule still stands for anything that bypasses
+  `close()`: a test that mutates the file underneath a URL-backed store — corrupting
+  it, replacing its sidecars, anything done to the bytes on disk rather than through
+  the store's own API — must still call `close()` on that store first, because relying
+  on `deinit` (not synchronous enough, and doesn't checkpoint on purpose — see
+  `IndexStore.close()`'s doc comment) or reaching the pool some other way gets none of
+  the fix: the pages about to be corrupted can still be served out of `-wal` to
+  whatever reopens the file next, and the test never proves what it claims to (#39,
+  #40).
 - **Blocking work never runs on the cooperative pool.** That pool is exactly
   `activeProcessorCount` threads wide and never grows, so a thread parked in file IO,
   in SQLite's busy wait, or in a pipe read from exiftool is a thread the process has
