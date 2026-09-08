@@ -840,9 +840,28 @@ final class BrowserModel {
             : Self.query(for: pass, applyingExtensionFilter: false)
         let searcher = self.searcher
         do {
-            // Off the main actor: the index can hold hundreds of thousands of
-            // rows and the window must not freeze while SQLite answers.
-            let answer = try await Task.detached(priority: .userInitiated) {
+            // Off the main actor, and off the cooperative pool with it.
+            //
+            // The first half of that is why this was ever detached: the index
+            // can hold hundreds of thousands of rows and the window must not
+            // freeze while SQLite answers. The second half is #30. A
+            // `Task.detached` is not a hop *off* the cooperative pool, it is a
+            // new task *on* it, and everything below is synchronous SQLite —
+            // `width>=1920` alone is 474 ms at 50k, and a cooperative thread
+            // parked in SQLite's read for 474 ms is a thread the pool has lost.
+            // `BlockingWork.run` puts it on a dispatch queue, whose blocked
+            // threads the workqueue replaces. See `BlockingWork` for the stack
+            // that made this a rule.
+            //
+            // Measured, because this is the grid's critical path: the hop costs
+            // 2.4 us against `Task.detached`'s 2.2 us, and a 50k-row reload —
+            // search plus facets, 34,360 rows back — is 92.8 ms hopped against
+            // 93.6 ms detached. The difference is noise; the query is the cost.
+            //
+            // Still not cancellable, and that has not changed: a superseded
+            // reload was always discarded by the `isCurrentQuery` guard below
+            // rather than by cancelling the task.
+            let answer = try await BlockingWork.run {
                 let rows = try searcher.search(query)
                 let counts = try searcher.facets(for: query)
                 guard let unfilteredByExtension else { return (rows, counts) }
@@ -852,7 +871,7 @@ final class BrowserModel {
                 return (rows, Facets(byExtension: wider.byExtension,
                                      byCamera: counts.byCamera,
                                      total: counts.total))
-            }.value
+            }
             guard isCurrentQuery(pass) else { return }
             setRecords(answer.0)
             facets = answer.1

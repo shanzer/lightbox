@@ -109,10 +109,10 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 616 tests, 77 suites.
+# Core: 619 tests, 78 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 100 tests.
+# App: builds the SwiftUI target and runs its 102 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -163,7 +163,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 616 tests live. `App/` only wires it to views.
+where all the logic and all 619 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -171,24 +171,83 @@ where all the logic and all 616 tests live. `App/` only wires it to views.
 | Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift`, `Index/IndexStore+{FileOperations,Reconcile}.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity; the `op_journal` writes and the guarded row move/copy/remove; the launch-time reconcile of `in_flight` rows and journal retention |
 | Metadata | `Metadata/{ImageMetadata,MetadataReader}.swift` | ImageIO `CGImageSource` reads — dimensions, camera, capture time |
 | Hashing | `Hashing/*.swift` | Three hashes: `content_hash` (whole file), `image_hash` (format-stripped pixel data), `phash` (DCT perceptual) |
-| Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
+| Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode; own executor, and the PNG encode hopped off the pool (#30) |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
 | Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Transfer,FileOperator+Replacements,FileOperator+Undo}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results; both unlinks guarded on file identity (#33); undo of the last batch as a new batch, and `undoability(of:)` (§8) |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
-| Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
+| Concurrency | `Concurrency/BlockingWork.swift` | Where blocking sections run — off the cooperative pool (#28); `public` since #30, so the App target uses it too |
 
 **Blocking work is kept off the cooperative pool.** Swift's pool is exactly
 `activeProcessorCount` threads wide and never grows, so a thread parked in file
 IO, in SQLite's busy wait, or in a pipe read from exiftool is a thread the
 process has lost — on the three-core CI runner three of those stalled the whole
-job about one run in two (#28). `IndexCoordinator` and `MetadataWriter` run
-their bodies on their own `DispatchSerialQueue` through `unownedExecutor`, which
-moves *where* the body runs without adding a suspension point, and so without
-changing what may interleave with what. The hashing pass's task-group children
-are not actor-isolated, so they hop through `BlockingWork.run` instead.
-`CooperativePoolTests` asserts both, and reproduces the stall itself with more
-blocked hashes than the machine has cores. To see it by hand:
+job about one run in two (#28). `IndexCoordinator`, `MetadataWriter`,
+`FileOperator` and `ThumbnailCache` run their bodies on their own
+`DispatchSerialQueue` through `unownedExecutor`, which moves *where* the body
+runs without adding a suspension point, and so without changing what may
+interleave with what. Blocking work that is not actor-isolated hops through
+`BlockingWork.run` instead: the hashing pass's task-group children,
+`ThumbnailCache.generate`'s PNG encode, and `MetadataWriter.recheckAvailability`.
+
+**Since #30 the rule holds everywhere, not only in Core.** #28 left three
+counterexamples, each with a fan-out of one, so none could starve the pool alone
+— but each was a `Task.detached` or a `@concurrent` doing synchronous SQLite or
+file IO straight on the pool, and the next stall would have come from one of
+them. All three now hop, and `BlockingWork` is `public` so the App target's two
+sites (`BrowserModel`'s search, `FolderTreeView`'s directory reads) use the same
+answer rather than growing a second one. The standing check is a `grep`:
+
+```bash
+grep -rn 'Task.detached\|@concurrent' Core/Sources App/Lightbox
+```
+
+Everything it turns up must hop through `BlockingWork` or an actor executor, or
+carry a comment saying why not. Today the only non-comment hit is
+`ThumbnailCache.generate`, whose `@concurrent` carries the QuickLook render —
+genuinely `async`, parking no thread — while its encode is hopped.
+
+The grep is not redundant with the tests. Every site has a queue-label assertion
+*except* `FolderTreeView`'s two directory reads: `FolderNode.children` is a free
+function with no injection seam and `FolderItem` is a view-tree helper with
+nowhere to observe a queue label, so for those two the grep is the only thing
+holding the line.
+
+**The ceiling is 64.** `BlockingWork.run`'s queue targets a non-overcommit root
+queue and admits exactly 64 concurrently-blocked closures, queueing the surplus
+rather than deadlocking. Callers must stay well under it, and the table on
+`BlockingWork.queue` writes down both each one's fan-out and how long it holds a
+slot — a caller with a small fan-out and a multi-second hold occupies the queue
+longer than a wide one that finishes in a millisecond.
+
+*Two* callers scale with something the user controls, not one: the grid starts a
+generation per visible cell, and `FolderTreeView.loadWithLookahead` is attached
+per row with `.task(id:)`, so its fan-out scales with sidebar height. The grid is
+the one that has been **measured** — 200 simultaneous requests peak at **at most
+10** concurrent encodes (6–7 in an ordinary full run, 10 with the cooperative
+pool narrowed to one thread), because QuickLook's render is milliseconds and the
+encode is 0.6 ms, so they arrive spread out, and
+`BlockingWorkFanOutTests.theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling`
+guards it at half the ceiling (`< 32`), the margin absorbing other suites' use
+of the same queue, while
+`theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes` pins the ceiling
+itself by holding every encode until 64 are in flight — no timing at all, since
+nothing is released until the 64th arrives. The sidebar has neither a
+measurement nor a
+test, and in slot-seconds it is the heaviest caller on this queue: a
+`contentsOfDirectory` plus an `lstat` per entry holds its slot for seconds on a
+spun-down external volume. If this queue is ever found saturated, look there
+first.
+
+Search latency was measured too, since the browser's search is on the
+grid's critical path: the hop costs 2.4 us against `Task.detached`'s 2.2 us, and
+a 50k-row reload is 92.8 ms hopped against 93.6 ms detached — the query is the
+cost, the hop is not.
+
+`CooperativePoolTests` — one suite in Core, one in `App/LightboxTests` — asserts
+every one of these with a queue-label assertion, and the Core one reproduces the
+stall itself with more blocked hashes than the machine has cores. To see it by
+hand:
 `env LIBDISPATCH_COOPERATIVE_POOL_STRICT=1 swift test` narrows the pool to one
 thread; if it hangs, `sample <pid> 5` names the parked frame outright.
 
@@ -405,12 +464,20 @@ Eight things automated tests could not cover. **None done yet** as of the
    (~180 s at 50k). Known, ugly, deferred — the grid has no "indexing…" state.
 8. **A real index pass over the Seagate, under the new executors.** #28 moved
    `IndexCoordinator` and `MetadataWriter` off the cooperative pool onto serial
-   dispatch queues of their own. `CooperativePoolTests` proves *where* the work
-   runs; it says nothing about the GUI path. Open a large folder on the external
-   drive, watch progress advance, then pause and resume tier 1 mid-pass and
-   confirm the counts pick up where they left off and the window stays
-   responsive throughout. Executor changes are exactly the kind that a unit
-   suite passes and a real window reveals.
+   dispatch queues of their own; #30 finished the job — `ThumbnailCache` got an
+   executor, and the thumbnail encode, the exiftool probe, `BrowserModel`'s
+   search and `FolderTreeView`'s directory reads all hop through
+   `BlockingWork.run`. `CooperativePoolTests` proves *where* the work runs; it
+   says nothing about the GUI path. Open a large folder on the external drive,
+   watch progress advance, then pause and resume tier 1 mid-pass and confirm the
+   counts pick up where they left off and the window stays responsive
+   throughout. Scroll the grid hard while that pass runs, too: #30 put the
+   thumbnail encode on the same queue as the hashing pass, and 64 is the
+   ceiling they now share. Expand the sidebar over the external drive while you
+   are there — `FolderTreeView`'s two hops are the only ones in #30 with no
+   label test behind them (no injection seam), so the grep and a real window are
+   all that cover them. Executor changes are exactly the kind that a unit suite
+   passes and a real window reveals.
 
 ## 8. Deferred, and what I'd do first in phase 2
 

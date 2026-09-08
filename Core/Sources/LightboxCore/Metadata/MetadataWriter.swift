@@ -86,6 +86,33 @@ public actor MetadataWriter {
     /// Tests gate on exactly this, so a skip guard cannot drift away from the
     /// lookup the writer performs (CONTRIBUTING: "its skip guard must consult
     /// the same path the code under test reads").
+    ///
+    /// **Synchronous, and deliberately not hopped off the cooperative pool
+    /// (#30).** It cannot be: it is the default argument of
+    /// `init(availability:hasher:)` and the condition of every
+    /// `@Suite(.enabled(if:))` exiftool guard, neither of which can `await`.
+    /// What makes that tolerable is that it forks essentially once per process
+    /// — every later read is a lock and a cached value — and that the fork is
+    /// `ExiftoolLocator.check`, bounded by `versionProbeTimeout` (ten seconds)
+    /// rather than by `ExiftoolRunner.commandTimeout` (two minutes). A fork per
+    /// *write*, which is what the actor's executor covers, is the shape that
+    /// starves a pool; this is not.
+    ///
+    /// Stated precisely, because "once" is not the whole story: **the first
+    /// read blocks its own thread for up to ten seconds**, and any thread that
+    /// races it into a cold cache forks a probe of its own rather than queueing
+    /// behind the first — `AvailabilityCache.value` deliberately probes outside
+    /// its lock, because parking every concurrent first reader on one lock for
+    /// ten seconds would empty a three-core pool by itself. So the cost is
+    /// bounded per thread rather than serialised across them, and it is paid
+    /// once. This is the same shape as the `swift_once`-backed `static let` it
+    /// replaced, so it is not a regression — but it is a cooperative thread
+    /// parked for up to ten seconds, and anything that starts calling this from
+    /// a hot path should hop it or hoist it.
+    ///
+    /// The refreshable path — pressed repeatedly by a user who is installing
+    /// exiftool while the window is open — is `recheckAvailability()`, and that
+    /// one hops.
     public static var availability: ExiftoolAvailability { availabilityCache.value }
 
     /// Re-runs the lookup and replaces the cached answer.
@@ -96,34 +123,133 @@ public actor MetadataWriter {
     /// message and concludes the app is broken. Rather than weaken the sentence
     /// to "restart Lightbox", the cache is refreshable, so the inspector can
     /// offer a *Try Again* that actually tries again.
+    ///
+    /// **`async`, and still `static`, since #30.** `async` because it forks
+    /// `exiftool -ver` and blocks in a pipe read until the probe answers or
+    /// times out, and that must happen off the cooperative pool like every
+    /// other fork in this file. `static` rather than moved onto the actor for
+    /// two reasons: the answer it caches is process-wide, not per-writer — so
+    /// an instance method would imply an ownership that does not exist, and
+    /// would make the inspector construct a `MetadataWriter` purely to ask a
+    /// question about `PATH` — and the actor's queue is serial, so a *Try
+    /// Again* pressed during a 500-file batch would sit behind every remaining
+    /// exiftool invocation in it. A `BlockingWork.run` hop answers in probe
+    /// time regardless of what the writer is doing.
     @discardableResult
-    public static func recheckAvailability() -> ExiftoolAvailability {
-        availabilityCache.recheck()
+    public static func recheckAvailability() async -> ExiftoolAvailability {
+        await recheckAvailability(in: availabilityCache) { ExiftoolLocator.check() }
+    }
+
+    /// Test seam for #30, matching `FileOperator`'s injected `copier`.
+    ///
+    /// Both halves are injected, and the *cache* half is the one that is easy
+    /// to leave out and expensive to get wrong. The probe is replaceable so
+    /// `CooperativePoolTests` can name the queue the fork ran on without
+    /// needing exiftool on `PATH`, and without paying the probe timeout on a
+    /// machine that has none. The cache is replaceable because the production
+    /// one is process-wide and unrestorable: a test that recheck-ed into it
+    /// with a stub probe would leave `.notFound` cached for every later test in
+    /// the run, and eleven exiftool round-trip tests would then fail claiming
+    /// exiftool was not installed. That is not hypothetical — it is what the
+    /// first version of this seam did.
+    @discardableResult
+    static func recheckAvailability(
+        in cache: AvailabilityCache,
+        probe: @escaping @Sendable () -> ExiftoolAvailability
+    ) async -> ExiftoolAvailability {
+        await cache.recheck(probe: probe)
     }
 
     private static let availabilityCache = AvailabilityCache()
 
     /// A lock rather than a `static let`, purely so `recheckAvailability` can
     /// exist. Contended once per batch at most.
-    private final class AvailabilityCache: @unchecked Sendable {
+    ///
+    /// Internal rather than private so a test can hand `recheckAvailability`
+    /// a cache of its own instead of poisoning the process-wide one.
+    final class AvailabilityCache: @unchecked Sendable {
         private let lock = NSLock()
         private var cached: ExiftoolAvailability?
 
+        /// Bumped when a *recheck* starts, and captured by every probe as it
+        /// begins. `store` refuses any answer computed before the newest
+        /// recheck began.
+        ///
+        /// Without it: the cache is cold, the inspector's *Try Again* forks a
+        /// recheck that is about to store `.available`, and a concurrent first
+        /// read of `value` forks a probe of its own that finishes *after* it
+        /// and stores the `.notFound` it saw. The stale answer wins, nothing
+        /// ever recomputes it, and *Try Again* looks broken for the rest of the
+        /// process — which is precisely the failure this refreshable cache was
+        /// added to prevent. The window is narrow today (availability is first
+        /// read at init, long before there is an inspector button to press),
+        /// which is an argument for the counter being cheap, not for it being
+        /// unnecessary.
+        private var generation: UInt64 = 0
+
+        /// The cached answer, probing for it once if nothing has been cached.
+        ///
+        /// **The probe runs outside the lock.** Holding `NSLock` across
+        /// `ExiftoolLocator.check` would park every concurrent first reader
+        /// behind a fork that may take `ExiftoolLocator.versionProbeTimeout` —
+        /// ten seconds — and on the three-core CI runner that is the entire
+        /// cooperative pool waiting on one lock. The cost of probing outside it
+        /// is that a genuine race between two cold readers forks twice rather
+        /// than once; two bounded forks are cheaper than a ten-second convoy,
+        /// and the double-check below means only one answer is kept.
         var value: ExiftoolAvailability {
             lock.lock()
-            defer { lock.unlock() }
-            if let cached { return cached }
+            if let cached {
+                lock.unlock()
+                return cached
+            }
+            let startedAt = generation
+            lock.unlock()
+
             let fresh = ExiftoolLocator.check()
+
+            lock.lock()
+            defer { lock.unlock() }
+            // A recheck started while this probe ran, so this answer predates
+            // the newest intent and must not be stored.
+            guard startedAt == generation else { return cached ?? fresh }
+            // Another cold reader raced and won with an equally current answer.
+            if let cached { return cached }
             cached = fresh
             return fresh
         }
 
-        func recheck() -> ExiftoolAvailability {
-            let fresh = ExiftoolLocator.check()
+        /// Marks the start of a recheck and returns the generation its answer
+        /// must still be current for.
+        private func beginRecheck() -> UInt64 {
             lock.lock()
-            cached = fresh
-            lock.unlock()
-            return fresh
+            defer { lock.unlock() }
+            generation += 1
+            return generation
+        }
+
+        /// Replaces the cached answer, unless a newer recheck has started since
+        /// `probeGeneration` was taken — in which case that newer recheck owns
+        /// the answer and this one is discarded. Returns what the cache holds
+        /// afterwards, which is what the caller should report.
+        ///
+        /// Separated from `recheck` so the lock is not taken inside an `async`
+        /// function: `NSLock.lock()` is unavailable from an asynchronous
+        /// context, and rightly — a lock held across a suspension point is a
+        /// lock held across an unbounded wait. Nothing suspends in here.
+        private func store(_ value: ExiftoolAvailability,
+                           from probeGeneration: UInt64) -> ExiftoolAvailability {
+            lock.lock()
+            defer { lock.unlock() }
+            guard probeGeneration == generation else { return cached ?? value }
+            cached = value
+            return value
+        }
+
+        func recheck(probe: @escaping @Sendable () -> ExiftoolAvailability) async -> ExiftoolAvailability {
+            let startedAt = beginRecheck()
+            let fresh = await BlockingWork.run(probe)
+            return store(fresh, from: startedAt)
         }
     }
 

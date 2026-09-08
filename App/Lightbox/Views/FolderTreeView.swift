@@ -46,9 +46,31 @@ final class FolderItem: Identifiable {
         if !hasLoaded {
             hasLoaded = true
             let url = self.url
-            let found = await Task.detached(priority: .userInitiated) {
+            // `BlockingWork.run`, not `Task.detached`: `FolderNode.children`
+            // is `contentsOfDirectory` plus an `lstat` per entry, and on the
+            // external or network volume this app is built for that parks the
+            // calling thread for as long as the volume takes to answer — for a
+            // spun-down drive, seconds. `Task.detached` would park a
+            // *cooperative* thread, which is #28's stall exactly; this parks a
+            // dispatch one, which the workqueue replaces (#30).
+            //
+            // Both hops in this file are held by the `grep` recorded in
+            // CLAUDE.md, not by a label test: `FolderNode.children` is a free
+            // function with no injection seam, and `FolderItem` is a view-tree
+            // helper with nowhere to observe which queue it ran on. Every other
+            // site in #30 has a `CooperativePoolTests` assertion; these two do
+            // not, so if you move this code, the grep is the only check.
+            //
+            // Worth knowing before adding a third hop here: this is the
+            // heaviest caller on `BlockingWork.run`'s queue in slot-seconds.
+            // Its fan-out scales with sidebar height, and each closure holds
+            // its slot for a `contentsOfDirectory` plus an `lstat` per entry —
+            // seconds on a spun-down volume, against the thumbnail encode's
+            // 0.6 ms. The queue admits 64 at once; see the table on
+            // `BlockingWork.queue`.
+            let found = await BlockingWork.run {
                 FolderNode.children(of: url)
-            }.value
+            }
             children = found.isEmpty ? nil : found.map { FolderItem(url: $0.url) }
         }
 
@@ -56,13 +78,15 @@ final class FolderItem: Identifiable {
         let pending = children.filter { !$0.hasLoaded }
         for item in pending { item.hasLoaded = true }
         let urls = pending.map(\.url)
-        // One hop to the background for the whole level rather than one per
-        // child: these are all reads of the same volume anyway.
-        let found = await Task.detached(priority: .userInitiated) {
+        // One hop off the pool for the whole level rather than one per child:
+        // these are all reads of the same volume anyway, and one closure that
+        // blocks for a level costs `BlockingWork.run` one of its 64 slots
+        // instead of one per sibling directory.
+        let found = await BlockingWork.run {
             var table: [String: [FolderNode]] = [:]
             for url in urls { table[url.path] = FolderNode.children(of: url) }
             return table
-        }.value
+        }
         for item in pending {
             let kids = found[item.url.path] ?? []
             item.children = kids.isEmpty ? nil : kids.map { FolderItem(url: $0.url) }

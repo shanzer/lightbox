@@ -79,8 +79,8 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 616 tests. No AppKit/SwiftUI.
-App/      Lightbox.xcodeproj — SwiftUI shell over Core; 100 tests. Depends on Core as ../Core.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 619 tests. No AppKit/SwiftUI.
+App/      Lightbox.xcodeproj — SwiftUI shell over Core; 102 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
 ```
@@ -161,12 +161,34 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   `activeProcessorCount` threads wide and never grows, so a thread parked in file IO,
   in SQLite's busy wait, or in a pipe read from exiftool is a thread the process has
   lost. Three of those stalled the CI job about one run in two (#28). `IndexCoordinator`,
-  `MetadataWriter` and `FileOperator` therefore run their bodies on their own
-  `DispatchSerialQueue` through `unownedExecutor`; blocking work that is *not*
-  actor-isolated — the hashing pass's task-group children — hops through
-  `BlockingWork.run`. Anything new in Core
-  that blocks belongs behind one of those two, and `CooperativePoolTests` fails if it
-  does not. Reproduce a narrowed pool with
+  `MetadataWriter`, `FileOperator` and `ThumbnailCache` therefore run their bodies on
+  their own `DispatchSerialQueue` through `unownedExecutor`; blocking work that is *not*
+  actor-isolated hops through `BlockingWork.run` — the hashing pass's task-group
+  children, `ThumbnailCache.generate`'s encode (the QuickLook render stays async and
+  parks nothing), `MetadataWriter.recheckAvailability`, and, since `BlockingWork` went
+  `public` in #30, the App target's two blocking sites: `BrowserModel`'s search and
+  `FolderTreeView`'s directory reads — `BlockingWork.run` is the only thing in that
+  enum that is `public`, its labels stay internal and the App tests reach them with
+  `@testable import LightboxCore`. The rule now holds **everywhere**, not just in
+  Core; anything new that blocks belongs behind one of those two.
+  `CooperativePoolTests` — one suite in Core, one in `App/LightboxTests` — pins each
+  site with a queue-label assertion and fails if it moves back, **except**
+  `FolderTreeView`'s two hops, which have no label test: `FolderNode.children` has no
+  injection seam and `FolderItem` is a view-tree helper with nowhere to read a queue
+  label from. Those two are held by the standing `grep` instead, which is the check
+  for the whole rule: `grep -rn 'Task.detached\|@concurrent' Core/Sources App/Lightbox`
+  must turn up nothing doing synchronous IO or SQLite outside a hop. Today its only
+  non-comment hit is `ThumbnailCache.generate`, whose `@concurrent` carries the async
+  render and whose blocking half is hopped. `BlockingWork.run`'s
+  queue admits **64** concurrently-blocked closures and queues the surplus, so every
+  caller's fan-out *and how long it holds a slot* is written down in the table on
+  `BlockingWork.queue`. Two callers scale with the window rather than a constant: the
+  grid's cells and the sidebar's rows. The grid is the one that has been measured —
+  it peaks at 10 at worst, and `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes`
+  pins the 64 itself — but in slot-seconds `FolderTreeView` is the heavier of the two, and
+  the one with no test: a `contentsOfDirectory` plus an `lstat` per entry can hold a
+  slot for seconds on a spun-down volume against the encode's 0.6 ms. Reproduce a
+  narrowed pool with
   `env LIBDISPATCH_COOPERATIVE_POOL_STRICT=1 swift test`, and `sample <pid> 5` if it
   hangs — the sample *is* the diagnosis.
 - **Never zip or index a pre-filter list against a post-filter one.** Both of the
@@ -239,3 +261,15 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   one function. Don't reintroduce the default, and don't hardcode
   `BrowserView.launchIndexURL`: that is how a test run came to create, migrate and
   WAL-switch the user's real `~/Library/Application Support/Lightbox/index.sqlite` (#15).
+- **The test suites build Debug only, and since #30 that is a requirement, not a
+  habit.** `App/LightboxTests/CooperativePoolTests.swift` uses `@testable import
+  LightboxCore`, which needs `ENABLE_TESTABILITY`, and that is set on the **Debug**
+  configuration alone (`project.pbxproj`, one occurrence). So
+  `xcodebuild test -configuration Release` does not compile, and neither does
+  `swift test -c release` for the same reason on the Core side. Nothing runs either
+  today — the scheme's TestAction is Debug and CI passes no `-configuration` — so this
+  is a constraint to know, not a breakage. It was left this way deliberately rather
+  than adding `ENABLE_TESTABILITY = YES` to Release: testability in Release costs
+  cross-module optimization and adds symbols to the shipping binary, which is a poor
+  trade for a test-only import. If Release testing is ever wanted, add the setting to
+  the Release config then — and expect the pbxproj to be edited by hand.
