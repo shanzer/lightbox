@@ -173,22 +173,130 @@ public final class IndexStore: Sendable {
         try DatabasePool(path: url.path, configuration: makeConfiguration())
     }
 
-    /// Closes the underlying SQLite connections synchronously.
+    /// What `close()`'s checkpoint accomplished before the pool closed.
+    public enum CloseOutcome: Sendable, Equatable {
+        /// The checkpoint fully completed: `-wal` is truncated to empty and
+        /// `index.sqlite` alone holds everything.
+        case checkpointed
+        /// The checkpoint could not complete — `Database.checkpoint(.truncate)`
+        /// threw `SQLITE_BUSY`, most plausibly because another connection
+        /// still holds a WAL read snapshot TRUNCATE cannot reclaim. The pool
+        /// still closed; `-wal` may still hold frames.
+        case blocked
+        /// This store was already closed; the call did nothing beyond the
+        /// already-idempotent `pool.close()`.
+        case alreadyClosed
+    }
+
+    /// Closes the underlying SQLite connections synchronously, first
+    /// checkpointing the write-ahead log so the file left behind is
+    /// self-contained.
+    ///
+    /// `DatabasePool.close()` closes the writer connection first and the
+    /// read-only readers after, so the writer is never the *last* connection
+    /// open on the file, and SQLite's automatic checkpoint-on-last-close
+    /// never runs once any reader connection has ever existed — which every
+    /// `IndexStore` opens, to be a pool at all. Left alone, that means a
+    /// "successful" `close()` can return with `-wal` still holding
+    /// everything nothing has read back from `index.sqlite` itself (measured
+    /// while fixing #40: 123,632 bytes of untouched `-wal` after a close
+    /// that raised no error). So this now runs `Database.checkpoint(.truncate)`
+    /// — GRDB's typed wrapper around `sqlite3_wal_checkpoint_v2` in
+    /// `SQLITE_CHECKPOINT_TRUNCATE` mode, deliberately not the
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` text form: the PRAGMA reports
+    /// contention as a `busy=1` result row rather than throwing, while the
+    /// typed API throws `SQLITE_BUSY`, which is what the `.blocked` case
+    /// below is built on — on the writer, via `pool.barrierWriteWithoutTransaction`,
+    /// before `pool.close()` runs. TRUNCATE folds every WAL frame back into
+    /// `index.sqlite` and truncates `-wal` to zero bytes, which is what makes
+    /// the promise below true by construction instead of by the one
+    /// production caller's luck (`BrowserModel.init(at:)`'s corrupt-index
+    /// path, which happens to follow `close()` with `rebuild(at:)`, itself
+    /// deleting all three files): **a fresh connection, or a
+    /// delete-and-recreate, can safely take over the file this leaves
+    /// behind.**
+    ///
+    /// `barrierWriteWithoutTransaction`, not `writeWithoutTransaction`, for
+    /// two reasons at once: it drains this pool's *own* reader connections
+    /// before the checkpoint runs — the same ordering `DatabasePool.close()`
+    /// itself uses internally — so a read this pool is still serving cannot
+    /// defeat TRUNCATE; and it is what gives idempotency for free. Called
+    /// after this store is already closed, `barrierWriteWithoutTransaction`
+    /// throws `DatabaseError.connectionIsClosed()` (its own guard against a
+    /// nil reader pool) rather than touching a closed writer connection, so
+    /// a second `close()` is detected cleanly from GRDB's own state instead
+    /// of state this type would otherwise have to track and keep in sync
+    /// with it.
+    ///
+    /// The checkpoint can fail to complete without anything being wrong:
+    /// SQLite cannot truncate frames a live reader might still need, so a
+    /// second `IndexStore` on the same file (two windows on `index.sqlite`,
+    /// or the reader-holding test below) can leave the checkpoint unable to
+    /// finish, past the configured busy timeout. That is not a reason to
+    /// fail *this* close — the caller closed one connection, not every
+    /// window — so it is mapped to `.blocked` rather than thrown, and
+    /// `pool.close()` always runs. Any other error (`SQLITE_IOERR`,
+    /// `SQLITE_CORRUPT`, …) is a real failure and is rethrown rather than
+    /// folded into either case.
     ///
     /// Not required for ordinary use — GRDB closes its connections when the
     /// `DatabasePool` deinitializes, and that is sufficient for a store an
-    /// `IndexStore` owns for its own lifetime. It matters wherever a file is
-    /// about to be unlinked under a live connection — `deinit` on a store that
-    /// owns its temporary directory, and one case in the app:
-    /// `BrowserModel.init(at:)` opens a connection to
-    /// check its integrity, and, if that check fails, discards it in favor of
-    /// a fresh one at the same path. `deinit` is not synchronous enough for
-    /// that — the old connection's file descriptor can still be open when
-    /// `rebuild(at:)` unlinks the file out from under it, which SQLite flags
-    /// as a client API violation even though it happens to tolerate it. This
-    /// makes closing the old connection an explicit, ordered step instead of
-    /// a race with ARC.
-    public func close() throws { try pool.close() }
+    /// `IndexStore` owns for its own lifetime (`deinit` does not route
+    /// through this method, and does not checkpoint: it is not synchronous
+    /// enough to be relied on for that, which is why `close()` exists as an
+    /// explicit step). This matters wherever a file is about to be unlinked
+    /// under a live connection — `deinit` on a store that owns its temporary
+    /// directory, and one case in the app: `BrowserModel.init(at:)` opens a
+    /// connection to check its integrity, and, if that check fails, discards
+    /// it in favor of a fresh one at the same path. `deinit` is not
+    /// synchronous enough for that — the old connection's file descriptor can
+    /// still be open when `rebuild(at:)` unlinks the file out from under it,
+    /// which SQLite flags as a client API violation even though it happens to
+    /// tolerate it. This makes closing the old connection an explicit,
+    /// ordered step instead of a race with ARC. That one production caller is
+    /// `@MainActor` and discards this method's return value — `rebuild(at:)`
+    /// deletes all three files right after, so what the checkpoint managed
+    /// plays no part there — which means it can block the main thread for up
+    /// to the busy timeout if a second window's store holds a read snapshot
+    /// at exactly that moment. Acceptable: reaching this path needs both a
+    /// corrupt index *and* a second window open on it.
+    ///
+    /// - Returns: `.checkpointed` if the checkpoint fully completed;
+    ///   `.blocked` if it could not, because another connection still holds a
+    ///   read snapshot; `.alreadyClosed` if this store was already closed. In
+    ///   every case `close()` itself has succeeded — the pool is closed. A
+    ///   rethrown checkpoint error (`SQLITE_IOERR`, `SQLITE_CORRUPT`, …)
+    ///   still leaves the pool closed, for the same reason.
+    @discardableResult
+    public func close() throws -> CloseOutcome {
+        let outcome: CloseOutcome
+        do {
+            try pool.barrierWriteWithoutTransaction { db in _ = try db.checkpoint(.truncate) }
+            outcome = .checkpointed
+        } catch let error as DatabaseError
+        where error.resultCode == .SQLITE_MISUSE && error.message == "Connection is closed" {
+            // `barrierWriteWithoutTransaction`'s own guard against a nil
+            // reader pool — see the doc comment above. Not our own state.
+            outcome = .alreadyClosed
+        } catch let error as DatabaseError where error.resultCode == .SQLITE_BUSY {
+            outcome = .blocked
+        } catch {
+            // A real failure, not `.alreadyClosed` or `.blocked`. The pool
+            // still has to close here, not just on the three paths above:
+            // the one production caller (`BrowserModel.init(at:)`'s
+            // corrupt-index path) calls this through `try?`, which would
+            // otherwise swallow the error and leave the old connection live
+            // for `rebuild(at:)` to unlink the file out from under it —
+            // exactly the hazard `close()` exists to remove. `try?`, not
+            // `try`, on the close itself: the error already being thrown is
+            // the reason to report, and a second failure closing the pool
+            // would have nothing more useful to say than the first.
+            try? pool.close()
+            throw error
+        }
+        try pool.close()
+        return outcome
+    }
 
     // MARK: - Schema
 
@@ -993,6 +1101,18 @@ public final class IndexStore: Sendable {
     /// simply reach for `testExecute`.
     func testWrite(_ body: (Database) throws -> Void) throws {
         try pool.write { db in try body(db) }
+    }
+
+    /// One read transaction on a *reader* connection, held open for as long
+    /// as `body` runs — `testRead`'s reason to exist alongside `testExecute`
+    /// and `testWrite` is the same as `testWrite`'s reason to exist alongside
+    /// `testExecute`: a test that has to prove something about a WAL
+    /// snapshot still being open (a checkpoint that cannot reclaim its
+    /// frames while a reader holds one) needs the read demonstrably in
+    /// progress, not a query that runs and releases before the test can
+    /// observe it.
+    func testRead<T>(_ body: (Database) throws -> T) throws -> T {
+        try pool.read { db in try body(db) }
     }
 
     /// Reads on one of the pool's *reader* connections, not the writer that

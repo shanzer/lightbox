@@ -1007,12 +1007,15 @@ struct IndexStoreTests {
 
         // All three files as a crash would have left them: rows committed to
         // the log, nothing checkpointed into the database yet. Captured while
-        // the connection is open and before anything checkpoints, because
-        // that is the only moment the sidecars still hold this genuinely
-        // uncheckpointed state — `close()` does not reliably checkpoint them
-        // away (issue #39), but `restore()` below overwrites whatever it
-        // leaves regardless, so what it does or doesn't do plays no part in
-        // this test.
+        // the connection is open and *before* `store.close()` runs below,
+        // because that is the only moment the sidecars still hold this
+        // genuinely uncheckpointed state — since #40, `close()` itself
+        // checkpoints the WAL, so capturing after it would hand this test an
+        // already-folded-back log instead of a crash-shaped one. (It would
+        // not change the outcome either way: `restore()` below overwrites
+        // whatever `close()` leaves regardless, so what `close()` does or
+        // doesn't do to these three files plays no part in this test — only
+        // the ordering of the capture does.)
         let store = try IndexStore(url: url)
         for i in 0..<5 { _ = try store.upsert(sampleRecord(path: "/a/\(i).jpg")) }
         let crash = (database: try Data(contentsOf: url),
@@ -1042,5 +1045,119 @@ struct IndexStoreTests {
         try restore(database: false)
         let reopened = try IndexStore(url: url)
         #expect(try reopened.count() == 0)
+    }
+
+    // MARK: - close() checkpoints the WAL (#40)
+
+    /// `close()`'s whole job. GRDB's `DatabasePool.close()` closes the writer
+    /// before the readers, so SQLite's checkpoint-on-last-close never runs
+    /// once a reader connection has ever existed, and a "closed" store could
+    /// leave `-wal` holding everything nothing has read back from
+    /// `index.sqlite` itself. This proves the opposite by construction, not
+    /// by inspecting `-wal`'s size alone: after `close()`, both sidecars are
+    /// deleted outright, so the readback below cannot be satisfied by SQLite
+    /// quietly replaying whatever the log still held — only what `close()`
+    /// actually folded into `index.sqlite` can answer it.
+    @Test func closeCheckpointsSoAFreshStoreReadsEverythingWithNoWALLeft() throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let walURL = URL(fileURLWithPath: url.path + "-wal")
+        let shmURL = URL(fileURLWithPath: url.path + "-shm")
+
+        let store = try IndexStore(url: url)
+        for i in 0..<10 { _ = try store.upsert(sampleRecord(path: "/a/\(i).jpg")) }
+        #expect(try store.count() == 10)
+
+        #expect(try store.close() == .checkpointed)
+
+        // The WAL is gone or empty on its own terms.
+        if FileManager.default.fileExists(atPath: walURL.path) {
+            let walSize = try FileManager.default.attributesOfItem(atPath: walURL.path)[.size] as? Int ?? -1
+            #expect(walSize == 0, "close() left a non-empty WAL (\(walSize) bytes)")
+        }
+        // The main file holds the schema and rows, not a bare page-1 stub —
+        // see `IntegrityTests.aGarbledHeaderFailsToOpenRatherThanBeingAcceptedSilently`
+        // for why 4096 is the bar a schema-and-rows file clears.
+        #expect(try Data(contentsOf: url).count > 4096)
+
+        for sidecar in [walURL, shmURL] {
+            try? FileManager.default.removeItem(at: sidecar)
+        }
+
+        let reopened = try IndexStore(url: url)
+        #expect(try reopened.count() == 10)
+        for i in 0..<10 {
+            #expect(try reopened.record(atPath: "/a/\(i).jpg") != nil)
+        }
+        try reopened.close()
+    }
+
+    /// `close()`'s idempotency comes from GRDB's own state, not a flag this
+    /// type tracks: `pool.barrierWriteWithoutTransaction` throws
+    /// `DatabaseError.connectionIsClosed()` once `pool.close()` has run
+    /// (its own guard against a nil reader pool), and `close()` maps that to
+    /// `.alreadyClosed` rather than letting it escape. This is the test for
+    /// the second call reporting that cleanly instead of throwing.
+    @Test func aSecondCloseIsANoOpThatDoesNotThrow() throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let store = try IndexStore(url: url)
+        _ = try store.upsert(sampleRecord(path: "/a/b.jpg"))
+        #expect(try store.close() == .checkpointed)
+        #expect(try store.close() == .alreadyClosed)
+    }
+
+    /// The case `close()`'s doc comment calls out: a second `IndexStore` on
+    /// the same file holding an open read transaction, so the checkpoint
+    /// cannot reclaim every frame. `close()` must still return — reporting
+    /// the incomplete checkpoint through its return value — rather than
+    /// throwing past the close, and the file must still be openable
+    /// afterward.
+    ///
+    /// This costs the full 5 s busy timeout (`IndexStore.makeConfiguration()`)
+    /// by design, not by accident: `Database.checkpoint(.truncate)` retries
+    /// through GRDB's busy handler for the whole window before giving up and
+    /// throwing `SQLITE_BUSY`, and that retry is exactly the mechanism this
+    /// test is proving doesn't hang forever or throw past the close. A
+    /// future pass "fixing the slow test" by shortening or deleting this
+    /// wait would delete the thing it verifies. `two`'s reader lives on its
+    /// own `IndexStore`/`DatabasePool` — a distinct set of connections from
+    /// `one`'s — so `pool.barrierWriteWithoutTransaction`'s draining of
+    /// `one`'s *own* readers (see `close()`'s doc comment) does not touch it,
+    /// and the checkpoint still blocks on `two`'s snapshot the same way it
+    /// would across two real app windows.
+    @Test func closeStillReturnsWhenAnotherStoresReadSnapshotBlocksTheCheckpoint() throws {
+        let url = tree.root.appendingPathComponent("index.sqlite")
+        let one = try IndexStore(url: url)
+        for i in 0..<5 { _ = try one.upsert(sampleRecord(path: "/a/\(i).jpg")) }
+
+        let two = try IndexStore(url: url)
+        let readerReady = DispatchSemaphore(value: 0)
+        let releaseReader = DispatchSemaphore(value: 0)
+        // A plain thread, not a `Task`: the reader blocks holding its
+        // snapshot open, and blocking a cooperative-pool thread to test a
+        // blocking API is how a test deadlocks its own executor.
+        Thread.detachNewThread {
+            try? two.testRead { db in
+                // The read statement is what actually takes the WAL
+                // snapshot; entering the closure alone does not.
+                _ = try? Int.fetchOne(db, sql: "SELECT count(*) FROM files")
+                readerReady.signal()
+                _ = releaseReader.wait(timeout: .now() + 10)
+            }
+        }
+        if case .timedOut = readerReady.wait(timeout: .now() + 10) {
+            Issue.record("the reader never took its snapshot")
+            releaseReader.signal()
+            return
+        }
+
+        #expect(try one.close() == .blocked)
+
+        releaseReader.signal()
+        try two.close()
+
+        // Not fully checkpointed is not the same as unsafe to reopen.
+        let reopened = try IndexStore(url: url)
+        #expect(try reopened.count() == 5)
+        try reopened.close()
     }
 }
