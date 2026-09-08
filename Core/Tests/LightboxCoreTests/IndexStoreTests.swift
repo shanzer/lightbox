@@ -1007,8 +1007,12 @@ struct IndexStoreTests {
 
         // All three files as a crash would have left them: rows committed to
         // the log, nothing checkpointed into the database yet. Captured while
-        // the connection is open, because closing it checkpoints and then
-        // removes the sidecars.
+        // the connection is open and before anything checkpoints, because
+        // that is the only moment the sidecars still hold this genuinely
+        // uncheckpointed state — `close()` does not reliably checkpoint them
+        // away (issue #39), but `restore()` below overwrites whatever it
+        // leaves regardless, so what it does or doesn't do plays no part in
+        // this test.
         let store = try IndexStore(url: url)
         for i in 0..<5 { _ = try store.upsert(sampleRecord(path: "/a/\(i).jpg")) }
         let crash = (database: try Data(contentsOf: url),

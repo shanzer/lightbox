@@ -26,7 +26,58 @@ struct IntegrityTests {
     @Test func aGarbledHeaderFailsToOpenRatherThanBeingAcceptedSilently() throws {
         let tree = try TempTree()
         let url = tree.root.appendingPathComponent("index.sqlite")
-        _ = try IndexStore(url: url)          // create and close
+        let walURL = URL(fileURLWithPath: url.path + "-wal")
+        let shmURL = URL(fileURLWithPath: url.path + "-shm")
+        let first = try IndexStore(url: url)
+        // Explicit close, not `_ = try IndexStore(url: url)` relying on ARC:
+        // this is a `DatabasePool` in WAL mode (CLAUDE.md's GRDB/WAL gotcha),
+        // and the schema this initializer just wrote (via the migrator) lands
+        // in `index.sqlite-wal`, not in `index.sqlite` itself, until something
+        // checkpoints it back. If a connection is still open — or ARC just
+        // hasn't run the pool's `deinit` yet — when the bytes below overwrite
+        // the file's header, the reopened store can still validate page 1
+        // against a frame sitting in `-wal`/`-shm` and never look at the
+        // garbled header on disk at all. (Confirmed empirically: holding a
+        // second connection open across the overwrite reproduces exactly
+        // this — the reopened store reports healthy every time in a loop.)
+        //
+        // `IndexStore.close()` alone is not enough to prevent it either:
+        // `DatabasePool.close()` closes the writer connection first and the
+        // readers after, so the writer is not the *last* connection to close,
+        // and SQLite's automatic checkpoint-on-last-close never runs at all
+        // once a reader connection exists — it only fires on the connection
+        // that turns out to be the last one open, and by the time any reader
+        // closes last it cannot write, so it cannot checkpoint. Empirically,
+        // `close()` alone left `-wal` on disk at its full pre-close size, and
+        // the reopened store still read the garbled header's page right out
+        // of it. So the checkpoint has to be forced explicitly, on the
+        // writer, before anything closes — `testExecute` is the documented
+        // seam for reaching the writer connection from a test rather than
+        // touching `pool` directly (`pool` is documented as reachable only
+        // from `IndexStore`'s own extensions, not from outside the type).
+        // `PRAGMA wal_checkpoint(TRUNCATE)` checkpoints every frame back into
+        // `index.sqlite` and resets `-wal` to empty. The sidecars are then
+        // removed outright (as `IndexStore.rebuild(at:)` does) so "gone" is
+        // verifiable by existence, not by trusting the checkpoint left
+        // nothing readable.
+        try first.testExecute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+        try first.close()
+        for sidecar in [walURL, shmURL] {
+            try? FileManager.default.removeItem(at: sidecar)
+        }
+        #expect(!FileManager.default.fileExists(atPath: walURL.path))
+        #expect(!FileManager.default.fileExists(atPath: shmURL.path))
+        // The checkpoint is load-bearing, not incidental cleanup: without it,
+        // everything the migrator wrote is still sitting in the (now-removed)
+        // `-wal`, and `index.sqlite` on disk is a bare 4096-byte page-1 stub —
+        // a valid header over no schema. A garbled version of that stub would
+        // still fail to open, so the detection assertions below would pass
+        // whether or not the checkpoint ran, proving nothing. This assertion
+        // pins the checkpoint as the thing that put the schema where the
+        // garble can actually reach it. (Verified by mutation: drop the
+        // checkpoint above but keep the sidecar removals, and this goes red —
+        // the file is exactly 4096 bytes.)
+        #expect(try Data(contentsOf: url).count > 4096)
 
         // Overwrite the SQLite header with garbage.
         let handle = try FileHandle(forWritingTo: url)

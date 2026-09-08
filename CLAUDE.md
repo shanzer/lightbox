@@ -137,7 +137,15 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   `IndexStore.makeConfiguration()` and nowhere else. Two consequences: the index is
   three files (`index.sqlite`, `-wal`, `-shm`) and they are deleted together, and
   `IndexStore.inMemory()` is a private temporary file — a pool cannot be in-memory —
-  removed when the store is released.
+  removed when the store is released. A test that mutates the file underneath a
+  URL-backed store — corrupting it, replacing its sidecars, anything done to the bytes
+  on disk rather than through the store's own API — must `close()` that store first
+  (and, since the writer closes before the readers, SQLite's checkpoint-on-last-close
+  never runs once a reader connection exists, so `close()` alone leaves `-wal` on disk
+  unchanged — force a checkpoint on the writer, e.g. `PRAGMA wal_checkpoint(TRUNCATE)`,
+  when what's still in `-wal` is exactly what the mutation needs to reach): otherwise
+  the pages it's about to corrupt can still be served out of `-wal` to whatever reopens
+  the file next, and the test never proves what it claims to (#39).
 - **Blocking work never runs on the cooperative pool.** That pool is exactly
   `activeProcessorCount` threads wide and never grows, so a thread parked in file IO,
   in SQLite's busy wait, or in a pipe read from exiftool is a thread the process has
