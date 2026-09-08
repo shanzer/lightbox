@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-import LightboxCore
+@testable import LightboxCore
 @testable import Lightbox
 
 /// A preference store that lives and dies with the test.
@@ -43,6 +43,66 @@ private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath:
 @MainActor
 private func sheetDescription(_ model: BrowserModel) -> String {
     model.activeSheet.map(\.id) ?? "no sheet"
+}
+
+/// Drives a cancel from the operator side rather than the wall clock (#45).
+///
+/// `FileOperator.itemBoundaryHook` is awaited once per finished item, on the
+/// operator's own queue, before the next item's cancellation check. Installed
+/// as this gate's `hook(_:)`, it reports the item count to a test that is
+/// waiting on `awaitFirstItem()` and then parks until `release()` — so a test
+/// can call `cancelBatch()` between exactly one item finishing and the next
+/// one starting, with no dependency on `batchProgress` or on how long any
+/// other suite in this process happens to hold the main actor.
+///
+/// An actor, not a class with a lock: the hook runs on `FileOperator`'s queue
+/// and `awaitFirstItem`/`release` run on the main actor, and the two rendez­vous
+/// through actor isolation rather than through `os_unfair_lock` or a
+/// `DispatchSemaphore` — the latter would park a *thread*, which is exactly
+/// what `FileOperator`'s own executor exists to avoid (`CLAUDE.md`, "blocking
+/// work never runs on the cooperative pool").
+private actor ItemGate {
+    private(set) var reachedCount = 0
+    private var reachedContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var releasePending = false
+
+    /// Installed as `FileOperator.itemBoundaryHook`. Reports `completed`, then
+    /// parks until `release()` — synchronously, so by the time
+    /// `awaitFirstItem()` returns to its caller, this call is already parked
+    /// and `release()` cannot arrive early. Actor exclusivity is what makes
+    /// that true: nothing else runs on this actor between the report below
+    /// and the suspension that follows it.
+    func hook(_ completed: Int) async {
+        reachedCount = completed
+        if let reachedContinuation {
+            self.reachedContinuation = nil
+            reachedContinuation.resume()
+        }
+        if releasePending {
+            releasePending = false
+            return
+        }
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    /// Suspends until the hook has reported its first item.
+    func awaitFirstItem() async {
+        guard reachedCount == 0 else { return }
+        await withCheckedContinuation { reachedContinuation = $0 }
+    }
+
+    /// Lets a parked `hook(_:)` call continue. Safe to call before the hook
+    /// has parked — the release is then remembered rather than lost — though
+    /// `awaitFirstItem()` returning already rules that ordering out.
+    func release() {
+        if let releaseContinuation {
+            self.releaseContinuation = nil
+            releaseContinuation.resume()
+        } else {
+            releasePending = true
+        }
+    }
 }
 
 // MARK: - The batch, end to end
@@ -306,10 +366,14 @@ struct FileOperationBatchTests {
     /// Cancel stops the batch after the item it is on, and everything already
     /// finished stays finished — on disk and in the journal.
     ///
-    /// Cancelled from the main actor as soon as the first progress report
-    /// lands, which is the same moment the user's click would arrive. The
-    /// deadline is there so a broken cancel fails the test rather than hanging
-    /// the suite.
+    /// **Driven from the operator, not the wall clock (#45).** Polling
+    /// `batchProgress` on the main actor raced the other `@MainActor` suites
+    /// in this process, which block it synchronously for seconds
+    /// (`MenuCommandTests`'s `RunLoop.current.run`): by the time the poll
+    /// observed progress, all 300 items were already done and there was
+    /// nothing left to cancel. `ItemGate` instead parks `FileOperator` itself
+    /// after the first item, which a `Task.checkCancellation()` cannot be
+    /// scheduled around.
     @Test func cancellingABatchLeavesTheFinishedItemsDone() async throws {
         let total = 300
         let root = try tree.directory("library")
@@ -324,20 +388,25 @@ struct FileOperationBatchTests {
         #expect(model.records.count == total)
         model.selectAll()
 
-        let batch = Task { await model.beginBatch(.move, destination: destination) }
-        let deadline = Date().addingTimeInterval(10)
-        while (model.batchProgress?.completed ?? 0) < 1, Date() < deadline {
-            await Task.yield()
+        let gate = ItemGate()
+        await model.fileOperator.setItemBoundaryHookForTesting { completed in
+            await gate.hook(completed)
         }
+
+        let batch = Task { await model.beginBatch(.move, destination: destination) }
+        await gate.awaitFirstItem()
         model.cancelBatch()
+        await gate.release()
         await batch.value
 
         let batchID = try #require(model.lastCompletedBatch?.batchID,
                                    "the cancelled batch completed nothing at all")
         let done = try #require(model.lastCompletedBatch?.completedCount)
-        #expect(done > 0)
-        #expect(done < total,
-                "the batch finished before the cancel could land; raise `total`")
+        // A monotonic count, not `batchProgress` — which `endBatch()` clears
+        // by the time this line runs. The gate parked after exactly one item,
+        // so cancellation cannot have let a second one start.
+        #expect(done == 1,
+                "the gate released after item 1; cancel must land before item 2 starts")
 
         // The journal is the record, and it has to agree with the disk. Every
         // item the batch finished is `complete`; the ones it never reached stay
@@ -703,6 +772,17 @@ struct UndoTests {
     /// Noisy, and deliberately not refused — the second press finishes the job.
     /// The point of the test is that "noisy" is the worst of it: nothing is
     /// lost, and every file ends up back where it started.
+    ///
+    /// **Driven from the operator, not the wall clock (#45).** This used to
+    /// poll `model.batchProgress` on the main actor, which raced the other
+    /// `@MainActor` suites in the same process: `MenuCommandTests` blocks the
+    /// main actor synchronously for seconds (`RunLoop.current.run`), so the
+    /// poll could observe progress only after all 120 items were already
+    /// restored, and the assertion that the first undo was partial failed —
+    /// seen 2 of 10 full App runs. `ItemGate` instead parks `FileOperator`
+    /// itself, on its own queue, immediately after the first item's journal
+    /// write — a boundary `Task.checkCancellation()` cannot be scheduled
+    /// around, whatever else the process is doing.
     @Test func aSecondUndoAfterACancelledOneFinishesTheJobNoisily() async throws {
         let total = 120
         let root = try tree.directory("library")
@@ -720,18 +800,28 @@ struct UndoTests {
         await model.beginBatch(.move, destination: destination)
         #expect(model.lastCompletedBatch?.completedCount == total)
 
-        // First press, cancelled as soon as it has restored something.
-        let first = UndoCommandAction.run(isEditingText: false, model: model)
-        let deadline = Date().addingTimeInterval(10)
-        while (model.batchProgress?.completed ?? 0) < 1, Date() < deadline {
-            await Task.yield()
+        // First press, cancelled the instant the gate reports the first
+        // restored item — before a second one can start.
+        let gate = ItemGate()
+        await model.fileOperator.setItemBoundaryHookForTesting { completed in
+            await gate.hook(completed)
         }
+        let first = UndoCommandAction.run(isEditingText: false, model: model)
+        await gate.awaitFirstItem()
         model.cancelBatch()
+        await gate.release()
         await first.work?.value
+        // Cleared before the second press: that undo must run to completion,
+        // with nothing left to park it.
+        await model.fileOperator.setItemBoundaryHookForTesting(nil)
 
         let restoredByFirst = sources.count(where: exists)
-        #expect(restoredByFirst > 0, "the cancel landed before anything was put back")
-        #expect(restoredByFirst < total, "the undo finished before the cancel could land")
+        // A monotonic count the gate produced directly, not `batchProgress` —
+        // which `endBatch()` clears by the time this line runs, and which a
+        // state load can overtake regardless. The gate released after exactly
+        // one item, so the cancel cannot have let a second one start.
+        #expect(restoredByFirst == 1,
+                "the gate released after item 1; cancel must land before item 2 starts")
         #expect(model.lastCompletedBatch?.kind == .move,
                 "a cancelled undo must leave the original batch as the thing to reverse")
 
