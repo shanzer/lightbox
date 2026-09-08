@@ -15,6 +15,26 @@ public enum ThumbnailError: Error, Equatable {
 /// the system has a generator for, which is exactly the set of formats a photo
 /// library contains and ImageIO alone would half-cover.
 public actor ThumbnailCache {
+    /// This actor's body runs on a dispatch queue of its own, not on the
+    /// cooperative pool (#30).
+    ///
+    /// Nothing here forks a subprocess, but three things here block on the
+    /// filesystem and one of them blocks for a long time: `evictIfNeeded()` and
+    /// `cachedCount()` enumerate a directory holding one PNG per thumbnail the
+    /// user has ever scrolled past — tens of thousands after a session — and
+    /// `stat` every one of them, and `thumbnail(for:mtime:size:)` stats the
+    /// destination on every request. On the external drive this app exists for,
+    /// a directory walk that wide is seconds, not milliseconds. See
+    /// `BlockingWork` for why seconds on a cooperative thread is the whole bug.
+    private let queue = BlockingWork.serialQueue(BlockingWork.thumbnailCacheLabel)
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        queue.asUnownedSerialExecutor()
+    }
+
+    /// Test seam for #30: the queue this actor's body actually ran on.
+    func currentQueueLabel() -> String { BlockingWork.currentQueueLabel }
+
     private let directory: URL
     private let budgetBytes: Int64
     /// In-flight generations, so eight scroll events for one image do not
@@ -94,6 +114,15 @@ public actor ThumbnailCache {
 
     // MARK: - Internals
 
+    /// The blocking half of a generation: encode `image` as PNG and leave it at
+    /// the given destination.
+    ///
+    /// A closure rather than a direct call so `CooperativePoolTests` can assert
+    /// which queue the encode ran on, exactly as `FileOperator`'s injected
+    /// `copier` does for the filesystem half of a batch. Production always
+    /// passes `install(_:at:)`.
+    typealias PNGInstalling = @Sendable (CGImage, URL) throws -> Void
+
     /// Renders `url` and writes the PNG to `destination`.
     ///
     /// `nonisolated` because nothing here touches actor state: a slow RAW decode
@@ -109,16 +138,43 @@ public actor ThumbnailCache {
     /// as a test failure. The attribute pins the off-actor execution under both
     /// modes.
     ///
+    /// **Only the QuickLook render stays here.** `@concurrent` means "on the
+    /// cooperative pool", which is the right home for an `await` that parks
+    /// nothing and the wrong home for `install`, which parks a thread in
+    /// ImageIO and `rename(2)`. So the render runs here and the encode hops
+    /// through `BlockingWork.run` (#30).
+    ///
+    /// **Fan-out.** The grid starts one `.task` per visible cell, and a
+    /// full-screen window of small tiles is 200-odd cells. `BlockingWork.run`
+    /// admits 64 concurrently-blocked closures and queues the surplus, so 200
+    /// simultaneous encodes would not deadlock but would push everything else
+    /// that shares that queue — the hashing pass, file operations — behind
+    /// them. Measured rather than assumed: 200 simultaneous `generate` calls
+    /// peak at **at most 10** concurrent installs — 6 to 7 in an ordinary full
+    /// test run, 10 with the cooperative pool narrowed to one thread — because
+    /// QuickLook's render is milliseconds and the encode is 0.6 ms, so the
+    /// requests arrive at the hop spread out rather than together.
+    /// `theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling` guards it at half
+    /// the ceiling (`< 32`), the margin absorbing other suites' use of the same
+    /// queue, and
+    /// `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes` pins the
+    /// ceiling itself by holding every encode until 64 are in flight, so the
+    /// number depends on the queue's width rather than on how fast anything
+    /// runs — the margin is two assertions, not a remembered scratch run.
+    ///
+    /// Not the *only* caller that scales with the window, though it is the only
+    /// measured one: `FolderTreeView.loadWithLookahead` fans out with sidebar
+    /// height and holds each slot far longer. The table on
+    /// `BlockingWork.queue` carries both.
+    ///
     /// Internal rather than private so tests can drive the cleanup branches
     /// below directly; their failure conditions are not reachable through
     /// `thumbnail(for:mtime:size:)` on demand.
     @concurrent
     nonisolated static func generate(
-        from url: URL, to destination: URL, size: Int
+        from url: URL, to destination: URL, size: Int,
+        install: @escaping PNGInstalling = ThumbnailCache.install
     ) async throws -> URL {
-        try FileManager.default.createDirectory(
-            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-
         let request = QLThumbnailGenerator.Request(
             fileAt: url,
             size: CGSize(width: size, height: size),
@@ -132,18 +188,35 @@ public actor ThumbnailCache {
             throw ThumbnailError.generationFailed
         }
 
-        // Encoded to a unique temporary name and moved into place rather than
-        // written straight to `destination`. This is hardening, not a fix for an
-        // observed defect: ImageIO on this platform publishes nothing at the
-        // destination path until the encode completes, and a failed or abandoned
-        // `CGImageDestinationFinalize` leaves no file at all rather than a
-        // truncated one. What the rename does buy is the window ImageIO cannot
-        // cover — `kill -9`, power loss, or ENOSPC partway through — where a
-        // partial file sitting at `destination` would be indistinguishable from
-        // a finished thumbnail to the existence check in
-        // `thumbnail(for:mtime:size:)`, and the mtime-keyed name means nothing
-        // would ever invalidate it. It also makes the multi-writer case below
-        // explicit rather than accidental.
+        // The QuickLook call above is genuinely asynchronous and parks no
+        // thread, so it stays where `@concurrent` puts it. Everything in
+        // `install` blocks, so it does not (#30).
+        try await BlockingWork.run { try install(image, destination) }
+        return destination
+    }
+
+    /// Writes `image` to `destination` as a PNG.
+    ///
+    /// Every line here blocks the calling thread — `mkdir(2)`, an ImageIO
+    /// encode, `rename(2)`, and up to two `stat`s — so it is only ever reached
+    /// through the `BlockingWork.run` hop in `generate`.
+    ///
+    /// Encoded to a unique temporary name and moved into place rather than
+    /// written straight to `destination`. This is hardening, not a fix for an
+    /// observed defect: ImageIO on this platform publishes nothing at the
+    /// destination path until the encode completes, and a failed or abandoned
+    /// `CGImageDestinationFinalize` leaves no file at all rather than a
+    /// truncated one. What the rename does buy is the window ImageIO cannot
+    /// cover — `kill -9`, power loss, or ENOSPC partway through — where a
+    /// partial file sitting at `destination` would be indistinguishable from
+    /// a finished thumbnail to the existence check in
+    /// `thumbnail(for:mtime:size:)`, and the mtime-keyed name means nothing
+    /// would ever invalidate it. It also makes the multi-writer case below
+    /// explicit rather than accidental.
+    nonisolated static func install(_ image: CGImage, at destination: URL) throws {
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+
         let temporary = destination.deletingLastPathComponent()
             .appendingPathComponent(
                 "\(destination.lastPathComponent).\(UUID().uuidString).\(temporaryExtension)")
@@ -169,7 +242,6 @@ public actor ThumbnailCache {
                 throw ThumbnailError.generationFailed
             }
         }
-        return destination
     }
 
     private struct Entry {

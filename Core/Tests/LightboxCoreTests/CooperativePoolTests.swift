@@ -23,11 +23,15 @@ import Dispatch
 /// never grows, so once the last thread parks there is nothing left to produce
 /// it. Three concurrent blocking tests were enough on a three-core runner.
 ///
-/// The fix moves Core's blocking sections off that pool. These tests hold that
-/// line in two different ways, because either alone is weak: the label tests
-/// say *where* the work ran and fail instantly and legibly if it moves back,
-/// and the starvation test reproduces the actual failure and fails within
-/// seconds instead of hanging.
+/// The fix moves Core's blocking sections off that pool. The line is held in
+/// two different ways, because either alone is weak: the label tests below say
+/// *where* the work ran and fail instantly and legibly if it moves back, and
+/// `BlockingWorkFanOutTests.aHashBlockedOnEveryCoreDoesNotStopTheRestOfThe`
+/// `Process` reproduces the actual failure and fails within seconds instead of
+/// hanging. The starvation test lives over there rather than here because it
+/// parks `activeProcessorCount + 1` closures on `BlockingWork.run`'s queue and
+/// holds them, and everything with that shape has to be serialised against the
+/// tests that measure the queue's occupancy.
 struct CooperativePoolTests {
     let tree: TempTree
 
@@ -135,93 +139,96 @@ struct CooperativePoolTests {
         #expect(labels.withLock { $0 } == [BlockingWork.fileOperatorLabel])
     }
 
-    // MARK: - The stall itself
+    /// The QuickLook render is genuinely `async` and parks nothing, but what
+    /// follows it is not: a PNG encode through ImageIO, a `mkdir`, and a
+    /// `rename(2)` onto a cache directory that may be on the same external
+    /// drive the library is. `@concurrent` puts that on the cooperative pool,
+    /// which is the one place it must not be — and unlike the coordinator this
+    /// site has real fan-out, one generation per visible grid cell.
+    ///
+    /// The installer is injected the way `FileOperator`'s `copier` is above, so
+    /// what is asserted is the queue the encode *itself* ran on and not the
+    /// queue some proxy for it ran on.
+    @Test func theThumbnailEncodeRunsOffTheCooperativePool() async throws {
+        let source = try Fixtures.writeImage(to: tree.root.appendingPathComponent("t.jpg"),
+                                             width: 64, height: 64)
+        let destination = tree.root.appendingPathComponent("cache/ab/abcdef.png")
+        let labels = LockBox(Set<String>())
 
-    /// Blocks in every hash until released, so a test can park as many threads
-    /// as the machine has cores and then ask whether anything else can still
-    /// run.
-    private struct StuckHasher: FileHashing {
-        let entered: LockBox<Int>
-        let release: DispatchSemaphore
-
-        func hashes(for url: URL, mediaType: MediaType) throws -> FileHashes {
-            entered.withLock { $0 += 1 }
-            release.wait()
-            return FileHashes(contentHash: "c", imageHash: "i", imageHashKind: "jpeg-scan-v1")
+        _ = try await ThumbnailCache.generate(from: source, to: destination, size: 64) { _, target in
+            labels.withLock { _ = $0.insert(BlockingWork.currentQueueLabel) }
+            try FileManager.default.createDirectory(
+                at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("png".utf8).write(to: target)
         }
+
+        #expect(labels.withLock { $0 } == [BlockingWork.runLabel],
+                "the thumbnail encode ran on a thread that was not a blocking-work thread")
     }
 
-    /// More blocked hashes than the cooperative pool has threads, released only
-    /// by something that needs a cooperative thread itself.
+    /// The actor's own body blocks too, and for longer than the encode does:
+    /// `evictIfNeeded()` and `cachedCount()` enumerate a cache directory that
+    /// holds one file per thumbnail the user has ever scrolled past — tens of
+    /// thousands — and `stat` each one.
+    @Test func theThumbnailCacheRunsItsOwnBodyOffTheCooperativePool() async throws {
+        let cache = ThumbnailCache(directory: tree.root.appendingPathComponent("cache"))
+        #expect(await cache.currentQueueLabel() == BlockingWork.thumbnailCacheLabel)
+    }
+
+    /// `recheckAvailability()` forks `exiftool -ver` and blocks in a pipe read
+    /// until it answers or `ExiftoolLocator`'s probe timeout expires. It is the
+    /// *Try Again* button behind an inspector that has just told the user
+    /// exiftool is missing, so it is pressed exactly when the fork is slowest
+    /// to fail.
     ///
-    /// Before the fix this is the CI stall exactly: the blocked hashes take
-    /// every pool thread, the releaser never gets one, and the process is done.
-    /// After it, the hashes park dispatch-queue threads — which the workqueue
-    /// replaces — and the releaser runs.
+    /// The probe is injected rather than run for real: what is under test is
+    /// where the hop puts it, which does not depend on there being anything on
+    /// `PATH` to fork. Injecting it also keeps this test off the two-minute
+    /// path when there is not.
     ///
-    /// **The deadline lives on a plain `Thread`, and it has to.** Under a
-    /// genuinely starved pool nothing scheduled on the pool can report the
-    /// starvation: a `Task.sleep` watchdog needs a thread to wake up on, and
-    /// `completes(within:)` would hang alongside everything else. The watchdog
-    /// therefore signals the semaphores itself, which unwedges the pool so the
-    /// test can *fail* in ten seconds rather than hang until CI gives up.
-    @Test func aHashBlockedOnEveryCoreDoesNotStopTheRestOfTheProcess() async throws {
-        // One more blocker than the pool can possibly have threads. Other tests
-        // running alongside this one only make the pool scarcer, never wider,
-        // so this cannot pass by accident on a wide machine.
-        let blockers = ProcessInfo.processInfo.activeProcessorCount + 1
-        let entered = LockBox(0)
-        let release = DispatchSemaphore(value: 0)
-        let releasedByPool = LockBox(false)
-        let rescuedByWatchdog = LockBox(false)
-
-        var coordinators: [IndexCoordinator] = []
-        for i in 0..<blockers {
-            let store = try IndexStore.inMemory()
-            let root = try tree.directory("blocker\(i)")
-            _ = try tree.file("blocker\(i)/only.jpg")
-            let c = IndexCoordinator(store: store, walker: Walker(),
-                                     metadata: QueueNamingMetadata(labels: LockBox(Set())),
-                                     hasher: StuckHasher(entered: entered, release: release),
-                                     grayscale: QuietGrayscale(), concurrency: 1)
-            _ = try await c.indexTier0(root: root, recursive: true, onProgress: nil)
-            coordinators.append(c)
-        }
-        let roots = (0..<blockers).map { tree.root.appendingPathComponent("blocker\($0)") }
-
-        let watchdog = Thread {
-            let deadline = Date().addingTimeInterval(10)
-            while Date() < deadline {
-                if releasedByPool.withLock({ $0 }) { return }
-                Thread.sleep(forTimeInterval: 0.01)
-            }
-            rescuedByWatchdog.withLock { $0 = true }
-            for _ in 0..<blockers { release.signal() }
-        }
-        watchdog.start()
-
-        await withTaskGroup(of: Void.self) { group in
-            for (c, root) in zip(coordinators, roots) {
-                group.addTask { _ = try? await c.runHashingPass(root: root, onProgress: nil) }
-            }
-            // The proof obligation: this task needs a cooperative thread, and
-            // it can only get one if the blocked hashes are not holding them.
-            group.addTask {
-                while entered.withLock({ $0 }) < blockers {
-                    try? await Task.sleep(for: .milliseconds(5))
-                    if rescuedByWatchdog.withLock({ $0 }) { return }
-                }
-                releasedByPool.withLock { $0 = true }
-                for _ in 0..<blockers { release.signal() }
-            }
+    /// The *cache* is injected for a blunter reason: `MetadataWriter`'s own is
+    /// process-wide and has no restore, so recheck-ing a stub answer into it
+    /// leaves `.notFound` cached for the rest of the run and every exiftool
+    /// round-trip test that follows fails claiming exiftool is not installed.
+    /// A private cache keeps this test's answer to itself.
+    @Test func theExiftoolProbeRunsOffTheCooperativePool() async {
+        let labels = LockBox(Set<String>())
+        let answer = await MetadataWriter.recheckAvailability(
+            in: MetadataWriter.AvailabilityCache()
+        ) {
+            labels.withLock { _ = $0.insert(BlockingWork.currentQueueLabel) }
+            return .notFound
         }
 
-        #expect(!rescuedByWatchdog.withLock { $0 },
-                """
-                \(blockers) blocked hashes starved the cooperative pool: nothing on it \
-                could run for ten seconds, and only an off-pool thread got the process \
-                moving again. That is issue #28.
-                """)
-        #expect(releasedByPool.withLock { $0 })
+        #expect(answer == .notFound)
+        #expect(labels.withLock { $0 } == [BlockingWork.runLabel],
+                "the exiftool probe forked on a thread that was not a blocking-work thread")
+    }
+
+    /// A recheck that does not *replace* the cached answer is not a recheck.
+    ///
+    /// The test above proves the probe ran off the pool and that its answer
+    /// came back to the caller; neither fact needs the cache to have been
+    /// written, so deleting the `store` call left the suite green. What the
+    /// type exists for is the next read of `value`, and that is what this
+    /// asserts. No probe fires on that read: the cache is warm, which is the
+    /// whole point.
+    ///
+    /// The stub answer is `.tooOld` with a path that cannot exist rather than
+    /// `.notFound`, because `.notFound` is exactly what a real
+    /// `ExiftoolLocator.check` returns on a machine without exiftool — CI is
+    /// one — so a `.notFound` assertion would pass there even with the store
+    /// removed and the lazy probe running instead. This answer is one no real
+    /// probe can produce.
+    @Test func aRecheckReplacesWhatTheCacheAnswersWithNext() async {
+        let stub = ExiftoolAvailability.tooOld(path: "/nowhere/exiftool",
+                                               version: "0.1", minimum: "13.0")
+        let cache = MetadataWriter.AvailabilityCache()
+
+        let returned = await MetadataWriter.recheckAvailability(in: cache) { stub }
+
+        #expect(returned == stub)
+        #expect(cache.value == stub,
+                "the recheck's answer never reached the cache, so the next reader re-probes")
     }
 }
