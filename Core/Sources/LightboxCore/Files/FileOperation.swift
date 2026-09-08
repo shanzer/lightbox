@@ -220,15 +220,25 @@ public enum FileOperationFailure: Error, Sendable, Equatable, Hashable {
     /// The index transaction failed after the filesystem operation succeeded.
     /// The files moved; the rows did not. The journal row stays `in_flight`.
     case indexWriteFailed(String)
-    /// **Undo only.** The file this step would reverse is not the file the batch
-    /// acted on: its `size`/`mtime` no longer match the `files` row that
-    /// recorded them. Something edited it — an external editor, a re-export, a
-    /// sync client — between the batch and the undo.
+    /// **The file at this path is not the one the plan described.** Its
+    /// `size`/`mtime` no longer match the `files` row that recorded them, or —
+    /// on the copy/unlink window of a cross-volume move — the `stat` this
+    /// transfer itself took of the source. Something replaced or edited it: an
+    /// external editor, a re-export, a sync client, a restore from backup.
     ///
-    /// A per-item failure rather than a silent skip, and rather than proceeding.
-    /// Moving it back would be undoing an operation that is no longer the last
-    /// thing to have happened to that photo, and the user asked to reverse a
-    /// batch, not to discard someone else's edit. Nothing changed.
+    /// Two paths report it, for the same reason. Undo (#6): the step would
+    /// reverse an operation that is no longer the last thing to have happened
+    /// to that photo, and the user asked to reverse a batch, not to discard
+    /// someone else's edit. The unlinks (#33): `delete` and a cross-volume
+    /// `move` are the only two places where a file that arrived in the gap is
+    /// *destroyed* rather than displaced, so both re-check identity in the
+    /// instant before `removeItem` — the read half of `setHashes(for:)`'s
+    /// guard.
+    ///
+    /// A per-item failure rather than a silent skip, and rather than
+    /// proceeding. Nothing changed — **except on the transfer's window**, where
+    /// the copy is already at the destination and the rows are therefore left
+    /// `in_flight` through `rollbackIncomplete` rather than settled `failed`.
     case modifiedSinceOperation
     /// **Undo only.** A `trash` row's `trash_url` names nothing: the user
     /// emptied the Trash, or Finder aged the item out of it. The photo is gone

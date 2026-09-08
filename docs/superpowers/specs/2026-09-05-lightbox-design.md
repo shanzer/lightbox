@@ -459,6 +459,27 @@ with progress.
   toggleable.
 - **Copy clones on APFS** via `copyfile` with `COPYFILE_CLONE` when source and
   destination share a volume.
+- **An unlink is decided by file identity, not by the path.** *(Amended: added
+  for #33.)* Every index write in `FileOperator` is already guarded on identity
+  — `setHashes(for:)`'s rule, matching the id and the `size`/`mtime` the row was
+  written with. The two paths that *unlink* now read the same way. A permanent
+  `delete` re-reads the row for each file and refuses when it no longer
+  describes what is on disk, or when the row the plan read has been pruned —
+  a missing row is disagreement, not an absence of evidence. **A refusal on the
+  selected file refuses the whole item, companions included**: a sidecar travels
+  with a photo because it shares its basename, so once the file at the source
+  path is not the planned one, its companions belong to that file and unlinking
+  them destroys a stranger's edits. A cross-volume move keeps the `stat` its
+  copy was verified against and refuses to remove a source that no longer
+  matches it, naming which sources went and which did not. A source that has
+  vanished is not a mismatch on either path — something else unlinked it, which
+  is where a finished move leaves it anyway. "There is a file here now" is not
+  "this is the file we were asked to act on", and these are the only two places
+  in the app where a file that arrived in the plan/execute gap would be
+  destroyed rather than displaced —
+  `replace` moves such a file to the Trash under its own journal row. The delete
+  refusal changed nothing, so its rows are `failed`; the move's copy is already
+  at the destination, so its rows stay `in_flight` carrying both paths.
 - **Index and filesystem are reconciled, not transacted.** The filesystem is
   not transactional, so the order is: journal the intent, perform the
   filesystem operation, then update the index in a single database transaction.
