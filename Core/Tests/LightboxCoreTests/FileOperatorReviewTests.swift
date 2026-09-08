@@ -1432,6 +1432,35 @@ struct FileOperatorUnlinkIdentityTests {
         #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.failed])
     }
 
+    /// **The permissive half of the same rule.** A sidecar is not indexed in
+    /// its own right, so a delete that reaches one finds no row and has nothing
+    /// recorded about it to disagree with. Refusing there would be the guard
+    /// eating the ordinary case: every `.xmp`, `.aae` and `.thm` in the library
+    /// would become undeletable, and the RAW beside it would go while its
+    /// sidecar stayed — the orphaning that companion handling exists to
+    /// prevent, arrived at through the safety check.
+    @Test func aDeleteStillUnlinksAnUnindexedCompanion() async throws {
+        let raw = try tree.file("lib/IMG_0001.CR2", bytes: 64)
+        let sidecar = try tree.file("lib/IMG_0001.xmp", bytes: 6)
+        let store = try IndexStore.inMemory()
+        try index(raw, into: store)
+        // The sidecar has no row, which is the ordinary state of a sidecar.
+        #expect(try store.record(atPath: sidecar.path) == nil)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .delete, sources: [raw], destination: nil)
+        #expect(plan.items[0].companions == [sidecar])
+
+        let results = try await op.execute(plan)
+
+        #expect(results[0].outcome == .completed)
+        #expect(!exists(raw))
+        #expect(!exists(sidecar))
+        #expect(try store.journalRows(batchID: plan.batchID).map(\.state)
+                    == [.complete, .complete])
+        #expect(try store.record(atPath: raw.path) == nil)
+    }
+
     /// **A source that is already gone is not a mismatch.** Something else
     /// removed it between the copy and the unlink — and "gone from the source,
     /// present at the destination" is the finished shape of a move, not a reason
