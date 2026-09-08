@@ -378,7 +378,13 @@ struct FileOperationFailureExplanationTests {
         .sourceVanished, .permissionDenied, .destinationReadOnly, .diskFull,
         .volumeUnmounted, .copyIncomplete, .trashURLNotRecorded("detail"),
         .rollbackIncomplete("detail"), .sourceRemovalFailed,
-        .destinationNotReplaceable, .indexWriteFailed("detail"), .other("detail"),
+        .destinationNotReplaceable, .indexWriteFailed("detail"),
+        // The undo-only pair (#6). Listed here because this test is the whole
+        // reason the list is hand-written, and it did *not* catch these two
+        // arriving without a sentence — `explanation` simply stopped compiling,
+        // which is a different guard and one a `default:` clause would remove.
+        .modifiedSinceOperation, .trashEmptied,
+        .other("detail"),
     ]
 
     @Test func everyFailureHasASentenceAndNoneOfThemIsTheDefault() {

@@ -150,6 +150,63 @@ final class BrowserModel {
     /// data loss: the window would just quietly open onto an empty grid.
     private(set) var didRebuildIndex = false
 
+    // MARK: - Text focus
+
+    /// One of the window's text fields.
+    ///
+    /// Named rather than counted so each field only ever reports about itself —
+    /// see `setEditing(_:_:)`. Add a case when a field is added; a field that
+    /// forgets to report leaves ⌘Z routed to the grid while the user is typing
+    /// in it, which is `HANDOFF` §7.6's second ⌘Z check.
+    enum TextField: Hashable, Sendable, CaseIterable {
+        /// `PathBarView`'s filename search.
+        case search
+        /// `FilterPanelView`'s exact-size pair.
+        case exactWidth
+        case exactHeight
+    }
+
+    /// Which text fields are being edited right now.
+    ///
+    /// **A set, not a `Bool`, and this is load-bearing.** Focus moving from one
+    /// field to another produces two reports, and SwiftUI does not promise the
+    /// blur arrives before the focus: with a single flag, the field that just
+    /// lost focus can clear what the field that gained it has already set, and
+    /// for that window ⌘Z is routed to the grid while the user is typing. Each
+    /// field reporting only about itself cannot express that ordering at all.
+    private(set) var editingFields: Set<TextField> = []
+
+    /// Whether ⌘Z belongs to a text field rather than to the grid.
+    ///
+    /// **Two measurements produced this property**; both are written out in
+    /// `HANDOFF` §8, which is where the tables live.
+    ///
+    /// The first ruled out routing ⌘Z the way ⌘A is routed: `NSWindow`
+    /// implements `undo:` through its own `NSUndoManager`, so asking the
+    /// responder chain answers "handled" whenever any window is key, whatever
+    /// is focused — and a guard on that swallowed every ⌘Z.
+    ///
+    /// The second ruled out asking `NSApp.keyWindow?.firstResponder` instead:
+    /// that is not observable state, so a SwiftUI body reading it gains no
+    /// dependency on it and the Undo command's enabled state was decided by
+    /// whatever invalidated the command last rather than by where focus was.
+    ///
+    /// Hence observable state the views publish. Focus moving invalidates the
+    /// command body, which is the only thing that makes the enabled state
+    /// honest, and there is no `NSApp` read left to disagree with it.
+    var isEditingText: Bool { !editingFields.isEmpty }
+
+    /// Reports one field's focus. Called by the views through
+    /// `View.reportingTextFocus(_:isFocused:to:)`.
+    func setEditing(_ field: TextField, _ isEditing: Bool) {
+        var updated = editingFields
+        if isEditing { updated.insert(field) } else { updated.remove(field) }
+        // Compared rather than assigned unconditionally: this is observed by
+        // the menu, and a keystroke that changed nothing about focus must not
+        // invalidate the command body.
+        if updated != editingFields { editingFields = updated }
+    }
+
     /// Which rows are selected. `SelectionModel` lives in `Core`; this is just
     /// where the window keeps its copy.
     var selection = SelectionModel()
@@ -408,8 +465,9 @@ final class BrowserModel {
     /// The one sheet this window is showing. See `ActiveSheet`.
     var activeSheet: ActiveSheet?
 
-    /// The last batch that changed anything, for #6's ⌘Z. Never a permanent
-    /// delete — see `CompletedBatch`. Written only by `finish`.
+    /// The last batch that changed anything, for ⌘Z. Never a permanent delete —
+    /// see `CompletedBatch`. Written by `finish` and `finishUndo`, and nowhere
+    /// else; `finishUndo`'s write is what makes the next press the redo.
     var lastCompletedBatch: CompletedBatch?
 
     /// The menu title ⌘Z should carry. "Undo" with nothing to undo, so the

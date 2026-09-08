@@ -41,18 +41,32 @@ extension BrowserModel {
     /// against a real selection.
     func isEnabled(_ command: FileCommand) -> Bool {
         guard !selection.selected.isEmpty else { return false }
-        // Not "queue it up": two batches interleaving index writes over the
-        // same rows is the one thing the journal ordering cannot describe.
-        guard !isBatchRunning else { return false }
-        // **A SwiftUI sheet is not run-loop modal.** A menu key equivalent is
-        // matched by the menu bar whatever is on screen, so ⌘⌫ pressed over the
-        // collision sheet reaches this command and starts a trash batch — whose
-        // `run` overwrites `activeSheet` with `.progress`, discarding the
-        // half-answered plan behind it with no way back. The sheets are
-        // questions the window is waiting on; nothing else may act until one is
-        // answered.
-        return activeSheet == nil
+        return canStartWork
     }
+
+    /// Whether the window is free to start work at all.
+    ///
+    /// Shared by the four batch commands and by ⌘Z, which differ only in what
+    /// else they need — a selection for the first, something to reverse for the
+    /// second.
+    ///
+    /// Two conditions. Not "queue it up" for the first: two batches
+    /// interleaving index writes over the same rows is the one thing the
+    /// journal ordering cannot describe. And **a SwiftUI sheet is not run-loop
+    /// modal** for the second: a menu key equivalent is matched by the menu bar
+    /// whatever is on screen, so ⌘⌫ pressed over the collision sheet would
+    /// reach Move to Trash and start a batch — whose `run` overwrites
+    /// `activeSheet` with `.progress`, discarding the half-answered plan behind
+    /// it with no way back. The sheets are questions the window is waiting on;
+    /// nothing else may act until one is answered.
+    var canStartWork: Bool { !isBatchRunning && activeSheet == nil }
+
+    /// Whether ⌘Z has something to reverse.
+    ///
+    /// No selection required, unlike the batch commands: undo acts on the last
+    /// batch, not on what happens to be highlighted now — and after a trash or
+    /// a move out of scope there is nothing highlighted at all.
+    var canUndo: Bool { lastCompletedBatch != nil && canStartWork }
 
     /// The selected photos as file URLs, in display order.
     var selectedURLs: [URL] {
@@ -104,11 +118,59 @@ extension BrowserModel {
                          destination: summary.destinationDirectory)
     }
 
+    // MARK: - Undo
+
+    /// ⌘Z: reverses the last batch this window completed, or says why it cannot.
+    ///
+    /// **Asks before acting.** `FileOperator.undoability(of:)` is consulted
+    /// first and its refusal is shown, because the refusal that matters —
+    /// a permanent delete — is worthless after the fact. `undo(batch:)` would
+    /// throw the same refusal before touching anything, so the pre-check is not
+    /// what makes this safe; it is what makes it *explicable*. A ⌘Z that
+    /// silently did nothing would read as a broken menu item.
+    ///
+    /// The reversal runs as an ordinary batch — its own `batch_id`, its own
+    /// journal rows, the same progress sheet and the same summary — which is
+    /// also why redo needs nothing further: `lastCompletedBatch` becomes the
+    /// reversal, and reversing *that* is the redo.
+    func undoLastBatch() async {
+        guard let batch = lastCompletedBatch, canStartWork else { return }
+        isBatchStarting = true
+        let op = fileOperator
+        do {
+            let undoability = try await op.undoability(of: batch.batchID)
+            guard undoability.isUndoable else {
+                isBatchStarting = false
+                await present(.summary(OperationSummary(
+                    kind: batch.kind, destinationDirectory: nil,
+                    planningFailure: Self.describe(refusal: undoability.refusal))))
+                return
+            }
+            await runUndo(batch, undoability: undoability)
+        } catch {
+            isBatchStarting = false
+            await present(.summary(OperationSummary(
+                kind: batch.kind, destinationDirectory: nil,
+                planningFailure: Self.describe(planningError: error))))
+        }
+    }
+
     /// Dismisses whatever sheet is up, abandoning it. The batch itself is
     /// stopped with `cancelBatch()`; this only closes a question.
     func dismissSheet() {
         activeSheet = nil
     }
+
+    /// Whether there is a batch in flight for Stop to act on.
+    ///
+    /// Not the same as `isBatchRunning`, and the gap is real: `run` presents the
+    /// progress sheet before it has a `Task`, so for the length of that
+    /// presentation `cancelBatch()` would be a silent no-op on a live-looking
+    /// button. Reordering was the other option and is worse — the `Task` would
+    /// then be able to finish and present the summary *before* `present(.progress)`
+    /// ran, leaving a progress sheet over a finished batch. A briefly disabled
+    /// Stop is the honest reading: there is nothing to stop yet.
+    var canCancelBatch: Bool { batchTask != nil }
 
     /// Stops the batch after the item it is on.
     ///
@@ -179,6 +241,42 @@ extension BrowserModel {
 
     // MARK: - Running
 
+    /// A progress handler for the batch identified by `token`.
+    ///
+    /// Built outside the `Task` that uses it, so its `[weak self]` weakly
+    /// captures the model itself: a capture list nested inside another
+    /// closure's `[weak self]` would be weakening an already-optional binding,
+    /// which is not a thing.
+    ///
+    /// Hopped, not assigned: the handler is called on the operator's own queue,
+    /// once per finished item, and `batchProgress` is main-actor state. The
+    /// token is what stops a report from the batch that just finished landing
+    /// on the one that just started — see `batchToken`.
+    private func progressHandler(kind: FileOperationKind,
+                                 token: Int) -> FileOperator.ProgressHandler {
+        { [weak self] completed, total, current in
+            Task { @MainActor in
+                guard let self, self.batchToken == token else { return }
+                self.batchProgress = BatchProgress(kind: kind, completed: completed,
+                                                   total: total, current: current)
+            }
+        }
+    }
+
+    /// Takes the window out of "a batch is running".
+    ///
+    /// The token is bumped **before** the progress is cleared, so a callback
+    /// still in flight for this batch cannot resurrect the indicator it belongs
+    /// to. One copy, because both endings need the same four assignments in the
+    /// same order and a drifting second copy is how the indicator outlives its
+    /// batch.
+    private func endBatch() {
+        batchToken += 1
+        batchProgress = nil
+        batchTask = nil
+        isBatchStarting = false
+    }
+
     private func run(_ plan: FileOperationPlan) async {
         batchToken += 1
         let token = batchToken
@@ -187,20 +285,7 @@ extension BrowserModel {
         await present(.progress)
 
         let op = fileOperator
-        // Built here rather than inline in the `Task` below, so its `[weak
-        // self]` weakly captures the model itself: a capture list nested inside
-        // another closure's `[weak self]` would be weakening an already-optional
-        // binding, which is not a thing.
-        //
-        // Hopped, not assigned: the handler is called on the operator's own
-        // queue, once per finished item, and `batchProgress` is main-actor state.
-        let onProgress: FileOperator.ProgressHandler = { [weak self] completed, total, current in
-            Task { @MainActor in
-                guard let self, self.batchToken == token else { return }
-                self.batchProgress = BatchProgress(kind: plan.kind, completed: completed,
-                                                   total: total, current: current)
-            }
-        }
+        let onProgress = progressHandler(kind: plan.kind, token: token)
         let task = Task { [weak self] in
             do {
                 let results = try await op.execute(plan, onProgress: onProgress)
@@ -221,19 +306,17 @@ extension BrowserModel {
     /// Puts the window back together after a batch.
     private func finish(_ plan: FileOperationPlan, results: [FileOperationResult],
                         cancelled: Bool, planningFailure: String? = nil) async {
-        // Bumped before the progress is cleared, so a callback still in flight
-        // for this batch cannot resurrect the indicator it belongs to.
-        batchToken += 1
-        batchProgress = nil
-        batchTask = nil
-        isBatchStarting = false
+        endBatch()
 
         let completed = results.filter(\.isCompleted)
         // A permanent delete is never remembered: nothing can undo it, and an
         // Undo item offering to is a lie with the worst possible payload.
         if !completed.isEmpty, plan.kind != .delete {
+            // `isReversal: false` — a batch the user asked for directly, so the
+            // next ⌘Z undoes it rather than redoing anything. Only `finishUndo`
+            // ever sets that flag.
             lastCompletedBatch = CompletedBatch(batchID: plan.batchID, kind: plan.kind,
-                                                results: completed)
+                                                results: completed, isReversal: false)
         }
 
         // The index already knows. See this extension's own documentation for
@@ -241,19 +324,141 @@ extension BrowserModel {
         await reload()
         follow(plan: plan, completed: completed)
 
+        await presentSummary(kind: plan.kind,
+                             destinationDirectory: plan.destinationDirectory,
+                             results: results, cancelled: cancelled,
+                             planningFailure: planningFailure)
+    }
+
+    /// The tail both a batch and an undo end with.
+    ///
+    /// Shown only when something failed. A run that did what it was told does
+    /// not need a sheet dismissed before the user can carry on — and that
+    /// includes a clean cancel; see `OperationSummary.wasCancelled`.
+    private func presentSummary(kind: FileOperationKind, destinationDirectory: URL?,
+                                results: [FileOperationResult], cancelled: Bool,
+                                planningFailure: String?) async {
         if let planningFailure {
             await present(.summary(OperationSummary(
-                kind: plan.kind, destinationDirectory: plan.destinationDirectory,
+                kind: kind, destinationDirectory: destinationDirectory,
                 planningFailure: planningFailure)))
             return
         }
-        let summary = OperationSummary(kind: plan.kind,
-                                       destinationDirectory: plan.destinationDirectory,
+        let summary = OperationSummary(kind: kind,
+                                       destinationDirectory: destinationDirectory,
                                        results: results, wasCancelled: cancelled)
-        // Shown only when something failed. A batch that did what it was told
-        // does not need a sheet dismissed before the user can carry on — and
-        // that includes a clean cancel; see `OperationSummary.wasCancelled`.
         await present(summary.failures.isEmpty ? nil : .summary(summary))
+    }
+
+    // MARK: - Running an undo
+
+    /// The reversal, driven exactly as a batch is: same token discipline, same
+    /// progress sheet, same cancel, same summary.
+    ///
+    /// Separate from `run(_:)` rather than folded into it because the two
+    /// differ in what they await and in what they leave behind — an undo has no
+    /// plan, no destination directory, and a different rule for the selection.
+    /// What they must not differ in is the state discipline around the batch,
+    /// which is why `present(_:)`, `batchToken` and `batchTask` are used here in
+    /// the same order and for the same reasons; see `run(_:)`.
+    private func runUndo(_ batch: CompletedBatch, undoability: BatchUndoability) async {
+        batchToken += 1
+        let token = batchToken
+        // **`batch.kind` wins once this is already a reversal.** `undoability`
+        // reads the journal of the batch being undone, and a reversal's rows
+        // are the machinery rather than the user's operation — undoing a copy
+        // trashes, so the second press would read `.trash` and the item would
+        // offer "Undo Trash 3 Items" for what the user knows as a copy. See
+        // `CompletedBatch.kind`, which exists to say exactly this.
+        let kind = batch.isReversal ? batch.kind : (undoability.kind ?? batch.kind)
+        batchProgress = BatchProgress(kind: kind, completed: 0,
+                                      total: undoability.items, current: nil)
+        await present(.progress)
+
+        let op = fileOperator
+        let onProgress = progressHandler(kind: kind, token: token)
+        let task = Task { [weak self] in
+            do {
+                let undone = try await op.undo(batch: batch.batchID, onProgress: onProgress)
+                await self?.finishUndo(batch, kind: kind, reversalID: undone.batchID,
+                                       results: undone.results, cancelled: false)
+            } catch FileOperatorError.cancelled(let completed) {
+                // A cancelled undo has put real files back, journalled under a
+                // reversal id this side never learns — `undo` only returns it
+                // on the way out — so `lastCompletedBatch` still names the
+                // original batch.
+                //
+                // **That batch is still `complete` and still undoable**, and
+                // pressing ⌘Z again re-runs the *whole* reversal: the items
+                // already restored have no source left to move and come back as
+                // per-item failures, while the rest are restored. Noisy — a
+                // summary sheet listing failures for work that actually
+                // succeeded — but it finishes the job and loses nothing, which
+                // is why it is left alone rather than refused. Asserted by
+                // `aSecondUndoAfterACancelledOneFinishesTheJobNoisily`, down to
+                // the failure count.
+                //
+                // The reason differs by what was reversed, because `reverse`
+                // reports a missing source by where it was looking
+                // (`step.fromTrash`): `sourceVanished` after a move or a copy,
+                // `trashEmptied` when the batch being reversed was a trash and
+                // the file is already out of the Trash. The test covers the
+                // move; the trash leg is read off `FileOperator+Undo`, not
+                // measured here.
+                // Refusing would mean tracking a reversal id that the
+                // cancellation path does not produce, to prevent a second press
+                // that repairs the state.
+                await self?.finishUndo(batch, kind: kind, reversalID: nil,
+                                       results: completed, cancelled: true)
+            } catch let refusal as UndoRefusal {
+                await self?.finishUndo(batch, kind: kind, reversalID: nil, results: [],
+                                       cancelled: false,
+                                       planningFailure: Self.describe(refusal: refusal))
+            } catch {
+                await self?.finishUndo(batch, kind: kind, reversalID: nil, results: [],
+                                       cancelled: false,
+                                       planningFailure: Self.describe(planningError: error))
+            }
+        }
+        batchTask = task
+        await task.value
+    }
+
+    /// Puts the window back together after an undo.
+    ///
+    /// `finish`'s counterpart, and it differs in exactly two places: what it
+    /// remembers for the *next* ⌘Z — the reversal, with the flag flipped, which
+    /// is the whole of the redo mechanism — and that the selection empties
+    /// rather than following anything. `reversalID` is nil when there is
+    /// nothing to remember: a refusal, or a cancellation, which never learns
+    /// the id.
+    private func finishUndo(_ batch: CompletedBatch, kind: FileOperationKind,
+                            reversalID: String?, results: [FileOperationResult],
+                            cancelled: Bool, planningFailure: String? = nil) async {
+        endBatch()
+
+        let completed = results.filter(\.isCompleted)
+        // The reversal becomes what ⌘Z offers next, with the flag flipped so it
+        // is offered as the redo. Only when the reversal is known and did
+        // something: a refused or cancelled undo leaves the original standing,
+        // which is what the user would press ⌘Z for next anyway.
+        if let reversalID, !completed.isEmpty {
+            lastCompletedBatch = CompletedBatch(batchID: reversalID, kind: kind,
+                                                results: completed,
+                                                isReversal: !batch.isReversal)
+        }
+
+        await reload()
+        // **Emptied, not followed.** An undo is the one run whose items do not
+        // share a direction: undoing a copy trashes files while undoing a move
+        // restores them, and a reversal can put photos back into folders that
+        // are not on screen at all. A selection that is right for some of them
+        // and wrong for the rest is worse than none, and the grid has just been
+        // reloaded so the user can see where everything landed.
+        selection.clear()
+
+        await presentSummary(kind: kind, destinationDirectory: nil, results: results,
+                             cancelled: cancelled, planningFailure: planningFailure)
     }
 
     /// What the selection means once the files have moved.
@@ -287,6 +492,45 @@ extension BrowserModel {
     }
 
     // MARK: - Wording
+
+    /// The sentence for an undo the operator will not perform.
+    ///
+    /// Here rather than on `UndoRefusal` in `Core`, for the same reason
+    /// `FileOperatorError`'s wording is here: a refusal is a pre-flight answer
+    /// to a caller, not a per-item outcome shown in a list. The distinction
+    /// that decides it is whether the string ends up in the summary sheet's
+    /// *rows* — those are `FileOperationFailure.explanation`, which is `Core`'s
+    /// because only `Core` knows why its cases differ — or in its headline,
+    /// which is window copy.
+    ///
+    /// Exhaustive with no `default`, deliberately: a case added by a later
+    /// `Core` change must fail to compile here rather than reach the user as an
+    /// empty sheet.
+    static func describe(refusal: UndoRefusal?) -> String {
+        switch refusal {
+        case nil:
+            // Unreachable — the caller checks `isUndoable` first — but a
+            // fatalError in a menu action is not a trade worth making.
+            return "That operation can be undone."
+        case .noSuchBatch:
+            return "There is no record of that operation any more, so it cannot be undone."
+        case .permanentDelete:
+            return "That operation deleted files permanently. Unlinking a file cannot "
+                + "be reversed, which is why it asked first."
+        case .unsettled(let rows):
+            return "\(rows) step\(rows == 1 ? "" : "s") of that operation never recorded "
+                + "what they did, so reversing it could act on files that never moved."
+        case .reconciledAfterACrash(let rows):
+            return "\(rows) step\(rows == 1 ? "" : "s") of that operation were worked out "
+                + "from the disk after an interrupted run rather than recorded as they "
+                + "happened. Reversing a reconstruction can lose a file, so it is refused."
+        case .someItemsFailed(let rows):
+            return "That operation had \(rows) failure\(rows == 1 ? "" : "s"), so it is not "
+                + "one reversible unit. The items that succeeded stay where they are."
+        case .nothingToUndo:
+            return "Nothing in that operation was attempted, so there is nothing to reverse."
+        }
+    }
 
     /// The sentence for a batch that never started.
     ///

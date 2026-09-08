@@ -161,9 +161,13 @@ private struct BatchProgressSheet: View {
 
             HStack {
                 Spacer()
+                // `canCancelBatch`, not `batchProgress != nil`: the sheet is
+                // presented a moment before the batch has a `Task`, and a live
+                // button that silently does nothing is worse than one that is
+                // briefly off.
                 Button("Stop After This Item") { model.cancelBatch() }
                     .keyboardShortcut(.cancelAction)
-                    .disabled(model.batchProgress == nil)
+                    .disabled(!model.canCancelBatch)
             }
         }
         .padding(20)

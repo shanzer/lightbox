@@ -27,6 +27,21 @@ struct LightboxApp: App {
                 FileOperationCommands()
             }
 
+            // ⌘Z. `replacing:` and not `after:`, for exactly the reason the
+            // pasteboard group below is replaced: SwiftUI's stock Undo already
+            // carries ⌘Z, and AppKit resolves two items sharing one key
+            // equivalent by stripping it off the *custom* one. `UndoMenuTests`
+            // asserts the shortcut is on our item and that nothing else claims
+            // it.
+            //
+            // No Redo goes back. Undoing an undo *is* the redo — `Core`
+            // journals a reversal as an ordinary batch, so it needs no history
+            // state — and the single item's title says which of the two the
+            // next press will do.
+            CommandGroup(replacing: .undoRedo) {
+                UndoCommand()
+            }
+
             // ⌘A as a menu command rather than as `.onKeyPress(keys: ["a"])` on
             // the grid. A key equivalent is matched by the menu bar in
             // `performKeyEquivalent`, before the event ever reaches the focused
@@ -191,15 +206,6 @@ struct FileOperationCommands: View {
 
         item(.trash)
         item(.deletePermanently)
-
-        // No Undo item here. #6 owns ⌘Z, and the hook it attaches to —
-        // `BrowserModel.lastCompletedBatch` and `undoMenuTitle` — already
-        // exists. A disabled stub would have to be a second item titled
-        // "Undo", and the Edit menu already carries one from SwiftUI's
-        // `.undoRedo` group: two items sharing ⌘Z is precisely the collision
-        // that left ⌘A mouse-only, because AppKit resolves it by stripping the
-        // key equivalent off the *custom* item. #6 replaces the stock group,
-        // gated on the grid having focus the same way Select All is.
     }
 
     @ViewBuilder
@@ -252,5 +258,134 @@ struct FileOperationCommands: View {
         case .deletePermanently:
             model.confirmPermanentDelete()
         }
+    }
+}
+
+/// Where a ⌘Z goes, and the act of sending it there.
+///
+/// A named type rather than a closure inside the `Button`, because the routing
+/// decision is the part that was wrong and the part no test could reach: the
+/// menu item's action needs a key window to exercise, and `xcodebuild test`
+/// does not provide one. `destination(isEditingText:canUndo:)` is a pure
+/// function of two booleans and `run` takes the decision as an argument, so
+/// both branches are testable with no window at all — and, since the focus flag
+/// moved onto `BrowserModel`, so is the decision the menu actually makes.
+/// `UndoRoutingTests` drives all of it without a key window.
+enum UndoCommandAction {
+    enum Destination: Equatable {
+        /// The field editor's own undo. It wins whenever text is being edited,
+        /// even if the grid also has a batch to reverse — ⌘Z belongs to the
+        /// thing being typed in.
+        case textEditing
+        /// The focused window's last batch.
+        case model
+        /// Nothing to undo anywhere; the item is greyed out.
+        case nowhere
+    }
+
+    /// The item's title, which **must agree with where the press will go**.
+    ///
+    /// `BrowserModel.undoMenuTitle` describes the last batch and knows nothing
+    /// about focus, so naming it unconditionally meant a window with a batch
+    /// behind it and the search field focused read "Undo Move 3 Items" while
+    /// ⌘Z undid typing. That is the single claim the one-item, no-Redo design
+    /// rests on — the title says which of the two the next press does — and it
+    /// was false in exactly the state four rounds of review were about.
+    ///
+    /// A free function of the destination and the string, so the rule is
+    /// assertable without a window.
+    static func title(for destination: Destination, undoTitle: String?) -> String {
+        guard destination == .model, let undoTitle else { return "Undo" }
+        return undoTitle
+    }
+
+    static func destination(isEditingText: Bool, canUndo: Bool) -> Destination {
+        if isEditingText { return .textEditing }
+        return canUndo ? .model : .nowhere
+    }
+
+    /// The decision for a window, read off observable state.
+    ///
+    /// **`BrowserModel.isEditingText`, not `NSApp`.** The first version asked
+    /// `NSApp.keyWindow?.firstResponder` here, which is not observable: SwiftUI
+    /// never re-evaluated the command body when focus moved into a text field,
+    /// so `.disabled` was decided at launch and stayed decided. The item was
+    /// therefore greyed out while the user typed, and a disabled menu item
+    /// still consumes its key equivalent — so ⌘Z in the search field did
+    /// nothing at all, which is the harm the routing exists to prevent, moved
+    /// from the action into the enabled state. The views publish their focus
+    /// into the model instead; see `BrowserModel.setEditing(_:_:)`.
+    @MainActor
+    static func destination(for model: BrowserModel?) -> Destination {
+        destination(isEditingText: model?.isEditingText ?? false,
+                    canUndo: model?.canUndo ?? false)
+    }
+
+    /// Sends the ⌘Z, and says where it went.
+    ///
+    /// The `Task` for the model branch is handed back rather than dropped so a
+    /// test can await the undo it started. The menu ignores it: the UI must not
+    /// block on a batch.
+    /// Sends a ⌘Z for `model`, deciding from its own state. **What the menu
+    /// calls.** The overload below takes the decision instead, which is what
+    /// tests drive.
+    @MainActor
+    @discardableResult
+    static func run(model: BrowserModel?,
+                    forward: @MainActor (String) -> Bool = LightboxApp.forwardToResponder)
+        -> (destination: Destination, work: Task<Void, Never>?) {
+        run(isEditingText: model?.isEditingText ?? false, model: model, forward: forward)
+    }
+
+    /// Sends a ⌘Z with the routing decision handed in, and says where it went.
+    ///
+    /// The decision is a parameter so both branches are reachable without a key
+    /// window — the shipping path went untested through a whole review cycle for
+    /// want of exactly this. The `Task` for the model branch is handed back
+    /// rather than dropped so a test can await the undo it started; the menu
+    /// ignores it, because the UI must not block on a batch.
+    @MainActor
+    @discardableResult
+    static func run(isEditingText: Bool, model: BrowserModel?,
+                    forward: @MainActor (String) -> Bool = LightboxApp.forwardToResponder)
+        -> (destination: Destination, work: Task<Void, Never>?) {
+        switch destination(isEditingText: isEditingText, canUndo: model?.canUndo ?? false) {
+        case .textEditing:
+            _ = forward("undo:")
+            return (.textEditing, nil)
+        case .model:
+            // `model` is non-nil by construction — a nil one makes `canUndo`
+            // false and the destination `.nowhere` — but an enum case cannot
+            // carry that, and trapping in a menu action to prove a point is not
+            // a trade worth making. Reported as `.nowhere`, which is what a
+            // press with no window does.
+            guard let model else { return (.nowhere, nil) }
+            return (.model, Task { await model.undoLastBatch() })
+        case .nowhere:
+            return (.nowhere, nil)
+        }
+    }
+}
+
+/// ⌘Z, for the grid or for whatever is editing text.
+///
+/// The item replaces SwiftUI's stock Undo, so it is the *only* ⌘Z in the app:
+/// AppKit binds none of its own, and a text field's undo is reachable through
+/// an Edit-menu item and nothing else. That is why the item may not simply be
+/// disabled when the grid has nothing to reverse, and why the action routes
+/// rather than assuming — see `BrowserModel.isEditingText` for the two
+/// measurements that settled how.
+struct UndoCommand: View {
+    @FocusedValue(\.browserModel) private var model
+
+    var body: some View {
+        // Computed once and used for all three, so the title, the enabled state
+        // and the action cannot disagree about where the press is going.
+        let destination = UndoCommandAction.destination(for: model)
+        Button(UndoCommandAction.title(for: destination, undoTitle: model?.undoMenuTitle)) {
+            UndoCommandAction.run(model: model)
+        }
+        .keyboardShortcut("z", modifiers: .command)
+        .disabled(destination == .nowhere)
     }
 }

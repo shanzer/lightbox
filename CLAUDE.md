@@ -79,8 +79,8 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 610 tests. No AppKit/SwiftUI.
-App/      Lightbox.xcodeproj — SwiftUI shell over Core; 63 tests. Depends on Core as ../Core.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 613 tests. No AppKit/SwiftUI.
+App/      Lightbox.xcodeproj — SwiftUI shell over Core; 100 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
 ```

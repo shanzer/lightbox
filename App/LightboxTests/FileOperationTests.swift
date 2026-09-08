@@ -547,3 +547,296 @@ struct CollisionSheetTests {
         #expect(sheet.plan.items[1].destination?.lastPathComponent == "IMG_0001 2.jpg")
     }
 }
+
+// MARK: - Undo
+
+/// ⌘Z, through the model. `Core`'s `FileOperatorUndoTests` prove the reversal
+/// itself; what is asserted here is that the window asks for it, survives it,
+/// and comes back describing the right thing.
+@MainActor
+struct UndoTests {
+    let tree: TempDirectory
+    let preferences = MemoryPreferences()
+
+    init() throws { tree = try TempDirectory() }
+
+    private func model(_ store: IndexStore) -> BrowserModel {
+        BrowserModel(store: store, preferences: preferences)
+    }
+
+    /// The wiring test: move three files, undo, and everything is back —
+    /// on disk, in the index, and in what the next ⌘Z offers to do.
+    ///
+    /// Verified by mutation: making `undoLastBatch` return without calling
+    /// `FileOperator.undo` turns this red on the first assertion.
+    @Test func undoingAMovePutsTheFilesBackOnDiskAndInTheIndex() async throws {
+        let root = try tree.directory("library")
+        let names = ["IMG_0001.jpg", "IMG_0002.jpg", "IMG_0003.jpg"]
+        let sources = try names.map { try tree.file("library/from/\($0)", bytes: 64) }
+        let destination = try tree.directory("library/to")
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+
+        await model.open(root)
+        #expect(model.records.count == 3)
+        model.selectAll()
+        await model.beginBatch(.move, destination: destination)
+
+        let forward = try #require(model.lastCompletedBatch)
+        #expect(forward.completedCount == 3)
+        #expect(model.undoMenuTitle == "Undo Move 3 Items")
+        #expect(sources.allSatisfy { !exists($0) }, "the move did not happen")
+        #expect(model.canUndo)
+
+        // **Through the menu action, not `undoLastBatch()` directly.**
+        // `UndoCommandAction.run` is the only code a user's ⌘Z executes, and
+        // the first version of it swallowed every press without any test
+        // noticing — because every test called the model straight.
+        let outcome = UndoCommandAction.run(isEditingText: false, model: model)
+        #expect(outcome.destination == .model)
+        await outcome.work?.value
+
+        // On disk.
+        for source in sources {
+            #expect(exists(source), "\(source.lastPathComponent) did not come back")
+        }
+        let leftBehind = try FileManager.default
+            .contentsOfDirectory(atPath: destination.path)
+            .filter { !$0.hasPrefix(".") }
+        #expect(leftBehind.isEmpty, "the destination still holds \(leftBehind)")
+
+        // In the index. The grid is reloaded from it, so these are the same
+        // claim twice — deliberately, because a row that survived at the old
+        // path is invisible in `records` and lethal to duplicate detection.
+        for source in sources {
+            #expect(try store.record(atPath: source.path) != nil,
+                    "no row for \(source.lastPathComponent) at its restored path")
+            #expect(try store.record(
+                atPath: destination.appendingPathComponent(source.lastPathComponent).path) == nil,
+                    "a row survived at the destination \(source.lastPathComponent) left")
+        }
+        #expect(model.records.count == 3)
+        #expect(Set(model.records.map(\.path)) == Set(sources.map(\.path)))
+
+        // And the next ⌘Z is the redo, named as one.
+        let reversal = try #require(model.lastCompletedBatch)
+        #expect(reversal.batchID != forward.batchID,
+                "the reversal was journalled under the batch it reversed")
+        #expect(reversal.isReversal)
+        #expect(reversal.completedCount == 3)
+        #expect(model.undoMenuTitle == "Redo Move 3 Items")
+        #expect(model.activeSheet == nil, "a clean undo put a sheet on screen")
+        #expect(model.selection.selected.isEmpty, "the selection survived an undo")
+    }
+
+    /// Undoing a **copy** still calls itself a copy — on the second press too.
+    ///
+    /// `Core` reverses a copy by trashing it, so the reversal's journal rows say
+    /// `.trash`. The first press cannot show the drift: the kind is read off the
+    /// *forward* batch, which really was a copy. It is the **second** press that
+    /// reads `undoability` for the reversal and gets `.trash` back, titling the
+    /// item "Undo Trash 3 Items" — naming the machinery instead of the thing the
+    /// user did. `CompletedBatch.kind` exists to carry the user's word through,
+    /// and pressing twice is the only way to assert that it does. (The
+    /// single-press version of this test passed with the bug in place.)
+    ///
+    /// The round trip is worth having for itself: copy → undo → redo, with the
+    /// copies trashed and then restored, is the redo path end to end.
+    @Test func undoingACopyIsStillNamedACopyAcrossARedo() async throws {
+        let root = try tree.directory("library")
+        let names = ["a.jpg", "b.jpg", "c.jpg"]
+        for name in names { try tree.file("library/from/\(name)", bytes: 32) }
+        let destination = try tree.directory("library/to")
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+        var batchIDs: [String] = []
+        defer { for id in batchIDs { emptyTrash(of: store, batchID: id) } }
+
+        await model.open(root)
+        model.selection.selectAll(model.records.compactMap {
+            $0.path.contains("/from/") ? $0.id : nil
+        })
+        #expect(model.selection.selected.count == 3)
+        await model.beginBatch(.copy, destination: destination)
+        #expect(model.undoMenuTitle == "Undo Copy 3 Items")
+        #expect(names.allSatisfy { exists(destination.appendingPathComponent($0)) })
+
+        // Press one: the copies go to the Trash, the originals stay.
+        let undo = UndoCommandAction.run(isEditingText: false, model: model)
+        #expect(undo.destination == .model)
+        await undo.work?.value
+        batchIDs.append(try #require(model.lastCompletedBatch?.batchID))
+
+        for name in names {
+            #expect(!exists(destination.appendingPathComponent(name)),
+                    "\(name) is still at the destination")
+            #expect(exists(root.appendingPathComponent("from/\(name)")),
+                    "undoing the copy took the original \(name)")
+        }
+        #expect(model.undoMenuTitle == "Redo Copy 3 Items")
+
+        // Press two: the redo. This is where the kind would drift to `.trash`.
+        let redo = UndoCommandAction.run(isEditingText: false, model: model)
+        #expect(redo.destination == .model)
+        await redo.work?.value
+        batchIDs.append(try #require(model.lastCompletedBatch?.batchID))
+
+        for name in names {
+            #expect(exists(destination.appendingPathComponent(name)),
+                    "the redo did not put the copy of \(name) back")
+        }
+        #expect(model.undoMenuTitle == "Undo Copy 3 Items",
+                "the title names the machinery rather than the operation")
+    }
+
+    /// What a **second** ⌘Z does after the first one was cancelled.
+    ///
+    /// The claim the comment on `runUndo`'s cancellation branch makes, asserted
+    /// rather than reasoned. A cancelled undo journals under a reversal id this
+    /// side never learns, so `lastCompletedBatch` still names the original —
+    /// whose rows `FileOperator.undo` never touched, so it is still `complete`
+    /// and still undoable. Pressing again therefore re-runs the *whole*
+    /// reversal: the items the first attempt already restored have no source
+    /// left to move, and come back as per-item failures while the rest are
+    /// restored.
+    ///
+    /// Noisy, and deliberately not refused — the second press finishes the job.
+    /// The point of the test is that "noisy" is the worst of it: nothing is
+    /// lost, and every file ends up back where it started.
+    @Test func aSecondUndoAfterACancelledOneFinishesTheJobNoisily() async throws {
+        let total = 120
+        let root = try tree.directory("library")
+        var sources: [URL] = []
+        for index in 0..<total {
+            sources.append(try tree.file(String(format: "library/from/IMG_%04d.jpg", index),
+                                         bytes: 16))
+        }
+        let destination = try tree.directory("library/to")
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+
+        await model.open(root)
+        model.selectAll()
+        await model.beginBatch(.move, destination: destination)
+        #expect(model.lastCompletedBatch?.completedCount == total)
+
+        // First press, cancelled as soon as it has restored something.
+        let first = UndoCommandAction.run(isEditingText: false, model: model)
+        let deadline = Date().addingTimeInterval(10)
+        while (model.batchProgress?.completed ?? 0) < 1, Date() < deadline {
+            await Task.yield()
+        }
+        model.cancelBatch()
+        await first.work?.value
+
+        let restoredByFirst = sources.count(where: exists)
+        #expect(restoredByFirst > 0, "the cancel landed before anything was put back")
+        #expect(restoredByFirst < total, "the undo finished before the cancel could land")
+        #expect(model.lastCompletedBatch?.kind == .move,
+                "a cancelled undo must leave the original batch as the thing to reverse")
+
+        // Second press: the same reversal, over everything.
+        #expect(model.canUndo)
+        let second = UndoCommandAction.run(isEditingText: false, model: model)
+        #expect(second.destination == .model)
+        await second.work?.value
+
+        // Every file is home.
+        #expect(sources.allSatisfy(exists), "the second undo did not finish the job")
+        let left = try FileManager.default.contentsOfDirectory(atPath: destination.path)
+            .filter { !$0.hasPrefix(".") }
+        #expect(left.isEmpty, "the destination still holds \(left.count) files")
+
+        // And the noise is exactly the already-restored items, reported as
+        // gone rather than silently skipped.
+        guard case .summary(let summary)? = model.activeSheet else {
+            Issue.record("the second undo reported nothing: \(sheetDescription(model))")
+            return
+        }
+        #expect(summary.failures.count == restoredByFirst,
+                "\(summary.failures.count) failures for \(restoredByFirst) already-restored items")
+        #expect(summary.failures.allSatisfy {
+            $0.failure == .sourceVanished
+        }, "a move's already-restored items should report as vanished sources")
+    }
+
+    /// A refusal is shown, never swallowed. A permanent delete is the case that
+    /// matters and the one `Core` reports first, whatever else a batch holds.
+    ///
+    /// Nothing is remembered for ⌘Z after a permanent delete — `finish` refuses
+    /// to record one — so the refusal is reached by handing the model a batch
+    /// id directly, which is also the shape a stale `lastCompletedBatch` takes
+    /// after retention ages a batch out.
+    @Test func aRefusalIsExplainedRatherThanSilentlyIgnored() async throws {
+        let root = try tree.directory("library")
+        try tree.file("library/IMG_0001.jpg", bytes: 16)
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+        await model.open(root)
+
+        model.lastCompletedBatch = CompletedBatch(batchID: "a-batch-that-never-was",
+                                                  kind: .move, results: [], isReversal: false)
+        #expect(model.canUndo)
+        await model.undoLastBatch()
+
+        guard case .summary(let summary)? = model.activeSheet else {
+            Issue.record("a refused undo said nothing: \(sheetDescription(model))")
+            return
+        }
+        let explanation = try #require(summary.planningFailure)
+        #expect(!explanation.isEmpty)
+        #expect(explanation.localizedCaseInsensitiveContains("no record"),
+                "the refusal does not say why: \(explanation)")
+        #expect(!summary.canRetry, "a refused undo must not offer Retry Failed")
+    }
+
+    /// Every refusal has a sentence, and the two that carry counts show them.
+    /// A `switch` with a `default` would let a case added by a later Core
+    /// change reach the user as an empty sheet.
+    @Test func everyUndoRefusalHasASentence() throws {
+        let refusals: [UndoRefusal] = [
+            .noSuchBatch, .permanentDelete, .unsettled(rows: 3),
+            .reconciledAfterACrash(rows: 2), .someItemsFailed(rows: 1), .nothingToUndo,
+        ]
+        for refusal in refusals {
+            let sentence = BrowserModel.describe(refusal: refusal)
+            #expect(!sentence.isEmpty, "\(refusal) has no explanation")
+            // A digit is a legitimate opener — "3 steps of that operation…" —
+            // so this checks for a sentence rather than for a capital.
+            let opener = try #require(sentence.first)
+            #expect(opener.isUppercase || opener.isNumber,
+                    "\(refusal) does not start a sentence: \(sentence)")
+            #expect(sentence.hasSuffix("."), "\(refusal) is not a sentence: \(sentence)")
+        }
+        #expect(BrowserModel.describe(refusal: .unsettled(rows: 3)).contains("3"))
+        #expect(BrowserModel.describe(refusal: .someItemsFailed(rows: 1)).contains("1"))
+        #expect(BrowserModel.describe(refusal: .permanentDelete)
+            .localizedCaseInsensitiveContains("permanently"))
+    }
+
+    /// ⌘Z is off with nothing to reverse, and off while the window is busy —
+    /// the same "may work start" gate the four batch commands share.
+    @Test func undoIsOffWithNothingToReverseAndWhileTheWindowIsBusy() async throws {
+        let root = try tree.directory("library")
+        try tree.file("library/IMG_0001.jpg", bytes: 16)
+        let store = try IndexStore.inMemory()
+        let model = model(store)
+        await model.open(root)
+
+        #expect(!model.canUndo, "⌘Z is live before anything has been done")
+        #expect(model.undoMenuTitle == "Undo")
+
+        model.lastCompletedBatch = CompletedBatch(batchID: "b", kind: .move,
+                                                  results: [], isReversal: false)
+        #expect(model.canUndo)
+
+        model.batchProgress = BatchProgress(kind: .move, completed: 1, total: 9, current: nil)
+        #expect(!model.canUndo, "⌘Z is live while a batch is running")
+        model.batchProgress = nil
+
+        model.activeSheet = .confirmPermanentDelete(count: 1)
+        #expect(!model.canUndo, "⌘Z is live under a sheet")
+        model.dismissSheet()
+        #expect(model.canUndo)
+    }
+}

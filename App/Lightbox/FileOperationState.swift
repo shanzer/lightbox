@@ -82,14 +82,28 @@ struct BatchProgress: Equatable, Sendable {
 /// worst possible payload.
 struct CompletedBatch: Sendable, Equatable {
     let batchID: String
+    /// What the *original* operation did, carried through a reversal unchanged.
+    ///
+    /// Not the reversal's own kind, which differs per step and per direction —
+    /// undoing a copy trashes, undoing a trash moves. The user is owed the name
+    /// of the thing they did, and "Redo Copy 3 Items" is that; "Redo Trash 3
+    /// Items" would describe the machinery.
     let kind: FileOperationKind
     /// Only the items that reached `.completed`. The rest have nothing to undo.
     let results: [FileOperationResult]
+    /// Whether this batch is itself a reversal, which makes the next ⌘Z a redo.
+    ///
+    /// **This is the entire redo mechanism on this side.** `Core` keeps no
+    /// history: a reversal is journalled as an ordinary batch, so undoing it is
+    /// the redo and needs no new call. All the window has to do is say which of
+    /// the two the next ⌘Z will be, and flip the flag each time.
+    let isReversal: Bool
 
     var completedCount: Int { results.count }
 
-    /// "Undo Move 12 Items" — spec §8's undo, named after what it will reverse,
-    /// so the menu says what ⌘Z is about to do rather than just that it can.
+    /// "Undo Move 12 Items", or "Redo Move 12 Items" once the move has been
+    /// reversed — spec §8's undo, named after what it will do rather than
+    /// merely that it can.
     var undoTitle: String {
         let noun = completedCount == 1 ? "Item" : "Items"
         let verb = switch kind {
@@ -98,7 +112,7 @@ struct CompletedBatch: Sendable, Equatable {
         case .trash: "Trash"
         case .delete: "Delete"
         }
-        return "Undo \(verb) \(completedCount) \(noun)"
+        return "\(isReversal ? "Redo" : "Undo") \(verb) \(completedCount) \(noun)"
     }
 }
 

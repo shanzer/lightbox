@@ -293,6 +293,11 @@ public extension FileOperationFailure {
         case .indexWriteFailed(let detail):
             "The files moved but the index could not be updated (\(detail)); it "
                 + "will be corrected on the next scan."
+        case .modifiedSinceOperation:
+            "The file has been edited since the operation, so it was left alone "
+                + "rather than undone over someone else's change."
+        case .trashEmptied:
+            "The file is no longer in the Trash, so there is nothing to put back."
         case .other(let detail):
             "Failed: \(detail)"
         }
