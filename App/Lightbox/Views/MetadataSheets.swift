@@ -163,6 +163,12 @@ struct MetadataSummarySheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(summary.headline).font(.headline)
+            if let note = summary.notReachedNote {
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if summary.sidecars > 0 {
                 Text("\(summary.sidecars) of them were written to an .xmp sidecar; "
                     + "the RAW files themselves were not opened.")

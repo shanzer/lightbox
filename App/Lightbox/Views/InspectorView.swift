@@ -16,7 +16,10 @@ import LightboxCore
 /// - **It does not commit on blur.** Return applies; clicking away does not. A
 ///   blur-commit writes to every selected file the moment focus moves, which
 ///   for a 300-file selection is a batch nobody asked for. The fields say so.
-/// - **A blank box means unchanged — every box, no exceptions.** `onSubmit`
+/// - **A blank box means unchanged — every box, no exceptions**, and for the
+///   two boxes that are pre-filled from the index the rule is stated against
+///   what they were filled with (`CaptureTimeSeed`) rather than against the
+///   empty string. `onSubmit`
 ///   fires on Return whether or not the text changed, so tabbing into an
 ///   untouched Artist box on a 300-file selection and pressing Return would
 ///   otherwise erase Artist on 300 files and rewrite every one of them, with no
@@ -74,6 +77,10 @@ struct InspectorView: View {
     @State private var latitudeDraft = ""
     @State private var longitudeDraft = ""
     @State private var refusal: String?
+    /// What `reseed()` put in the capture-time pair, so a Return that changed
+    /// neither box can be recognised as changing nothing — see
+    /// `CaptureTimeSeed`.
+    @State private var captureSeed: CaptureTimeSeed?
 
     @FocusState private var focused: BrowserModel.TextField?
 
@@ -182,7 +189,8 @@ struct InspectorView: View {
     private var fields: some View {
         field("Capture time", text: $captureTimeDraft, prompt: WallClock.placeholder,
               id: .inspectorCaptureTime) {
-            .captureTime(wallClock: captureTimeDraft, offset: captureZoneDraft)
+            .captureTime(wallClock: captureTimeDraft, offset: captureZoneDraft,
+                         seed: captureSeed)
         }
         // **Always shown, never assumed.** A `DateTimeOriginal` with no
         // `OffsetTimeOriginal` names a different instant on every machine that
@@ -190,7 +198,8 @@ struct InspectorView: View {
         // the code — spec §9, constraint 1.
         field("Time zone", text: $captureZoneDraft, prompt: "-05:00",
               id: .inspectorCaptureZone) {
-            .captureTime(wallClock: captureTimeDraft, offset: captureZoneDraft)
+            .captureTime(wallClock: captureTimeDraft, offset: captureZoneDraft,
+                         seed: captureSeed)
         }
         Button("Batch Time Operations…") { model.openBatchTimeSheet() }
             .disabled(!model.canStartMetadataBatch)
@@ -301,6 +310,7 @@ struct InspectorView: View {
         guard !records.isEmpty else {
             captureTimeDraft = ""
             captureZoneDraft = ""
+            captureSeed = nil
             return
         }
         let offset = MetadataEditRequest.defaultOffset(for: records)
@@ -312,6 +322,10 @@ struct InspectorView: View {
         } else {
             captureTimeDraft = ""
         }
+        // Remembered, so a Return that changed neither box changes nothing.
+        // Without it these two are the one pair that escapes the
+        // blank-means-unchanged rule, by never being blank.
+        captureSeed = CaptureTimeSeed(wallClock: captureTimeDraft, offset: captureZoneDraft)
     }
 
     // MARK: - Read-only rendering

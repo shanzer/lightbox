@@ -17,6 +17,62 @@ import LightboxCore
 /// and called the writer once per file would write exactly the same metadata
 /// and would still be wrong, because each call is its own `-stay_open` round
 /// trip and its own progress sequence starting again at 1.
+/// Lets a test stand at an exact point inside a batch, with no sleep and no
+/// poll anywhere in it.
+///
+/// **Sleeping and polling is what made the first version of the cancel test
+/// flaky, and the reason is worth keeping.** The App suite runs suites in
+/// parallel in one process, and three of them block the main actor
+/// *synchronously* for seconds at a time — `renderFields`, `focus` and
+/// `waitForEditableFieldsToDisappear` all spin `RunLoop.current.run`. The stub
+/// writer is nonisolated, so it kept going while the main actor was blocked: by
+/// the time the test's `@MainActor` poll of `batchProgress` got to run, the
+/// batch had finished all five files and `endBatch()` had set `batchProgress`
+/// back to nil, so the poll read `nil ?? 0` for its whole deadline and the test
+/// failed claiming the batch "never started". 3 of 10 full runs.
+///
+/// So the stub parks instead. `reach(_:)` reports a finished item *and blocks
+/// the writer there* until `release()`, and `waitForReach(_:)` returns when it
+/// has. Neither side can outrun the other however long the main actor is held.
+actor WriteGate {
+    /// How many items the stub finishes before it parks.
+    let pauseAfter: Int
+
+    private var reached = 0
+    private var observer: (count: Int, continuation: CheckedContinuation<Void, Never>)?
+    private var parked: CheckedContinuation<Void, Never>?
+    private var isReleased = false
+
+    init(pauseAfter: Int) { self.pauseAfter = pauseAfter }
+
+    /// Writer side: item `count` is done. Parks on the nth until released.
+    func reach(_ count: Int) async {
+        reached = count
+        if let observer, observer.count <= count {
+            self.observer = nil
+            observer.continuation.resume()
+        }
+        guard count == pauseAfter, !isReleased else { return }
+        // The body runs synchronously before the suspension, so `release()`
+        // cannot land between the guard and the continuation being stored —
+        // and `isReleased` covers a release that arrives before the park.
+        await withCheckedContinuation { parked = $0 }
+    }
+
+    /// Test side: returns once the writer has finished `count` items.
+    func waitForReach(_ count: Int) async {
+        if reached >= count { return }
+        await withCheckedContinuation { observer = (count, $0) }
+    }
+
+    /// Test side: lets the parked writer go.
+    func release() {
+        isReleased = true
+        parked?.resume()
+        parked = nil
+    }
+}
+
 final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
     struct Call: Sendable {
         let edit: MetadataEdit
@@ -37,8 +93,8 @@ final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
     /// written stays written" — a stub writes no bytes, but it can say which
     /// files it reached before Stop.
     private var _written: [URL] = []
-    /// How long each item takes, so a cancellation has somewhere to land.
-    private var _delayPerFile: Duration = .zero
+    /// Where a test wants the batch to stand still. See `WriteGate`.
+    private var _gate: WriteGate?
 
     init(availability: ExiftoolAvailability = .available(path: "/stub/exiftool",
                                                          version: "13.55")) {
@@ -49,7 +105,7 @@ final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
     var rechecks: Int { lock.withLock { _rechecks } }
     var written: [URL] { lock.withLock { _written } }
 
-    func slowDown(_ delay: Duration) { lock.withLock { _delayPerFile = delay } }
+    func park(at gate: WriteGate) { lock.withLock { _gate = gate } }
 
     func fail(_ name: String, with error: MetadataWriteError) {
         lock.withLock { _failures[name] = error }
@@ -74,14 +130,13 @@ final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
 
     func write(_ edit: MetadataEdit, to urls: [URL],
                progress: @escaping @Sendable (Int, Int) -> Void) async -> [WriteOutcome] {
-        let (failures, warnings, sidecars, delay) = lock.withLock {
-            () -> ([String: MetadataWriteError], [WriteWarning], Set<String>, Duration) in
+        let (failures, warnings, sidecars, gate) = lock.withLock {
+            () -> ([String: MetadataWriteError], [WriteWarning], Set<String>, WriteGate?) in
             _calls.append(Call(edit: edit, urls: urls))
-            return (_failures, _warnings, _sidecarExtensions, _delayPerFile)
+            return (_failures, _warnings, _sidecarExtensions, _gate)
         }
         var outcomes: [WriteOutcome] = []
         for (index, url) in urls.enumerated() {
-            if delay > .zero { try? await Task.sleep(for: delay) }
             // **Between items, never inside one** — the real writer's rule, so
             // a cancelled stub batch has the shape a cancelled real one does.
             if Task.isCancelled {
@@ -102,6 +157,9 @@ final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
                                  rehash: nil, warnings: warnings))))
             }
             progress(index + 1, urls.count)
+            // After the item and after the progress report, so a test that has
+            // been let through knows both have happened.
+            await gate?.reach(index + 1)
         }
         return outcomes
     }
@@ -237,7 +295,7 @@ struct MetadataEditRequestTests {
     /// Spec §9, constraint 1, refused here rather than N times in a sheet.
     @Test(arguments: ["", "   "]) func aCaptureTimeWithNoZoneIsRefused(_ offset: String) {
         let built = MetadataEditRequest.build(
-            .captureTime(wallClock: "2021-07-08 09:10:11", offset: offset),
+            .captureTime(wallClock: "2021-07-08 09:10:11", offset: offset, seed: nil),
             for: [record("a.jpg", id: 1)])
         guard case .failure(let refusal) = built else {
             Issue.record("a zone-less capture time must be refused")
@@ -252,7 +310,7 @@ struct MetadataEditRequestTests {
     func anOffsetTheReaderCannotParseIsRefused(_ offset: String) {
         #expect(TimeZoneOffset.parse(offset) == nil)
         let built = MetadataEditRequest.build(
-            .captureTime(wallClock: "2021-07-08 09:10:11", offset: offset),
+            .captureTime(wallClock: "2021-07-08 09:10:11", offset: offset, seed: nil),
             for: [record("a.jpg", id: 1)])
         guard case .failure(let refusal) = built else {
             Issue.record("\(offset) must be refused")
@@ -290,7 +348,7 @@ struct MetadataEditRequestTests {
     /// report `"" is not a date and time` for a field nobody touched.
     @Test(arguments: ["", "   "]) func aBlankWallClockIsUnchanged(_ wallClock: String) {
         let built = MetadataEditRequest.build(
-            .captureTime(wallClock: wallClock, offset: "-04:00"),
+            .captureTime(wallClock: wallClock, offset: "-04:00", seed: nil),
             for: [record("a.jpg", id: 1)])
         guard case .failure(let refusal) = built else {
             Issue.record("a blank capture time must change nothing")
@@ -299,9 +357,36 @@ struct MetadataEditRequestTests {
         #expect(refusal == .nothingToWrite)
     }
 
+    /// **The two pre-filled boxes obey the same rule, stated against the seed.**
+    /// `onSubmit` fires on every Return, so without this, tabbing through an
+    /// untouched inspector rewrites every selected file to the capture time it
+    /// already has.
+    @Test func aCaptureTimeStillHoldingItsSeedChangesNothing() {
+        let seed = CaptureTimeSeed(wallClock: "2021-07-08 09:10:11", offset: "-04:00")
+        let built = MetadataEditRequest.build(
+            .captureTime(wallClock: "2021-07-08 09:10:11", offset: "-04:00", seed: seed),
+            for: [record("a.jpg", id: 1)])
+        guard case .failure(let refusal) = built else {
+            Issue.record("an untouched capture-time pair must change nothing")
+            return
+        }
+        #expect(refusal == .nothingToWrite)
+    }
+
+    /// Either box moving is a real edit — the zone especially, because changing
+    /// it alone is exactly how a mis-zoned camera is corrected.
+    @Test(arguments: [("2021-07-08 09:10:12", "-04:00"), ("2021-07-08 09:10:11", "-05:00")])
+    func aCaptureTimePairThatMovedStillWrites(_ pair: (String, String)) throws {
+        let seed = CaptureTimeSeed(wallClock: "2021-07-08 09:10:11", offset: "-04:00")
+        let request = try #require(try MetadataEditRequest.build(
+            .captureTime(wallClock: pair.0, offset: pair.1, seed: seed),
+            for: [record("a.jpg", id: 1)]).get())
+        #expect(request.groups[0].edit.captureTime != nil)
+    }
+
     @Test func aWallClockThatIsNotADateIsRefused() {
         let built = MetadataEditRequest.build(
-            .captureTime(wallClock: "last tuesday", offset: "-04:00"),
+            .captureTime(wallClock: "last tuesday", offset: "-04:00", seed: nil),
             for: [record("a.jpg", id: 1)])
         guard case .failure(let refusal) = built else {
             Issue.record("an unparseable wall clock must be refused")
@@ -496,6 +581,10 @@ struct MetadataEditRequestTests {
         #expect(summary.notReached == 1)
         #expect(summary.isWorthShowing)
         #expect(summary.headline == "1 file could not be written. The batch was stopped.")
+        // The count is what explains why the numbers do not add up, so it has
+        // to reach the sheet rather than only the value — `MetadataSummarySheet`
+        // renders exactly this string.
+        #expect(summary.notReachedNote == "1 file was not reached before the batch was stopped.")
     }
 
     @Test func nothingIsBuiltFromAnEmptySelection() {
@@ -564,9 +653,15 @@ struct InspectorEditingTests {
 
     /// A window with `count` files selected and a stub writer in place of
     /// exiftool.
+    /// - Parameter sort: applied **before** `open`, so the grid's first and only
+    ///   awaited reload already has it. Setting it afterwards would mean waiting
+    ///   on `sort`'s `didSet` — a reload this helper does not hold and cannot
+    ///   await — which is a poll, and a poll in this process races the suites
+    ///   that block the main actor for seconds at a time.
     private func window(files count: Int,
                         availability: ExiftoolAvailability = .available(path: "/stub/exiftool",
-                                                                        version: "13.55"))
+                                                                        version: "13.55"),
+                        sort: SearchQuery.Sort? = nil)
     async throws -> (BrowserModel, RecordingMetadataWriter, URL) {
         let root = try tree.directory("library")
         for index in 1...count {
@@ -575,6 +670,7 @@ struct InspectorEditingTests {
         let model = BrowserModel(store: try IndexStore.inMemory(), preferences: preferences)
         let writer = RecordingMetadataWriter(availability: availability)
         model.metadataWriter = writer
+        if let sort { model.sort = sort }
         await model.open(root)
         await model.resolveMetadataAvailability()
         model.selectAll()
@@ -619,7 +715,7 @@ struct InspectorEditingTests {
         let (model, writer, _) = try await window(files: 3)
 
         let refusal = await model.commitMetadataField(
-            .captureTime(wallClock: "2021-07-08 09:10:11", offset: ""))
+            .captureTime(wallClock: "2021-07-08 09:10:11", offset: "", seed: nil))
 
         #expect(refusal == .captureTimeRequiresTimeZone)
         #expect(writer.calls.isEmpty,
@@ -705,6 +801,26 @@ struct InspectorEditingTests {
         #expect(model.activeSheet == nil)
     }
 
+    /// **The seeded pair, at the model.** The two capture-time boxes are the
+    /// only ones the index can pre-fill, so they are the only ones the
+    /// blank-means-unchanged rule cannot reach; a Return that moved neither of
+    /// them must still reach no writer. Without this, tabbing through an
+    /// untouched inspector rewrites every selected file to the value it already
+    /// has — a fork, a stash, a rehash and a bumped mtime each, and no sheet,
+    /// because a clean success shows nothing.
+    @Test func anUntouchedCaptureTimePairCommitsNothing() async throws {
+        let (model, writer, _) = try await window(files: 3)
+        let seed = CaptureTimeSeed(wallClock: "2021-07-08 09:10:11", offset: "-04:00")
+
+        let refusal = await model.commitMetadataField(
+            .captureTime(wallClock: "2021-07-08 09:10:11", offset: "-04:00", seed: seed))
+
+        #expect(refusal == .nothingToWrite)
+        #expect(writer.calls.isEmpty,
+                "an untouched capture-time pair rewrote \(writer.calls.first?.urls.count ?? 0) files")
+        #expect(model.activeSheet == nil)
+    }
+
     /// Erasing goes through a confirmation and then writes the empty string
     /// that removes the tag — the only route to that write.
     @Test func clearingAFieldAsksFirstAndThenErasesAcrossTheSelection() async throws {
@@ -746,26 +862,34 @@ struct InspectorEditingTests {
     /// the right shape for a result list and the wrong one for a sheet: folded
     /// into the failures it says "4 files could not be written" to a user who
     /// pressed Stop and watched the bar the whole time.
+    ///
+    /// Driven by a rendezvous rather than a timer — see `WriteGate` for the
+    /// flake that idiom replaced. Nothing here reads `batchProgress`, which is
+    /// main-actor state that another suite can keep this test from seeing until
+    /// after the batch it describes has finished; `writer.written` only grows,
+    /// so it says the same thing whenever it is read.
     @Test func stoppingABatchShowsNoSheetAndKeepsWhatWasAlreadyWritten() async throws {
         let (model, writer, _) = try await window(files: 5)
-        writer.slowDown(.milliseconds(40))
+        let gate = WriteGate(pauseAfter: 1)
+        writer.park(at: gate)
 
         let batch = Task { await model.commitMetadataField(.artist("Ansel")) }
-        let deadline = Date().addingTimeInterval(5)
-        while (model.batchProgress?.completed ?? 0) < 1, Date() < deadline {
-            await Task.yield()
-        }
-        try #require((model.batchProgress?.completed ?? 0) >= 1,
-                     "the batch never started, so this proves nothing about Stop")
+        // Returns exactly when the first file is done and the writer is parked
+        // on it. No deadline: neither side can outrun the other.
+        await gate.waitForReach(1)
+        #expect(writer.written.count == 1,
+                "the gate let the batch past file 1 before the test could stop it")
+
         model.cancelBatch()
+        await gate.release()
         _ = await batch.value
 
         #expect(model.activeSheet == nil,
                 "Stop raised \(model.activeSheet.map(\.id) ?? "-"); a clean cancel reports nothing")
         #expect(model.batchProgress == nil)
         // Everything already done stays done, and nothing after the stop ran.
-        #expect(!writer.written.isEmpty, "nothing was written before the stop")
-        #expect(writer.written.count < 5, "the stop did not stop anything")
+        #expect(writer.written.count == 1,
+                "the stop let \(writer.written.count) of 5 files through")
     }
 
     /// **Sort order, not id order.** With the grid sorted by name ascending the
@@ -773,16 +897,8 @@ struct InspectorEditingTests {
     /// descending they disagree, and the sequence must follow what is on
     /// screen: that is the whole point of the operation.
     @Test func aSequenceFollowsTheGridsSortOrderRatherThanTheRowIds() async throws {
-        let (model, writer, _) = try await window(files: 5)
-        // Waited for rather than awaited: `sort`'s `didSet` starts its own
-        // reload, so an explicit `await model.reload()` here is superseded by
-        // that one and returns while the grid is still in the old order.
-        model.sort = SearchQuery.Sort(field: .name, ascending: false)
-        let sorted = Date().addingTimeInterval(5)
-        while model.records.first?.name != "IMG_0005.jpg", Date() < sorted {
-            try? await Task.sleep(for: .milliseconds(5))
-        }
-        model.selectAll()
+        let (model, writer, _) = try await window(
+            files: 5, sort: SearchQuery.Sort(field: .name, ascending: false))
         try #require(model.selectedRecords.map(\.name)
             == ["IMG_0005.jpg", "IMG_0004.jpg", "IMG_0003.jpg",
                 "IMG_0002.jpg", "IMG_0001.jpg"],

@@ -1125,15 +1125,25 @@ all three are now done:
   is never evaluated on a caller's thread. The inspector's `.task` resolves it
   once per window; nothing happens at launch.
 
-  **Only capture time and zone can be seeded.** The index has no columns for the
-  other six fields, so their boxes are blank-meaning-unchanged. Two consequences
-  worth knowing: the boxes' prompts have to say "unchanged" or an empty box
-  reads as "this file has no Artist"; and **`recordMetadataWrite` does not
-  refresh `capture_time`/`capture_offset`**, so after a capture-time edit the
-  read-only *Captured* row keeps showing the old value until something reindexes
-  the file — and nothing will, because that same call updated the row's `size`
-  and `mtime`, which is exactly what `needsReindex` keys on. Adding those two
-  columns to the write is a small `Core` change and the obvious follow-up.
+  **Only capture time and zone can be seeded**, and being seeded is itself a
+  trap. The index has no columns for the other six fields, so their boxes are
+  blank-meaning-unchanged and their prompts have to say so, or an empty box
+  reads as "this file has no Artist". The two that *are* filled cannot state
+  the rule as "blank": `onSubmit` fires on every Return, so tabbing through an
+  untouched inspector rewrote every selected file to the capture time it
+  already had — a fork, a stash, a rehash and a bumped mtime each, and no sheet,
+  because a clean success shows nothing. `CaptureTimeSeed` is what `reseed()`
+  put in the pair, and a commit still holding it changes nothing.
+
+  Separately, **`IndexStore.recordMetadataWrite` does not refresh
+  `capture_time`/`capture_offset` — that is issue #42**, a `Core` gap rather
+  than anything this layer can fix. After a capture-time edit the read-only
+  *Captured* row keeps showing the old value until something reindexes the
+  file, and nothing will: that same call updates the row's `size` and `mtime`,
+  which is exactly what `needsReindex` keys on, so the staleness is permanent
+  rather than merely late. Adding the two columns to that write is the fix, and
+  `InspectorView` and `BrowserModel+MetadataEditing.finish` both carry a comment
+  pointing at #42 so a reader of the code meets it.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And

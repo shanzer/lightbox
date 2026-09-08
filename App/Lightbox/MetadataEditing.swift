@@ -222,7 +222,10 @@ enum MetadataFieldEdit: Sendable, Equatable {
     case rating(String)
     case label(String)
     case gps(latitude: String, longitude: String)
-    case captureTime(wallClock: String, offset: String)
+    /// `seed` is what `InspectorView.reseed()` put in the two boxes off the
+    /// index. A commit whose boxes still hold it is a Return in an untouched
+    /// pair, and changes nothing — see `CaptureTimeSeed`.
+    case captureTime(wallClock: String, offset: String, seed: CaptureTimeSeed?)
     /// **Erasing a tag is its own gesture**, never a side effect of an empty
     /// box. See `MetadataField.isClearable` for why.
     case clear(MetadataField)
@@ -251,6 +254,33 @@ enum MetadataFieldEdit: Sendable, Equatable {
 }
 
 // MARK: - Batch time operations
+
+/// What the capture-time pair was pre-filled with.
+///
+/// **The two seeded boxes are the one place the blank-means-unchanged rule
+/// cannot be stated as "blank".** Capture time and time zone are the only §9
+/// fields the index can report a current value for, so `reseed()` fills them —
+/// and a filled box plus `onSubmit` firing on every Return means tabbing
+/// through an untouched inspector rewrites every selected file to the value it
+/// already has: an exiftool fork each, an `_original` stash each, every hash
+/// recomputed, every mtime bumped, and no sheet, because a clean success shows
+/// nothing. The rule is the same rule; it is stated against the seed rather
+/// than against the empty string.
+struct CaptureTimeSeed: Sendable, Equatable {
+    var wallClock: String
+    var offset: String
+
+    /// Whether both boxes still hold what was put in them.
+    ///
+    /// **Both**, not either: changing the zone alone moves the photo's instant,
+    /// which is exactly what a user fixing a mis-zoned camera means to do.
+    func matches(wallClock: String, offset: String) -> Bool {
+        wallClock.trimmingCharacters(in: .whitespaces) == self.wallClock
+            .trimmingCharacters(in: .whitespaces)
+            && offset.trimmingCharacters(in: .whitespaces) == self.offset
+                .trimmingCharacters(in: .whitespaces)
+    }
+}
 
 /// Spec §9's three batch time operations, as a sheet asks for them.
 enum BatchTimeOperation: Sendable, Equatable {
@@ -433,7 +463,12 @@ struct MetadataEditRequest: Sendable, Equatable {
                 return .failure(.invalidCoordinate(latitude: latitude, longitude: longitude))
             }
             return .success(MetadataEdit(gps: GPSCoordinate(latitude: lat, longitude: long)))
-        case .captureTime(let wallClock, let offset):
+        case .captureTime(let wallClock, let offset, let seed):
+            // The unchanged rule, stated against the seed because these two
+            // boxes are pre-filled. See `CaptureTimeSeed`.
+            if let seed, seed.matches(wallClock: wallClock, offset: offset) {
+                return .failure(.nothingToWrite)
+            }
             return captureTime(wallClock: wallClock, offset: offset)
                 .map { MetadataEdit(captureTime: $0) }
         }
@@ -669,6 +704,10 @@ struct MetadataSummary: Identifiable, Sendable {
     /// who pressed Stop and watched the progress bar the whole time. A move's
     /// clean cancel shows no sheet at all (`OperationSummary.wasCancelled`) and
     /// this follows it.
+    ///
+    /// It reaches the screen only through `notReachedNote`, and only when
+    /// something else has already raised the sheet — where it is what explains
+    /// why the numbers do not add up.
     let notReached: Int
 
     init(outcomes: [WriteOutcome], wasCancelled: Bool, wasClear: Bool = false) {
@@ -736,6 +775,14 @@ struct MetadataSummary: Identifiable, Sendable {
     /// they watched it. The count only reaches the screen alongside a real
     /// failure, where it explains why the numbers do not add up.
     var isWorthShowing: Bool { !failures.isEmpty || !notes.isEmpty }
+
+    /// The line under the headline that accounts for the files Stop skipped, or
+    /// nil when none were.
+    var notReachedNote: String? {
+        guard notReached > 0 else { return nil }
+        return "\(notReached) \(notReached == 1 ? "file was" : "files were") not reached "
+            + "before the batch was stopped."
+    }
 
     var headline: String {
         let verb = wasClear ? "cleared" : "written"
