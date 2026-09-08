@@ -112,7 +112,7 @@ cd ~/src/lightbox
 # Core: 619 tests, 78 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 142 tests.
+# App: builds the SwiftUI target and runs its 156 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -1066,6 +1066,32 @@ all three are now done:
   `anOffsetThisLayerAcceptsIsOneTheWriterAccepts` drives the real writer with an
   executable path that does not exist — validation runs before any fork — so the
   two layers cannot drift into disagreeing about what `±HH:MM` means.
+
+  **Blank means unchanged, in every box, and that is the rule the editor turns
+  on.** `TextField.onSubmit` fires on Return whether or not the text changed,
+  and `MetadataEdit.artist = ""` is *non-nil* — so `isEmpty` stays false and
+  `MetadataWriter+Tags` emits `-MWG:Creator=`, which erases the tag. Tabbing
+  into an untouched Artist box on a 300-file selection and pressing Return
+  therefore erased Artist on 300 files and rewrote every one of them, with no
+  ⌘Z. Every field now refuses a blank commit with `nothingToWrite`, keywords
+  included — they used to be the exception, and one rule everywhere is worth
+  more than that convenience. Erasing is the ✕ beside the box, behind a
+  confirmation, through `MetadataFieldEdit.clear`, and the summary says
+  "cleared". `MetadataField.isClearable` names the five that have one; capture
+  time, rating and GPS do not, because `MetadataEdit` cannot spell "remove
+  this".
+
+  **A stopped batch reports nothing.** `MetadataWriter` returns every un-reached
+  file as `.failure(.cancelled)` — the right shape for a result list, the wrong
+  one for a sheet. `MetadataSummary` counts them as `notReached` instead, and
+  `isWorthShowing` ignores that count, so Stop behaves as a stopped move does
+  (`OperationSummary.wasCancelled`) rather than raising "295 files could not be
+  written" in front of a user who watched the bar the whole time.
+
+  **One text field, not two.** `MetadataTextField` is the single place
+  `reportingTextFocus` is called; the inspector's ten boxes and the batch sheet's
+  six both go through it, so there is one place to forget the contract and two
+  tests walking that place.
 
   **A metadata batch is a batch.** Same `batchToken`/`batchTask`/
   `isBatchStarting` discipline, same `present(_:)` nil-yield-present sheet swap,

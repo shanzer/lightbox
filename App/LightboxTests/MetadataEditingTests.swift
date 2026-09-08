@@ -33,6 +33,12 @@ final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
     /// A RAW selection's outcome names the sidecar, which is what the summary
     /// counts.
     private var _sidecarExtensions: Set<String> = ["cr2", "cr3", "nef", "arw", "dng"]
+    /// Files the stub got as far as, in order. The stand-in for "already
+    /// written stays written" — a stub writes no bytes, but it can say which
+    /// files it reached before Stop.
+    private var _written: [URL] = []
+    /// How long each item takes, so a cancellation has somewhere to land.
+    private var _delayPerFile: Duration = .zero
 
     init(availability: ExiftoolAvailability = .available(path: "/stub/exiftool",
                                                          version: "13.55")) {
@@ -41,6 +47,9 @@ final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
 
     var calls: [Call] { lock.withLock { _calls } }
     var rechecks: Int { lock.withLock { _rechecks } }
+    var written: [URL] { lock.withLock { _written } }
+
+    func slowDown(_ delay: Duration) { lock.withLock { _delayPerFile = delay } }
 
     func fail(_ name: String, with error: MetadataWriteError) {
         lock.withLock { _failures[name] = error }
@@ -65,16 +74,25 @@ final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
 
     func write(_ edit: MetadataEdit, to urls: [URL],
                progress: @escaping @Sendable (Int, Int) -> Void) async -> [WriteOutcome] {
-        let (failures, warnings, sidecars) = lock.withLock { () -> ([String: MetadataWriteError],
-                                                                    [WriteWarning], Set<String>) in
+        let (failures, warnings, sidecars, delay) = lock.withLock {
+            () -> ([String: MetadataWriteError], [WriteWarning], Set<String>, Duration) in
             _calls.append(Call(edit: edit, urls: urls))
-            return (_failures, _warnings, _sidecarExtensions)
+            return (_failures, _warnings, _sidecarExtensions, _delayPerFile)
         }
         var outcomes: [WriteOutcome] = []
         for (index, url) in urls.enumerated() {
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            // **Between items, never inside one** — the real writer's rule, so
+            // a cancelled stub batch has the shape a cancelled real one does.
+            if Task.isCancelled {
+                outcomes.append(WriteOutcome(source: url, result: .failure(.cancelled)))
+                progress(index + 1, urls.count)
+                continue
+            }
             if let failure = failures[url.lastPathComponent] {
                 outcomes.append(WriteOutcome(source: url, result: .failure(failure)))
             } else {
+                lock.withLock { _written.append(url) }
                 let isSidecar = sidecars.contains(url.pathExtension.lowercased())
                 let written = isSidecar
                     ? url.deletingPathExtension().appendingPathExtension("xmp") : url
@@ -200,6 +218,22 @@ struct MetadataEditRequestTests {
         #expect(refusal == .noCaptureTimeToShift(count: 1))
     }
 
+    /// **A shift may not invent a zone.** Substituting the machine's for a file
+    /// that carries none writes an `OffsetTimeOriginal` nobody asked for —
+    /// §9 constraint 1 read backwards — and would format it at the *pre-shift*
+    /// instant, so a shift across a DST boundary would stamp the wrong one.
+    @Test func aShiftIsRefusedWhenAFileHasNoParseableTimeZone() {
+        let records = [record("a.jpg", id: 1, capture: 1_000, offset: "-04:00"),
+                       record("b.jpg", id: 2, capture: 2_000),
+                       record("c.jpg", id: 3, capture: 3_000, offset: "EST")]
+        let built = MetadataEditRequest.build(.shift(seconds: 60), for: records)
+        guard case .failure(let refusal) = built else {
+            Issue.record("a shift over files with no zone must be refused")
+            return
+        }
+        #expect(refusal == .noTimeZoneToShift(count: 2))
+    }
+
     /// Spec §9, constraint 1, refused here rather than N times in a sheet.
     @Test(arguments: ["", "   "]) func aCaptureTimeWithNoZoneIsRefused(_ offset: String) {
         let built = MetadataEditRequest.build(
@@ -251,6 +285,20 @@ struct MetadataEditRequestTests {
                 "the writer refused an offset this layer accepted: \(String(describing: error))")
     }
 
+    /// The zone box is always populated and the wall clock is not, so a Return
+    /// in the zone box of a selection whose capture times disagree must not
+    /// report `"" is not a date and time` for a field nobody touched.
+    @Test(arguments: ["", "   "]) func aBlankWallClockIsUnchanged(_ wallClock: String) {
+        let built = MetadataEditRequest.build(
+            .captureTime(wallClock: wallClock, offset: "-04:00"),
+            for: [record("a.jpg", id: 1)])
+        guard case .failure(let refusal) = built else {
+            Issue.record("a blank capture time must change nothing")
+            return
+        }
+        #expect(refusal == .nothingToWrite)
+    }
+
     @Test func aWallClockThatIsNotADateIsRefused() {
         let built = MetadataEditRequest.build(
             .captureTime(wallClock: "last tuesday", offset: "-04:00"),
@@ -299,12 +347,59 @@ struct MetadataEditRequestTests {
         #expect(MetadataEditRequest.keywords(from: "   ").isEmpty)
     }
 
-    /// An empty keyword string clears the set — `MetadataEdit.keywords`
-    /// replaces wholesale — rather than being "nothing to write".
-    @Test func anEmptyKeywordStringClearsTheSetRatherThanDoingNothing() throws {
+    /// **The one rule: blank means unchanged, keywords included.**
+    ///
+    /// Keywords used to be the exception — an empty box cleared the set,
+    /// because `MetadataEdit.keywords` replaces wholesale. One rule everywhere
+    /// is worth more than that convenience, and it is the same rule that stops
+    /// a stray Return in an untouched Artist box erasing Artist across the
+    /// selection.
+    @Test(arguments: [MetadataFieldEdit.artist(""), .copyright("  "), .description(""),
+                      .label(" "), .keywords(""), .keywords(" , , ")])
+    func aBlankBoxIsUnchangedForEveryField(_ edit: MetadataFieldEdit) {
+        let built = MetadataEditRequest.build(edit, for: [record("a.jpg", id: 1)])
+        guard case .failure(let refusal) = built else {
+            Issue.record("a blank \(edit.field.rawValue) box must change nothing")
+            return
+        }
+        #expect(refusal == .nothingToWrite)
+    }
+
+    /// Erasing is its own gesture, and it is the *only* thing that produces the
+    /// tag-removing write `MetadataWriter` turns an empty string into.
+    @Test func clearingAFieldIsWhatProducesTheErasingWrite() throws {
+        let records = [record("a.jpg", id: 1), record("b.jpg", id: 2)]
+        let artist = try #require(try MetadataEditRequest.build(.clear(.artist),
+                                                                for: records).get())
+        #expect(artist.groups.count == 1)
+        #expect(artist.groups[0].urls.count == 2)
+        #expect(artist.groups[0].edit.artist == "")
+
+        let keywords = try #require(try MetadataEditRequest.build(.clear(.keywords),
+                                                                  for: records).get())
+        #expect(keywords.groups[0].edit.keywords == [])
+    }
+
+    /// The three fields `MetadataEdit` cannot spell "remove this" for have no
+    /// Clear control, and asking for one anyway changes nothing.
+    @Test func onlyTheTextFieldsAreClearable() {
+        #expect(MetadataField.allCases.filter(\.isClearable).map(\.rawValue).sorted()
+            == ["artist", "copyright", "description", "keywords", "label"])
+        for field in MetadataField.allCases where !field.isClearable {
+            guard case .failure(let refusal) = MetadataEditRequest.build(
+                .clear(field), for: [record("a.jpg", id: 1)]) else {
+                Issue.record("\(field.rawValue) has no erase and must refuse one")
+                return
+            }
+            #expect(refusal == .nothingToWrite)
+        }
+    }
+
+    /// A value still writes, and arrives trimmed.
+    @Test func aFilledBoxStillWritesAndIsTrimmed() throws {
         let request = try #require(try MetadataEditRequest.build(
-            .keywords(""), for: [record("a.jpg", id: 1)]).get())
-        #expect(request.groups[0].edit.keywords == [])
+            .artist("  Ansel Adams  "), for: [record("a.jpg", id: 1)]).get())
+        #expect(request.groups[0].edit.artist == "Ansel Adams")
     }
 
     @Test(arguments: ["6", "-1", "five", "3.5"])
@@ -348,13 +443,59 @@ struct MetadataEditRequestTests {
         #expect(refusal == .invalidCoordinate(latitude: "91", longitude: "0"))
     }
 
-    /// Spec §9, constraint 2, where the user can see it.
-    @Test func aRawInTheSelectionIsAnnouncedAsASidecarWrite() {
-        #expect(MetadataEditRequest.writesToSidecar([record("a.CR2", id: 1)]))
-        #expect(MetadataEditRequest.writesToSidecar([record("a.jpg", id: 1),
-                                                     record("b.nef", id: 2)]))
-        #expect(!MetadataEditRequest.writesToSidecar([record("a.jpg", id: 1),
-                                                      record("b.png", id: 2)]))
+    /// Spec §9, constraint 2, where the user can see it — **and counted**. A
+    /// RAW+JPEG pair is the common selection, and "writes to an .xmp sidecar"
+    /// over a selection where two of thirty do is a claim about the other
+    /// twenty-eight that is not true.
+    @Test func theSidecarNoticeCountsRatherThanClaimingTheWholeSelection() throws {
+        #expect(MetadataEditRequest.sidecarNotice([record("a.png", id: 1)]) == nil)
+
+        let allRaw = try #require(MetadataEditRequest.sidecarNotice(
+            [record("a.CR2", id: 1), record("b.nef", id: 2)]))
+        #expect(allRaw == "These write to .xmp sidecars; the RAW files are untouched.")
+
+        let one = try #require(MetadataEditRequest.sidecarNotice([record("a.CR2", id: 1)]))
+        #expect(one == "Writes to an .xmp sidecar; the RAW file is untouched.")
+
+        let mixed = try #require(MetadataEditRequest.sidecarNotice(
+            [record("a.jpg", id: 1), record("b.nef", id: 2), record("c.png", id: 3)]))
+        #expect(mixed
+            == "1 of these write to an .xmp sidecar; those RAW files are untouched.")
+    }
+
+    /// The partition, at the value: `.cancelled` is a count, never a failure
+    /// row, so it cannot raise the sheet on its own.
+    @Test func cancelledOutcomesAreCountedNotReportedAsFailures() {
+        let a = URL(fileURLWithPath: "/library/a.jpg")
+        let b = URL(fileURLWithPath: "/library/b.jpg")
+        let c = URL(fileURLWithPath: "/library/c.jpg")
+        let summary = MetadataSummary(outcomes: [
+            WriteOutcome(source: a, result: .success(
+                WriteSuccess(written: a, target: .inPlace, rehash: nil, warnings: []))),
+            WriteOutcome(source: b, result: .failure(.cancelled)),
+            WriteOutcome(source: c, result: .failure(.cancelled)),
+        ], wasCancelled: true)
+
+        #expect(summary.written == 1)
+        #expect(summary.notReached == 2)
+        #expect(summary.failures.isEmpty,
+                "a stopped batch reported \(summary.failures.count) failures")
+        #expect(!summary.isWorthShowing,
+                "a clean stop must not put a sheet in front of the user")
+    }
+
+    /// A real failure still reports, and the stop then explains the arithmetic.
+    @Test func aRealFailureAlongsideAStopStillRaisesTheSheet() {
+        let a = URL(fileURLWithPath: "/library/a.jpg")
+        let b = URL(fileURLWithPath: "/library/b.jpg")
+        let summary = MetadataSummary(outcomes: [
+            WriteOutcome(source: a, result: .failure(.exiftoolFailed("no room"))),
+            WriteOutcome(source: b, result: .failure(.cancelled)),
+        ], wasCancelled: true)
+        #expect(summary.failures.count == 1)
+        #expect(summary.notReached == 1)
+        #expect(summary.isWorthShowing)
+        #expect(summary.headline == "1 file could not be written. The batch was stopped.")
     }
 
     @Test func nothingIsBuiltFromAnEmptySelection() {
@@ -542,6 +683,122 @@ struct InspectorEditingTests {
         let start = try #require(WallClock.parse("2021-07-08 09:10:11", in: zone))
         for (index, call) in writer.calls.enumerated() {
             #expect(call.urls.map(\.lastPathComponent) == ["IMG_000\(index + 1).jpg"])
+            #expect(call.edit.captureTime?.date
+                == start.addingTimeInterval(Double(index) * 10))
+        }
+    }
+
+    /// **The one rule, at the model.** A Return in an untouched box must reach
+    /// no writer at all — `onSubmit` fires whether or not the text changed, so
+    /// without this a stray Return on a 300-file selection erases the tag on
+    /// 300 files and rewrites every one of them, with no ⌘Z behind it.
+    @Test(arguments: [MetadataFieldEdit.artist(""), .copyright(""), .description(""),
+                      .label(""), .keywords("")])
+    func aBlankBoxCommitsNothing(_ edit: MetadataFieldEdit) async throws {
+        let (model, writer, _) = try await window(files: 3)
+
+        let refusal = await model.commitMetadataField(edit)
+
+        #expect(refusal == .nothingToWrite)
+        #expect(writer.calls.isEmpty,
+                "a blank \(edit.field.rawValue) box reached the writer as \(writer.calls.count) call(s), which would erase the tag")
+        #expect(model.activeSheet == nil)
+    }
+
+    /// Erasing goes through a confirmation and then writes the empty string
+    /// that removes the tag — the only route to that write.
+    @Test func clearingAFieldAsksFirstAndThenErasesAcrossTheSelection() async throws {
+        let (model, writer, _) = try await window(files: 3)
+
+        model.confirmClearMetadataField(.artist)
+        guard case .confirmMetadataClear(let field, let count)? = model.activeSheet else {
+            Issue.record("erasing must ask first, got \(model.activeSheet.map(\.id) ?? "no sheet")")
+            return
+        }
+        #expect(field == .artist)
+        #expect(count == 3)
+        #expect(writer.calls.isEmpty, "the confirmation wrote before it was answered")
+
+        let refusal = await model.clearMetadataField(.artist)
+        #expect(refusal == nil)
+        #expect(writer.calls.count == 1)
+        #expect(writer.calls[0].urls.count == 3)
+        #expect(writer.calls[0].edit.artist == "",
+                "an erase is the empty string MetadataWriter turns into a tag removal")
+    }
+
+    /// "3 files written" over a tag that was deleted is a true sentence
+    /// describing the wrong event.
+    @Test func anEraseSummaryReportsClearedRatherThanWritten() async throws {
+        let (model, writer, _) = try await window(files: 2)
+        writer.warn(.indexRowNotUpdated)   // raises the sheet so it can be read
+        await model.clearMetadataField(.label)
+        guard case .metadataSummary(let summary)? = model.activeSheet else {
+            Issue.record("expected the metadata summary sheet")
+            return
+        }
+        #expect(summary.wasClear)
+        #expect(summary.headline == "2 files cleared.")
+    }
+
+    /// **Stop shows no sheet**, the same as a clean cancel of a move. The
+    /// writer reports every un-reached file as `.failure(.cancelled)`, which is
+    /// the right shape for a result list and the wrong one for a sheet: folded
+    /// into the failures it says "4 files could not be written" to a user who
+    /// pressed Stop and watched the bar the whole time.
+    @Test func stoppingABatchShowsNoSheetAndKeepsWhatWasAlreadyWritten() async throws {
+        let (model, writer, _) = try await window(files: 5)
+        writer.slowDown(.milliseconds(40))
+
+        let batch = Task { await model.commitMetadataField(.artist("Ansel")) }
+        let deadline = Date().addingTimeInterval(5)
+        while (model.batchProgress?.completed ?? 0) < 1, Date() < deadline {
+            await Task.yield()
+        }
+        try #require((model.batchProgress?.completed ?? 0) >= 1,
+                     "the batch never started, so this proves nothing about Stop")
+        model.cancelBatch()
+        _ = await batch.value
+
+        #expect(model.activeSheet == nil,
+                "Stop raised \(model.activeSheet.map(\.id) ?? "-"); a clean cancel reports nothing")
+        #expect(model.batchProgress == nil)
+        // Everything already done stays done, and nothing after the stop ran.
+        #expect(!writer.written.isEmpty, "nothing was written before the stop")
+        #expect(writer.written.count < 5, "the stop did not stop anything")
+    }
+
+    /// **Sort order, not id order.** With the grid sorted by name ascending the
+    /// two coincide, so the sequence test above cannot tell them apart. Sorted
+    /// descending they disagree, and the sequence must follow what is on
+    /// screen: that is the whole point of the operation.
+    @Test func aSequenceFollowsTheGridsSortOrderRatherThanTheRowIds() async throws {
+        let (model, writer, _) = try await window(files: 5)
+        // Waited for rather than awaited: `sort`'s `didSet` starts its own
+        // reload, so an explicit `await model.reload()` here is superseded by
+        // that one and returns while the grid is still in the old order.
+        model.sort = SearchQuery.Sort(field: .name, ascending: false)
+        let sorted = Date().addingTimeInterval(5)
+        while model.records.first?.name != "IMG_0005.jpg", Date() < sorted {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        model.selectAll()
+        try #require(model.selectedRecords.map(\.name)
+            == ["IMG_0005.jpg", "IMG_0004.jpg", "IMG_0003.jpg",
+                "IMG_0002.jpg", "IMG_0001.jpg"],
+                     "the grid did not re-sort, so this proves nothing")
+
+        let refusal = await model.applyBatchTimeOperation(
+            .sequence(startWallClock: "2021-07-08 09:10:11", offset: "-04:00",
+                      intervalSeconds: 10))
+        #expect(refusal == nil)
+
+        let zone = try #require(TimeZoneOffset.parse("-04:00"))
+        let start = try #require(WallClock.parse("2021-07-08 09:10:11", in: zone))
+        #expect(writer.calls.count == 5)
+        for (index, call) in writer.calls.enumerated() {
+            #expect(call.urls.map(\.lastPathComponent) == ["IMG_000\(5 - index).jpg"],
+                    "step \(index) went to \(call.urls.map(\.lastPathComponent)), which is row-id order rather than sort order")
             #expect(call.edit.captureTime?.date
                 == start.addingTimeInterval(Double(index) * 10))
         }
@@ -801,4 +1058,106 @@ struct InspectorTextFocusTests {
         #expect(seen == expected,
                 "the inspector's fields reported \(seen.map(\.self)); every one must report, and distinctly")
     }
+
+    /// The batch time sheet goes through the same builder, so its boxes report
+    /// too. Only the `.set` mode's two are on screen at once — the picker
+    /// cannot be driven from here — which is enough to prove the sheet is not
+    /// carrying a second, unwalked copy of the field.
+    @Test func theBatchTimeSheetsFieldsReportTheirFocus() async throws {
+        let tree = try TempDirectory()
+        let root = try tree.directory("library")
+        try tree.file("library/IMG_0001.jpg", bytes: 64)
+        let model = BrowserModel(store: try IndexStore.inMemory(),
+                                 preferences: MemoryPreferences())
+        model.metadataWriter = RecordingMetadataWriter()
+        await model.open(root)
+        model.selectAll()
+        await model.resolveMetadataAvailability()
+
+        let (window, fields) = renderFields(BatchTimeSheet(model: model), count: 2)
+        defer { window.close() }
+        try #require(fields.count >= 2,
+                     "the batch time sheet rendered \(fields.count) fields, expected 2")
+
+        var seen: Set<BrowserModel.TextField> = []
+        for field in fields.prefix(2) {
+            focus(field, in: model)
+            seen.formUnion(model.editingFields)
+        }
+        #expect(seen == [.batchTimeSet, .batchTimeSetZone],
+                "the batch time sheet's fields reported \(seen)")
+    }
+
+    /// **Spec §11, at the pixels rather than at the flag.** With exiftool
+    /// unavailable the editing controls are *replaced by* the explanation: no
+    /// editable box is rendered at all, and the sentence and the command that
+    /// fixes it are.
+    ///
+    /// Driven as a transition rather than a bare negative: the same view is
+    /// rendered with the writer available first, so "no fields" cannot pass by
+    /// the host never having laid anything out.
+    @Test func withExiftoolUnavailableTheInspectorRendersNoEditableField() async throws {
+        let tree = try TempDirectory()
+        let root = try tree.directory("library")
+        try tree.file("library/IMG_0001.jpg", bytes: 64)
+        let model = BrowserModel(store: try IndexStore.inMemory(),
+                                 preferences: MemoryPreferences())
+        model.metadataWriter = RecordingMetadataWriter()
+        await model.open(root)
+        model.selectAll()
+        await model.resolveMetadataAvailability()
+
+        let (window, fields) = renderFields(InspectorView(model: model), count: 10)
+        defer { window.close() }
+        try #require(fields.count >= 10,
+                     "the inspector never rendered its fields, so their absence proves nothing")
+
+        model.metadataAvailability = .notFound
+        waitForEditableFieldsToDisappear(in: window)
+        #expect(editableFields(in: window).isEmpty,
+                "\(editableFields(in: window).count) editable fields survived exiftool going away")
+
+        let text = staticText(in: window)
+        #expect(text.contains { $0.contains("exiftool") },
+                "the explanation is not on screen; the panel shows \(text)")
+        #expect(text.contains(MetadataInspectorCopy.installCommand),
+                "the install command is not on screen; the panel shows \(text)")
+    }
+}
+
+/// Pumps the run loop until the panel has taken its editable fields down.
+///
+/// A synchronous helper because `RunLoop.current` is unavailable from an async
+/// context, and bounded by a deadline for the reason everything else here is:
+/// a fixed pump fails as "no fields", which reads like the assertion passing.
+@MainActor
+private func waitForEditableFieldsToDisappear(in window: NSWindow) {
+    let deadline = Date().addingTimeInterval(5)
+    while Date() < deadline, !editableFields(in: window).isEmpty {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+}
+
+/// Every editable `NSTextField` currently in `window`.
+@MainActor
+private func editableFields(in window: NSWindow) -> [NSTextField] {
+    allTextFields(in: window).filter(\.isEditable)
+}
+
+/// The selectable-but-not-editable ones, which is what `Text(...).textSelection(.enabled)`
+/// becomes on macOS — the only route a test has to the panel's own copy.
+@MainActor
+private func staticText(in window: NSWindow) -> [String] {
+    allTextFields(in: window).filter { !$0.isEditable }.map(\.stringValue)
+}
+
+@MainActor
+private func allTextFields(in window: NSWindow) -> [NSTextField] {
+    var found: [NSTextField] = []
+    func walk(_ view: NSView) {
+        if let field = view as? NSTextField { found.append(field) }
+        view.subviews.forEach(walk)
+    }
+    if let content = window.contentView { walk(content) }
+    return found
 }

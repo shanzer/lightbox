@@ -16,6 +16,13 @@ import LightboxCore
 /// - **It does not commit on blur.** Return applies; clicking away does not. A
 ///   blur-commit writes to every selected file the moment focus moves, which
 ///   for a 300-file selection is a batch nobody asked for. The fields say so.
+/// - **A blank box means unchanged — every box, no exceptions.** `onSubmit`
+///   fires on Return whether or not the text changed, so tabbing into an
+///   untouched Artist box on a 300-file selection and pressing Return would
+///   otherwise erase Artist on 300 files and rewrite every one of them, with no
+///   ⌘Z behind it. Erasing a tag is the ✕ beside the box, behind a
+///   confirmation. `MetadataField.isClearable` says which fields have one and
+///   why the other three do not.
 /// - **It does not show the current Artist, Copyright, Description, Keywords,
 ///   Rating, Label or GPS.** The index has no columns for them (`FileRecord`
 ///   carries capture time, zone, camera and dimensions and nothing else of
@@ -87,6 +94,15 @@ struct InspectorView: View {
                     row("Size", shared {
                         ByteCountFormatter.string(fromByteCount: $0.size, countStyle: .file)
                     })
+                    // **These two go stale after a capture-time edit, and that
+                    // is issue #42.** `IndexStore.recordMetadataWrite` rewrites
+                    // the row's size, mtime and hashes and leaves
+                    // `capture_time`/`capture_offset` alone — and since it does
+                    // rewrite size and mtime, `needsReindex` never asks for the
+                    // file to be read again either, so the stale value is
+                    // permanent rather than merely late. Nothing this view can
+                    // do short of a rescan is honest; the fix is one `Core`
+                    // change to that call.
                     row("Captured", shared { record in
                         record.captureDate.map { Self.dateFormatter.string(from: $0) }
                     })
@@ -137,8 +153,11 @@ struct InspectorView: View {
     private var editing: some View {
         Section("Edit") {
             if let explanation = model.metadataUnavailableExplanation {
-                // Spec §11: the fields render read-only with an explanation and
-                // the command that fixes it. Nothing else changes.
+                // Spec §11: with exiftool absent the editing controls are
+                // **replaced by** the explanation and the command that fixes
+                // it — not rendered greyed out. A disabled box carrying a value
+                // nobody can commit is furniture; the sentence is the whole of
+                // what there is to say. Nothing else in the window changes.
                 Text(explanation)
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -177,22 +196,22 @@ struct InspectorView: View {
             .disabled(!model.canStartMetadataBatch)
 
         field("Artist", text: $artistDraft, prompt: unchangedPrompt,
-              id: .inspectorArtist) { .artist(artistDraft) }
+              id: .inspectorArtist, clearing: .artist) { .artist(artistDraft) }
         field("Copyright", text: $copyrightDraft, prompt: unchangedPrompt,
-              id: .inspectorCopyright) { .copyright(copyrightDraft) }
+              id: .inspectorCopyright, clearing: .copyright) { .copyright(copyrightDraft) }
         field("Description", text: $descriptionDraft, prompt: unchangedPrompt,
-              id: .inspectorDescription) { .description(descriptionDraft) }
-        field("Keywords", text: $keywordsDraft, prompt: "alpha, beta",
-              id: .inspectorKeywords) { .keywords(keywordsDraft) }
-        field("Rating", text: $ratingDraft, prompt: "0–5",
+              id: .inspectorDescription, clearing: .description) { .description(descriptionDraft) }
+        field("Keywords", text: $keywordsDraft, prompt: unchangedPrompt,
+              id: .inspectorKeywords, clearing: .keywords) { .keywords(keywordsDraft) }
+        field("Rating", text: $ratingDraft, prompt: unchangedPrompt,
               id: .inspectorRating) { .rating(ratingDraft) }
         field("Label", text: $labelDraft, prompt: unchangedPrompt,
-              id: .inspectorLabel) { .label(labelDraft) }
-        field("Latitude", text: $latitudeDraft, prompt: "37.7749",
+              id: .inspectorLabel, clearing: .label) { .label(labelDraft) }
+        field("Latitude", text: $latitudeDraft, prompt: unchangedPrompt,
               id: .inspectorLatitude) {
             .gps(latitude: latitudeDraft, longitude: longitudeDraft)
         }
-        field("Longitude", text: $longitudeDraft, prompt: "-122.4194",
+        field("Longitude", text: $longitudeDraft, prompt: unchangedPrompt,
               id: .inspectorLongitude) {
             .gps(latitude: latitudeDraft, longitude: longitudeDraft)
         }
@@ -204,8 +223,8 @@ struct InspectorView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
 
-        if MetadataEditRequest.writesToSidecar(records) {
-            Text(MetadataInspectorCopy.sidecar)
+        if let sidecar = MetadataEditRequest.sidecarNotice(records) {
+            Text(sidecar)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -221,25 +240,23 @@ struct InspectorView: View {
             .fixedSize(horizontal: false, vertical: true)
     }
 
-    /// One editable field.
+    /// One editable field, through the shared `MetadataTextField` — the single
+    /// place `reportingTextFocus` is called, so there is one place to forget it
+    /// and `everyInspectorFieldReportsItsFocus` walks that place.
     ///
-    /// **Every one of them calls `reportingTextFocus`**, which is the
-    /// cross-file contract `BrowserModel.TextField` is the checklist for: a
-    /// field that forgets leaves ⌘Z reversing the last file batch while the
-    /// user types in it. Routed through one builder rather than written out ten
-    /// times so it cannot be forgotten for the eleventh.
+    /// `clearing` names the field the ✕ erases, and is absent for the three
+    /// that have no erase: `MetadataEdit` cannot spell "remove this capture
+    /// time / rating / position".
     @ViewBuilder
     private func field(_ label: String, text: Binding<String>, prompt: String,
                        id: BrowserModel.TextField,
+                       clearing clearable: MetadataField? = nil,
                        edit: @escaping () -> MetadataFieldEdit) -> some View {
-        LabeledContent(label) {
-            TextField("", text: text, prompt: Text(prompt))
-                .textFieldStyle(.roundedBorder)
-                .focused($focused, equals: id)
-                .reportingTextFocus(id, isFocused: focused == id, to: model)
-                .disabled(!model.canEditMetadata)
-                .onSubmit { commit(edit()) }
-        }
+        MetadataTextField(
+            label: label, text: text, prompt: prompt, id: id, focused: $focused,
+            model: model, isEnabled: model.canEditMetadata,
+            onSubmit: { commit(edit()) },
+            clear: clearable.map { field in { model.confirmClearMetadataField(field) } })
     }
 
     private func commit(_ edit: MetadataFieldEdit) {
@@ -251,9 +268,15 @@ struct InspectorView: View {
         }
     }
 
-    /// The prompt for a field the index cannot report a current value for.
-    /// A blank box means "leave this alone", and the prompt has to say so or
-    /// the box reads as "this file has no Artist".
+    /// **Every editable box carries this prompt**, because every one of them
+    /// means the same thing when empty: leave the tag alone. That is the rule
+    /// the whole editor turns on — `TextField.onSubmit` fires on Return whether
+    /// or not the text changed, so an empty box that erased would erase across
+    /// the selection on a stray Return. Erasing is the ✕ beside the box.
+    ///
+    /// It has to be said in the prompt or a blank box reads as "this file has
+    /// no Artist", which the index cannot actually tell us — see the type's own
+    /// documentation.
     private var unchangedPrompt: String {
         records.count == 1 ? "unchanged" : "unchanged for all \(records.count)"
     }

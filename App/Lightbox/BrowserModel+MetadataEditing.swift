@@ -83,7 +83,31 @@ extension BrowserModel {
     @discardableResult
     func commitMetadataField(_ edit: MetadataFieldEdit) async -> MetadataEditRefusal? {
         guard canStartWork else { return .busy }
-        return await apply(MetadataEditRequest.build(edit, for: selectedRecords))
+        return await apply(MetadataEditRequest.build(edit, for: selectedRecords),
+                           isClear: edit.isClear)
+    }
+
+    /// Puts the confirmation in front of an erase.
+    ///
+    /// **Blank means unchanged, so erasing needs a gesture of its own** — see
+    /// `MetadataField.isClearable`. It gets a confirmation for the same reason
+    /// a permanent delete does: it acts on the whole selection, it rewrites
+    /// every one of those files, and ⌘Z cannot put the tag back.
+    func confirmClearMetadataField(_ field: MetadataField) {
+        guard field.isClearable, canStartMetadataBatch else { return }
+        activeSheet = .confirmMetadataClear(field: field, count: selection.selected.count)
+    }
+
+    /// Runs the erase the confirmation sheet just agreed to.
+    ///
+    /// `canStartWork` is not consulted, for the reason
+    /// `applyBatchTimeOperation` gives: the sheet asking the question is the
+    /// sheet on screen.
+    @discardableResult
+    func clearMetadataField(_ field: MetadataField) async -> MetadataEditRefusal? {
+        guard !isBatchRunning else { return .busy }
+        return await apply(MetadataEditRequest.build(.clear(field), for: selectedRecords),
+                           isClear: true)
     }
 
     /// Raises the batch time sheet — spec §9's set / shift / assign-a-sequence.
@@ -111,7 +135,7 @@ extension BrowserModel {
     }
 
     private func apply(
-        _ built: Result<MetadataEditRequest, MetadataEditRefusal>
+        _ built: Result<MetadataEditRequest, MetadataEditRefusal>, isClear: Bool = false
     ) async -> MetadataEditRefusal? {
         // **Checked before the request is even looked at.** Without this a
         // window whose probe came back `.notFound` still forks a batch that
@@ -124,7 +148,7 @@ extension BrowserModel {
             return refusal
         case .success(let request):
             guard !request.isEmpty else { return .nothingToWrite }
-            await run(request)
+            await run(request, isClear: isClear)
             return nil
         }
     }
@@ -157,7 +181,7 @@ extension BrowserModel {
         }
     }
 
-    private func run(_ request: MetadataEditRequest) async {
+    private func run(_ request: MetadataEditRequest, isClear: Bool) async {
         // Set synchronously, before any suspension, for the reason
         // `isBatchRunning` gives: between the commit and the first `await`
         // there is otherwise a window in which a second commit sees nothing
@@ -200,13 +224,14 @@ extension BrowserModel {
                                                                progress: handlers[index]))
             }
             if Task.isCancelled { cancelled = true }
-            await self?.finish(outcomes, cancelled: cancelled)
+            await self?.finish(outcomes, cancelled: cancelled, isClear: isClear)
         }
         batchTask = task
         await task.value
     }
 
-    private func finish(_ outcomes: [WriteOutcome], cancelled: Bool) async {
+    private func finish(_ outcomes: [WriteOutcome], cancelled: Bool,
+                        isClear: Bool) async {
         endBatch()
 
         // **`lastCompletedBatch` is deliberately not written.** A metadata edit
@@ -215,9 +240,20 @@ extension BrowserModel {
         // and actually reversing whatever file operation came before it.
 
         // See this extension's own documentation for why this is `reload()`.
+        //
+        // **It will not refresh the inspector's *Captured* row after a
+        // capture-time edit, and that is issue #42, not a bug here.**
+        // `IndexStore.recordMetadataWrite` rewrites the row's size, mtime and
+        // hashes and leaves `capture_time`/`capture_offset` alone — and because
+        // it *does* rewrite size and mtime, which is exactly what
+        // `needsReindex` keys on, no later pass re-reads the file either. So
+        // the row this reload fetches still carries the old capture time. The
+        // fix is one `Core` change to that call; nothing this layer can do
+        // short of a rescan would be honest.
         await reload()
 
-        let summary = MetadataSummary(outcomes: outcomes, wasCancelled: cancelled)
+        let summary = MetadataSummary(outcomes: outcomes, wasCancelled: cancelled,
+                                      wasClear: isClear)
         await present(summary.isWorthShowing ? .metadataSummary(summary) : nil)
     }
 }

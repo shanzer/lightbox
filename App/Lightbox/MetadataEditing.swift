@@ -171,6 +171,27 @@ enum MetadataField: String, CaseIterable, Sendable {
     case label
     case gps
 
+    /// Whether the field has an explicit Clear control.
+    ///
+    /// **Blank means unchanged for every field, this one included** — the rule
+    /// the whole editor turns on, because `TextField.onSubmit` fires on Return
+    /// whether or not the text changed. Tabbing into an untouched Artist box on
+    /// a 300-file selection and pressing Return must not erase Artist on 300
+    /// files and rewrite every one of them, with no ⌘Z to put them back; the
+    /// prompt says "unchanged" and it has to be true. So erasing is a separate,
+    /// confirmed gesture rather than an empty string that happens to reach
+    /// `MetadataWriter`, which writes `-MWG:Creator=` for one.
+    ///
+    /// Capture time, rating and GPS have no Clear: `MetadataEdit` has no way to
+    /// spell "remove this", and inventing one would be a `Core` change to a
+    /// model that deliberately reads a nil field as "leave it alone".
+    var isClearable: Bool {
+        switch self {
+        case .artist, .copyright, .description, .keywords, .label: true
+        case .captureTime, .rating, .gps: false
+        }
+    }
+
     var title: String {
         switch self {
         case .captureTime: "Capture time"
@@ -195,14 +216,16 @@ enum MetadataFieldEdit: Sendable, Equatable {
     case artist(String)
     case copyright(String)
     case description(String)
-    /// Comma-separated. `MetadataEdit.keywords` replaces the set wholesale, so
-    /// an empty string clears every keyword rather than doing nothing.
+    /// Comma- or newline-separated.
     case keywords(String)
-    /// `0`…`5`, or empty to leave the rating alone.
+    /// `0`…`5`.
     case rating(String)
     case label(String)
     case gps(latitude: String, longitude: String)
     case captureTime(wallClock: String, offset: String)
+    /// **Erasing a tag is its own gesture**, never a side effect of an empty
+    /// box. See `MetadataField.isClearable` for why.
+    case clear(MetadataField)
 
     var field: MetadataField {
         switch self {
@@ -214,7 +237,16 @@ enum MetadataFieldEdit: Sendable, Equatable {
         case .label: .label
         case .gps: .gps
         case .captureTime: .captureTime
+        case .clear(let field): field
         }
+    }
+
+    /// Whether this commit erases rather than sets. The summary says "cleared"
+    /// for these, because "1 file written" over a tag that was deleted is a
+    /// true sentence that describes the wrong event.
+    var isClear: Bool {
+        if case .clear = self { return true }
+        return false
     }
 }
 
@@ -263,6 +295,10 @@ enum MetadataEditRefusal: Error, Sendable, Equatable {
     /// silently skipping those files: "8 of 12 were shifted" discovered
     /// afterwards is worse than being told first.
     case noCaptureTimeToShift(count: Int)
+    /// A shift keeps each file's own zone, so a file with no parseable
+    /// `OffsetTimeOriginal` has no zone to keep — and substituting one would be
+    /// writing a timestamp whose meaning the app made up.
+    case noTimeZoneToShift(count: Int)
 
     var message: String {
         switch self {
@@ -299,6 +335,10 @@ enum MetadataEditRefusal: Error, Sendable, Equatable {
         case .noCaptureTimeToShift(let count):
             "\(count) selected \(count == 1 ? "image has" : "images have") no capture time "
                 + "to shift. Set a capture time on \(count == 1 ? "it" : "them") first."
+        case .noTimeZoneToShift(let count):
+            "\(count) selected \(count == 1 ? "image has" : "images have") no time zone, and "
+                + "a shift keeps each image's own. Set a capture time and zone on "
+                + "\(count == 1 ? "it" : "them") first."
         }
     }
 }
@@ -348,16 +388,28 @@ struct MetadataEditRequest: Sendable, Equatable {
         for edit: MetadataFieldEdit
     ) -> Result<MetadataEdit, MetadataEditRefusal> {
         switch edit {
+        // **Blank is unchanged for every one of these**, and that is the rule
+        // the editor turns on — see `MetadataField.isClearable`. An empty
+        // string here is not "no field was set": `MetadataEdit.artist = ""` is
+        // non-nil, so `isEmpty` stays false and `MetadataWriter+Tags` emits an
+        // explicit `-MWG:Creator=` that erases the tag on every selected file.
         case .artist(let value):
-            return .success(MetadataEdit(artist: value))
+            return set(value) { MetadataEdit(artist: $0) }
         case .copyright(let value):
-            return .success(MetadataEdit(copyright: value))
+            return set(value) { MetadataEdit(copyright: $0) }
         case .description(let value):
-            return .success(MetadataEdit(description: value))
-        case .keywords(let value):
-            return .success(MetadataEdit(keywords: keywords(from: value)))
+            return set(value) { MetadataEdit(description: $0) }
         case .label(let value):
-            return .success(MetadataEdit(label: value))
+            return set(value) { MetadataEdit(label: $0) }
+        case .keywords(let value):
+            let parsed = keywords(from: value)
+            // Same rule, and it used to be the exception: an empty keyword box
+            // cleared the set. One rule everywhere is worth more than the
+            // convenience, and Clear is right there.
+            guard !parsed.isEmpty else { return .failure(.nothingToWrite) }
+            return .success(MetadataEdit(keywords: parsed))
+        case .clear(let field):
+            return clear(field)
         case .rating(let text):
             let trimmed = text.trimmingCharacters(in: .whitespaces)
             // Blank is "leave it alone", not zero: zero is a real rating that
@@ -387,10 +439,48 @@ struct MetadataEditRequest: Sendable, Equatable {
         }
     }
 
+    /// A text field's value, or `nothingToWrite` when the box is blank.
+    private static func set(
+        _ value: String, _ make: (String) -> MetadataEdit
+    ) -> Result<MetadataEdit, MetadataEditRefusal> {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .failure(.nothingToWrite) }
+        // Trimmed, not raw: a trailing space is not part of anybody's name, and
+        // EXIF readers pad these strings anyway.
+        return .success(make(trimmed))
+    }
+
+    /// The explicit erase. An empty string is exactly what `MetadataWriter`
+    /// turns into a tag-removing write — the difference from the blank-box case
+    /// is that a user asked for it and confirmed it.
+    private static func clear(
+        _ field: MetadataField
+    ) -> Result<MetadataEdit, MetadataEditRefusal> {
+        switch field {
+        case .artist: .success(MetadataEdit(artist: ""))
+        case .copyright: .success(MetadataEdit(copyright: ""))
+        case .description: .success(MetadataEdit(description: ""))
+        case .label: .success(MetadataEdit(label: ""))
+        case .keywords: .success(MetadataEdit(keywords: []))
+        // Unreachable through the UI — `isClearable` is what draws the button —
+        // but refused rather than trapped, because a `fatalError` reachable
+        // from a menu is not a trade worth making.
+        case .captureTime, .rating, .gps: .failure(.nothingToWrite)
+        }
+    }
+
     /// Spec §9, constraint 1, enforced here so the refusal is a message beside
     /// the field rather than N identical rows in a summary sheet.
     static func captureTime(wallClock: String,
                             offset: String) -> Result<CaptureTime, MetadataEditRefusal> {
+        // **Checked before the zone**, because the zone box is always populated
+        // and the wall clock is not: a Return in the zone box of a selection
+        // whose capture times disagree would otherwise report `"" is not a date
+        // and time` for a field the user never touched. Blank means unchanged
+        // here as everywhere else.
+        guard !wallClock.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return .failure(.nothingToWrite)
+        }
         let trimmedOffset = offset.trimmingCharacters(in: .whitespaces)
         guard !trimmedOffset.isEmpty else { return .failure(.captureTimeRequiresTimeZone) }
         guard let zone = TimeZoneOffset.parse(trimmedOffset) else {
@@ -427,19 +517,33 @@ struct MetadataEditRequest: Sendable, Equatable {
             }
 
         case .shift(let seconds):
-            let missing = records.filter { $0.captureDate == nil }.count
-            guard missing == 0 else { return .failure(.noCaptureTimeToShift(count: missing)) }
+            let missingTime = records.filter { $0.captureDate == nil }.count
+            guard missingTime == 0 else {
+                return .failure(.noCaptureTimeToShift(count: missingTime))
+            }
+            // **A shift may not invent a zone.** Substituting the machine's for
+            // a file that carries none writes an `OffsetTimeOriginal` nobody
+            // asked for — spec §9, constraint 1, read backwards — and it would
+            // be formatted at the *pre-shift* instant, so a shift across a DST
+            // boundary would stamp the wrong one. A shift is for a clock that
+            // was wrong; a file with no zone needs the zone set first, and it
+            // is told so before anything runs, exactly as a file with no
+            // capture time is.
+            let missingZone = records.filter { record in
+                record.captureOffset.flatMap { TimeZoneOffset.parse($0) } == nil
+            }.count
+            guard missingZone == 0 else {
+                return .failure(.noTimeZoneToShift(count: missingZone))
+            }
             var groups: [Group] = []
             groups.reserveCapacity(records.count)
             for record in records {
-                // `captureDate` is non-nil for every record here — the guard
-                // above is the whole batch's precondition — but the shift is
-                // still expressed per record rather than hoisted, because each
-                // file keeps **its own** zone: a shift fixes a wrong clock, it
-                // does not move photos between zones.
-                guard let existing = record.captureDate else { continue }
-                let offset = record.captureOffset.flatMap { TimeZoneOffset.parse($0) != nil ? $0 : nil }
-                    ?? TimeZoneOffset.format(.current, at: existing)
+                // Both preconditions hold for every record here, but the shift
+                // is still expressed per record rather than hoisted, because
+                // each file keeps **its own** zone: a shift fixes a wrong
+                // clock, it does not move photos between zones.
+                guard let existing = record.captureDate, let offset = record.captureOffset
+                else { continue }
                 let capture = CaptureTime(date: existing.addingTimeInterval(Double(seconds)),
                                           offset: offset)
                 groups.append(Group(edit: MetadataEdit(captureTime: capture),
@@ -496,7 +600,28 @@ struct MetadataEditRequest: Sendable, Equatable {
     /// (spec §9, constraint 2). The inspector says so beside the fields, so the
     /// user knows the container is untouched.
     static func writesToSidecar(_ records: [FileRecord]) -> Bool {
-        records.contains { MediaType.forExtension($0.ext)?.kind == .raw }
+        sidecarCount(records) > 0
+    }
+
+    /// How many of them. A mixed selection is the common case — a RAW+JPEG pair
+    /// is what the companion-files preference exists for — and "writes to an
+    /// .xmp sidecar" over a selection where only two of thirty do is a claim
+    /// about the other twenty-eight that is not true.
+    static func sidecarCount(_ records: [FileRecord]) -> Int {
+        records.count { MediaType.forExtension($0.ext)?.kind == .raw }
+    }
+
+    /// The sentence beside the fields, or nil when nothing in the selection is
+    /// RAW.
+    static func sidecarNotice(_ records: [FileRecord]) -> String? {
+        let count = sidecarCount(records)
+        guard count > 0 else { return nil }
+        if count == records.count {
+            return records.count == 1
+                ? "Writes to an .xmp sidecar; the RAW file is untouched."
+                : "These write to .xmp sidecars; the RAW files are untouched."
+        }
+        return "\(count) of these write to an .xmp sidecar; those RAW files are untouched."
     }
 }
 
@@ -524,6 +649,10 @@ struct MetadataSummary: Identifiable, Sendable {
 
     let id = UUID()
     let wasCancelled: Bool
+    /// Whether the commit erased a tag rather than setting one, so the headline
+    /// can say "cleared" — "3 files written" over a deleted Artist is a true
+    /// sentence describing the wrong event.
+    let wasClear: Bool
     let written: Int
     let failures: [Row]
     /// Warnings from writes that *succeeded*. Shown when the sheet is up, and
@@ -531,15 +660,29 @@ struct MetadataSummary: Identifiable, Sendable {
     let notes: [Row]
     /// Files whose edit landed in an `.xmp` sidecar rather than the container.
     let sidecars: Int
+    /// Files the batch never got to because the user pressed Stop.
+    ///
+    /// **Counted, never listed as failures.** `MetadataWriter` reports every
+    /// un-reached file as `.failure(.cancelled)` — that is the right shape for
+    /// a per-item result list, and the wrong one for a sheet: folded into
+    /// `failures` it raises "295 files could not be written" in front of a user
+    /// who pressed Stop and watched the progress bar the whole time. A move's
+    /// clean cancel shows no sheet at all (`OperationSummary.wasCancelled`) and
+    /// this follows it.
+    let notReached: Int
 
-    init(outcomes: [WriteOutcome], wasCancelled: Bool) {
+    init(outcomes: [WriteOutcome], wasCancelled: Bool, wasClear: Bool = false) {
         self.wasCancelled = wasCancelled
+        self.wasClear = wasClear
         var failures: [Row] = []
         var notes: [Row] = []
         var written = 0
         var sidecars = 0
+        var notReached = 0
         for outcome in outcomes {
             switch outcome.result {
+            case .failure(.cancelled):
+                notReached += 1
             case .failure(let error):
                 failures.append(Row(id: "fail:" + outcome.source.path,
                                     source: outcome.source, detail: error.explanation))
@@ -557,6 +700,7 @@ struct MetadataSummary: Identifiable, Sendable {
         self.notes = notes
         self.written = written
         self.sidecars = sidecars
+        self.notReached = notReached
     }
 
     /// **Two of the five warnings are expected rather than surprising**, and a
@@ -584,17 +728,22 @@ struct MetadataSummary: Identifiable, Sendable {
     ///
     /// The same rule the file-operation summary follows — report the
     /// exceptions, do not congratulate the rule — with warnings folded in,
-    /// because the three warnings that survive `describe` are exceptions too. A
-    /// clean cancel shows nothing: the progress sheet was on screen counting up
-    /// until Stop was pressed.
+    /// because the three warnings that survive `describe` are exceptions too.
+    ///
+    /// **`notReached` is deliberately absent from this.** A clean cancel shows
+    /// nothing: the progress sheet was on screen counting up until the moment
+    /// Stop was pressed, so nothing needs to tell the user how far it got —
+    /// they watched it. The count only reaches the screen alongside a real
+    /// failure, where it explains why the numbers do not add up.
     var isWorthShowing: Bool { !failures.isEmpty || !notes.isEmpty }
 
     var headline: String {
+        let verb = wasClear ? "cleared" : "written"
         guard !failures.isEmpty else {
-            return "\(written) \(written == 1 ? "file" : "files") written."
+            return "\(written) \(written == 1 ? "file" : "files") \(verb)."
         }
         let noun = failures.count == 1 ? "file" : "files"
-        let stem = "\(failures.count) \(noun) could not be written"
-        return wasCancelled ? "\(stem). The batch was cancelled." : "\(stem)."
+        let stem = "\(failures.count) \(noun) could not be \(verb)"
+        return wasCancelled ? "\(stem). The batch was stopped." : "\(stem)."
     }
 }

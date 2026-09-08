@@ -106,15 +106,14 @@ struct BatchTimeSheet: View {
         }
     }
 
+    /// The shared builder — see `MetadataTextField`. One place calls
+    /// `reportingTextFocus`, so there is one place to forget it and a test that
+    /// walks it.
     @ViewBuilder
     private func field(_ label: String, text: Binding<String>, prompt: String,
                        id: BrowserModel.TextField) -> some View {
-        LabeledContent(label) {
-            TextField("", text: text, prompt: Text(prompt))
-                .textFieldStyle(.roundedBorder)
-                .focused($focused, equals: id)
-                .reportingTextFocus(id, isFocused: focused == id, to: model)
-        }
+        MetadataTextField(label: label, text: text, prompt: prompt, id: id,
+                          focused: $focused, model: model)
     }
 
     private func apply() {
@@ -222,8 +221,50 @@ enum MetadataInspectorCopy {
     /// edit writes no `op_journal` rows, so there is nothing for ⌘Z to reverse.
     static let notUndoable = "Metadata edits are not undoable with ⌘Z in this phase."
 
-    /// Spec §9, constraint 2, where the user can see it.
-    static let sidecar = "Writes to an .xmp sidecar; the RAW file is untouched."
-
     static let installCommand = "brew install exiftool"
+
+    /// The confirmation in front of an erase. Says "erase", not "clear the
+    /// field": the field is a box on screen and the tag is in the user's files,
+    /// and only one of the two is about to change.
+    static func clearWarning(field: MetadataField, count: Int) -> String {
+        "\(field.title) will be erased from \(count) \(count == 1 ? "file" : "files"). "
+            + "Leaving the box empty does nothing; this is how the tag is removed. "
+            + "It cannot be undone with ⌘Z."
+    }
+}
+
+// MARK: - Clearing a field
+
+/// The confirmation in front of erasing one field across the selection.
+///
+/// **Blank means unchanged**, so this is the only way a tag is removed — and it
+/// asks first, for the reasons a permanent delete does: it acts on everything
+/// selected, it rewrites every one of those files, and no ⌘Z will put the tag
+/// back.
+struct MetadataClearSheet: View {
+    @Bindable var model: BrowserModel
+    let field: MetadataField
+    let count: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Erase \(field.title) from \(count) \(count == 1 ? "item" : "items")?")
+                .font(.headline)
+            Text(MetadataInspectorCopy.clearWarning(field: field, count: count))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { model.dismissSheet() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Erase", role: .destructive) {
+                    Task { await model.clearMetadataField(field) }
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+    }
 }

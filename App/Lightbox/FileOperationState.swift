@@ -243,6 +243,11 @@ enum ActiveSheet: Identifiable {
     case confirmPermanentDelete(count: Int)
     /// Spec §9's batch time operations: set, shift, assign a sequence.
     case batchTime
+    /// The confirmation in front of erasing one metadata field across the
+    /// selection. Blank means unchanged everywhere, so an erase is a gesture of
+    /// its own — and one that rewrites every selected file with no ⌘Z behind
+    /// it, which is the same reason a permanent delete asks first.
+    case confirmMetadataClear(field: MetadataField, count: Int)
     /// A metadata batch's per-item report. Separate from `.summary` because a
     /// metadata write has warnings and no destination, and a file operation has
     /// a destination and no warnings — one sheet serving both would be a switch
@@ -256,6 +261,7 @@ enum ActiveSheet: Identifiable {
         case .summary: "summary"
         case .confirmPermanentDelete: "confirmPermanentDelete"
         case .batchTime: "batchTime"
+        case .confirmMetadataClear: "confirmMetadataClear"
         case .metadataSummary: "metadataSummary"
         }
     }
