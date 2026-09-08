@@ -229,7 +229,11 @@ extension BrowserModel {
     /// its next sheet. `HANDOFF` §7.6 owes this a live check: nothing in an
     /// `xcodebuild test` run presents a real sheet, so the model's state is all
     /// a test here can see.
-    private func present(_ sheet: ActiveSheet?) async {
+    /// Internal rather than private: `BrowserModel+MetadataEditing.swift` runs
+    /// its batch through the same sheet discipline, and Swift has no access
+    /// level for "this type, across files". Nothing outside `BrowserModel`
+    /// calls it.
+    func present(_ sheet: ActiveSheet?) async {
         guard sheet != nil, activeSheet != nil else {
             activeSheet = sheet
             return
@@ -270,7 +274,9 @@ extension BrowserModel {
     /// to. One copy, because both endings need the same four assignments in the
     /// same order and a drifting second copy is how the indicator outlives its
     /// batch.
-    private func endBatch() {
+    /// Internal for the same reason `present(_:)` is — the metadata batch ends
+    /// with exactly these four assignments in exactly this order.
+    func endBatch() {
         batchToken += 1
         batchProgress = nil
         batchTask = nil

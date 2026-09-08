@@ -21,6 +21,10 @@ struct FileOperationSheetView: View {
             OperationSummarySheet(model: model, summary: summary)
         case .confirmPermanentDelete(let count):
             PermanentDeleteSheet(model: model, count: count)
+        case .batchTime:
+            BatchTimeSheet(model: model)
+        case .metadataSummary(let summary):
+            MetadataSummarySheet(model: model, summary: summary)
         }
     }
 }

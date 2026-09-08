@@ -164,6 +164,26 @@ final class BrowserModel {
         /// `FilterPanelView`'s exact-size pair.
         case exactWidth
         case exactHeight
+        /// `InspectorView`'s editable spec §9 fields. Capture time is two
+        /// boxes because a zone is not optional (spec §9, constraint 1) and
+        /// GPS is two because half a coordinate is not a position.
+        case inspectorCaptureTime
+        case inspectorCaptureZone
+        case inspectorArtist
+        case inspectorCopyright
+        case inspectorDescription
+        case inspectorKeywords
+        case inspectorRating
+        case inspectorLabel
+        case inspectorLatitude
+        case inspectorLongitude
+        /// `BatchTimeSheet`'s three operations.
+        case batchTimeSet
+        case batchTimeSetZone
+        case batchTimeShift
+        case batchTimeSequenceStart
+        case batchTimeSequenceZone
+        case batchTimeSequenceInterval
     }
 
     /// Which text fields are being edited right now.
@@ -413,7 +433,11 @@ final class BrowserModel {
                            sort: pass.sort)
     }
 
-    private let store: IndexStore
+    /// Internal rather than private for the same reason `fileOperator` is:
+    /// `BrowserModel+MetadataEditing.swift` builds this window's
+    /// `LiveMetadataWriter` around it, and Swift has no access level for "this
+    /// type, across files". Nothing outside `BrowserModel` reads it.
+    let store: IndexStore
     private let searcher: any RecordSearching
     private let coordinator: IndexCoordinator
     private var indexingTask: Task<Void, Never>?
@@ -425,6 +449,24 @@ final class BrowserModel {
     /// `BrowserModel+FileOperations.swift`, and Swift has no access level for
     /// "this type, across files". Nothing outside `BrowserModel` touches these.
     let fileOperator: FileOperator
+
+    // MARK: - Metadata editing
+
+    /// This window's metadata writer, or nil until one is needed.
+    ///
+    /// Built lazily by `BrowserModel.metadataEditor` rather than in `init`,
+    /// because constructing the real one resolves `MetadataWriter.availability`
+    /// — which forks `exiftool -ver`. A window must not pay for that before it
+    /// has drawn, for a feature the user may never touch. A test assigns a stub
+    /// here before the first commit; that is the seam the App suite's
+    /// exiftool-free tests run through.
+    var metadataWriter: (any MetadataWriting)?
+
+    /// The answer to "can this window write metadata at all", once resolved.
+    ///
+    /// Nil means *not yet asked*, which the inspector renders exactly as
+    /// unavailable: an unresolved probe is not permission to write.
+    var metadataAvailability: ExiftoolAvailability?
 
     /// Where the companion-files preference is remembered. See `PreferenceStore`.
     let preferences: any PreferenceStore
