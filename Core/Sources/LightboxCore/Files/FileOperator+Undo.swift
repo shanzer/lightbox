@@ -210,6 +210,7 @@ extension FileOperator {
                 trashURL: execution.trashURLs.first ?? nil, companions: [],
                 outcome: execution.outcome))
             onProgress?(index + 1, steps.count, step.source)
+            await itemBoundaryHook?(index + 1)
         }
         return UndoBatch(batchID: undoBatchID, results: results)
     }

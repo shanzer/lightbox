@@ -76,6 +76,36 @@ public actor FileOperator {
     /// as an intermittently stalled CI job on a machine nobody is watching.
     func currentQueueLabel() -> String { BlockingWork.currentQueueLabel }
 
+    /// Test seam for #45: awaited once per finished item, in `execute` and
+    /// `undo` alike, immediately after that item's progress report and before
+    /// the next iteration's `Task.checkCancellation()`. `nil` in production,
+    /// so the ordinary batch path pays nothing for it.
+    ///
+    /// A caller that wants a cancel to land after an exact item — rather than
+    /// racing it against `batchProgress` on the main actor, which a busy
+    /// process can starve for seconds — parks a `Task` here until it has
+    /// cancelled the batch, then releases it. Because cancellation is only
+    /// ever observed at the boundary this hook already stands on, the very
+    /// next iteration is guaranteed to throw rather than start another item.
+    /// The park is an ordinary `async` suspension on this actor's own queue,
+    /// not a blocked thread, so it costs the cooperative pool nothing.
+    /// Internal, never `public`, and reached from the App test target through
+    /// `@testable import LightboxCore` — the rule `CooperativePoolTests`
+    /// already states for `BlockingWork`'s labels: a test seam must not widen
+    /// the API that production code is held to.
+    typealias ItemBoundaryHook = @Sendable (_ completed: Int) async -> Void
+    // Internal rather than private for the same reason: `FileOperator+Undo.swift`'s
+    // loop reports through this too, and Swift has no access level for "this
+    // type, across files".
+    var itemBoundaryHook: ItemBoundaryHook?
+
+    /// Installs (or clears) the hook above. An actor method rather than a
+    /// settable property, because the hook is actor-isolated state and a test
+    /// sets it from outside the actor.
+    func setItemBoundaryHookForTesting(_ hook: ItemBoundaryHook?) {
+        itemBoundaryHook = hook
+    }
+
     /// Internal so the replacement machinery in `FileOperator+Replacements.swift`
     /// can reach it. Nothing outside `FileOperator` holds one.
     let store: IndexStore
@@ -286,10 +316,12 @@ public actor FileOperator {
 
             if volumeGone {
                 try skip(.volumeUnmounted, journalling: true)
+                await itemBoundaryHook?(index + 1)
                 continue
             }
             if case .skip(let reason) = dispositions[index] {
                 try skip(reason, journalling: false)
+                await itemBoundaryHook?(index + 1)
                 continue
             }
             // Re-read the volumes before every item rather than trusting the one
@@ -301,6 +333,7 @@ public actor FileOperator {
             guard volumesStillAnswering(item, plan) else {
                 volumeGone = true
                 try skip(.volumeUnmounted, journalling: true)
+                await itemBoundaryHook?(index + 1)
                 continue
             }
 
@@ -336,6 +369,7 @@ public actor FileOperator {
             results.append(Self.result(item, execution.outcome,
                                        trashURL: execution.trashURLs.first ?? nil))
             onProgress?(index + 1, plan.items.count, item.source)
+            await itemBoundaryHook?(index + 1)
         }
         return results
     }
