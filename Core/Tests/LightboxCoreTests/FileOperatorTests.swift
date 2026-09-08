@@ -278,7 +278,7 @@ struct FileOperatorRemovalTests {
     init() throws { tree = try TempTree() }
 
     @Test func trashingRecordsTheResultingURLAndRemovesTheRow() async throws {
-        let source = try tree.file("lib/IMG_0001.jpg", bytes: 64)
+        let source = try tree.file("lib/\(tree.uniqueName("IMG_0001", ext: "jpg"))", bytes: 64)
         let store = try IndexStore.inMemory()
         try index(source, into: store)
 

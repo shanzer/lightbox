@@ -27,6 +27,17 @@ final class TempTree {
     private var originalModes: [String: NSNumber] = [:]
     private var isCleanedUp = false
 
+    /// A suffix unique to this instance, minted once and shared by every call
+    /// to `uniqueName(_:ext:)`. Each test builds its own `TempTree`, so this
+    /// tags every fixture that test creates — which matters for a fixture
+    /// that leaves the tree altogether, the way a trashed file lands in the
+    /// developer's real `~/.Trash`. Two tests trashing same-named fixtures at
+    /// once is exactly how `swift test`'s parallel suites collide there:
+    /// Finder's Trash de-duplicates by name, so two `IMG_0001.CR2`s racing
+    /// into it fight over one slot. A per-instance tag means no two tests
+    /// ever offer the same name to begin with.
+    private lazy var tag = String(UUID().uuidString.prefix(8))
+
     init() throws {
         root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("lightbox-tests-\(UUID().uuidString)")
@@ -73,6 +84,15 @@ final class TempTree {
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(repeating: 0x41, count: bytes).write(to: url)
         return url
+    }
+
+    /// Mints `"<stem>-<tag>.<ext>"`, a fixture name unique to this tree.
+    /// A companion shares its sibling's tag by passing the same `stem`:
+    /// `uniqueName("IMG_0001", ext: "CR2")` and `uniqueName("IMG_0001", ext: "xmp")`
+    /// still pair up on the shared stem, just not on the literal `"IMG_0001"`
+    /// a concurrently running test might also choose.
+    func uniqueName(_ stem: String, ext: String) -> String {
+        "\(stem)-\(tag).\(ext)"
     }
 
     @discardableResult

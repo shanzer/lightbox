@@ -133,9 +133,12 @@ struct FileOperatorCollisionTests {
     /// row taking its place; leaving it behind would be an index entry for
     /// bytes that no longer exist, in the table duplicate detection reads.
     @Test func replaceOverwritesTheFileAndRetiresItsRow() async throws {
-        let source = try tree.file("a/IMG_0001.jpg", bytes: 20)
+        // The batch reaches the real Trash (through `disposeOfStash`), so the
+        // fixture name must be unique to this test run.
+        let name = tree.uniqueName("IMG_0001", ext: "jpg")
+        let source = try tree.file("a/\(name)", bytes: 20)
         let destination = try tree.directory("to")
-        let occupant = try tree.file("to/IMG_0001.jpg", bytes: 10)
+        let occupant = try tree.file("to/\(name)", bytes: 10)
         let store = try IndexStore.inMemory()
         try index(source, into: store)
         let occupantID = try index(occupant, into: store)
@@ -157,7 +160,7 @@ struct FileOperatorCollisionTests {
         #expect(try store.count() == 1)
         let row = try #require(try store.record(atPath: occupant.path))
         #expect(row.id != occupantID)
-        #expect(row.contentHash == "hash-IMG_0001.jpg")
+        #expect(row.contentHash == "hash-\(name)")
         // No stash left behind.
         let leftovers = try FileManager.default
             .contentsOfDirectory(atPath: destination.path)
@@ -356,8 +359,10 @@ struct FileOperatorCompanionTests {
     }
 
     @Test func trashingTakesTheCompanionsToo() async throws {
-        let raw = try tree.file("lib/IMG_0001.CR2", bytes: 40)
-        let sidecar = try tree.file("lib/IMG_0001.xmp", bytes: 5)
+        // Reaches the real Trash, so the fixture name must be unique to this
+        // test run — see `TempTree.uniqueName`.
+        let raw = try tree.file("lib/\(tree.uniqueName("IMG_0001", ext: "CR2"))", bytes: 40)
+        let sidecar = try tree.file("lib/\(tree.uniqueName("IMG_0001", ext: "xmp"))", bytes: 5)
         let store = try IndexStore.inMemory()
         try index(raw, into: store)
 

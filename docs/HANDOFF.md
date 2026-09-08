@@ -789,10 +789,15 @@ all three are now done:
   `aBatchSurvivesQuittingAndIsUndoneAfterRelaunch` closes a file-backed store and
   undoes through a fresh one, and `anEmptiedTrashIsFivePerItemFailuresAndNothingElse`
   trashes five real files, empties them from the real Trash and asserts five
-  `.trashEmptied` results with nothing else touched. Also owed: a genuinely
-  cross-volume undo. `performTransfer` is shared with the forward path, which is
-  where the cross-volume legs are tested, but no test drives an undo across two
-  real volumes.
+  `.trashEmptied` results with nothing else touched. Every Core test that trashes a
+  file for real cleans it up afterwards from the journal's own `trash_url` rows —
+  never by listing `~/.Trash` and matching on name — and, since #35, mints its
+  fixture name unique to that test run (`TempTree.uniqueName(_:ext:)`) rather than
+  reusing a literal like `IMG_0001.CR2`: `swift test` runs suites in parallel, and
+  two tests trashing the same name at once collide in that one shared directory.
+  Also owed: a genuinely cross-volume undo. `performTransfer` is shared with the
+  forward path, which is where the cross-volume legs are tested, but no test
+  drives an undo across two real volumes.
 
 - ~~**The file-operation UI.**~~ **Done** (issue #7). Move To…, Copy To…, Move
   to Trash (⌘⌫) and Delete Permanently… in the File menu, ⌘Z in the Edit menu,
