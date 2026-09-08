@@ -33,10 +33,10 @@ protocol MetadataWriting: Sendable {
 /// resolved availability — are not touched from two windows at once. The actor
 /// itself does no blocking work: `MetadataWriter` runs its body on a dispatch
 /// queue of its own (#28), and the availability probe, which forks a process,
-/// is pushed onto the *global* queue rather than left on the cooperative pool.
-/// `DispatchQueue.global` grows under load; the cooperative pool is exactly
-/// `activeProcessorCount` threads wide and never does, so a fork parked on one
-/// of its threads is a thread the process has lost.
+/// hops off the cooperative pool inside Core — `recheckAvailability()` is
+/// `async` and goes through `BlockingWork.run` (#30/#44). This type used to
+/// hand-roll that hop with its own `withCheckedContinuation` onto
+/// `DispatchQueue.global`; it is Core's answer now, not a second one.
 actor LiveMetadataWriter: MetadataWriting {
     private let store: IndexStore
     private var writer: MetadataWriter?
@@ -80,13 +80,10 @@ actor LiveMetadataWriter: MetadataWriting {
         return made
     }
 
+    /// `recheckAvailability()` forks `exiftool -ver` and hops off the
+    /// cooperative pool itself (#44), so there is nothing to wrap here.
+    /// `availability` is the cached value and costs a read.
     private static func probe(recheck: Bool) async -> ExiftoolAvailability {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: recheck
-                    ? MetadataWriter.recheckAvailability()
-                    : MetadataWriter.availability)
-            }
-        }
+        recheck ? await MetadataWriter.recheckAvailability() : MetadataWriter.availability
     }
 }
