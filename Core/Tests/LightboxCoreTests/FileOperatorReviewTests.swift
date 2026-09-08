@@ -215,9 +215,12 @@ struct FileOperatorReplacementJournalTests {
     init() throws { tree = try TempTree() }
 
     @Test func aSuccessfulReplaceJournalsTheDisplacedFileIntoTheTrash() async throws {
-        let source = try tree.file("a/IMG_0001.jpg", bytes: 20)
+        // The occupant really is disposed into the real Trash, so the fixture
+        // name must be unique to this test run — see `TempTree.uniqueName`.
+        let name = tree.uniqueName("IMG_0001", ext: "jpg")
+        let source = try tree.file("a/\(name)", bytes: 20)
         let destination = try tree.directory("to")
-        let occupant = try tree.file("to/IMG_0001.jpg", bytes: 10)
+        let occupant = try tree.file("to/\(name)", bytes: 10)
         let store = try IndexStore.inMemory()
         try index(source, into: store)
         try index(occupant, into: store)
@@ -244,7 +247,7 @@ struct FileOperatorReplacementJournalTests {
         #expect(try bytes(URL(fileURLWithPath: trashed)) == 10)
         // No stash left in the folder, and the displaced row retired.
         #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path)
-                == ["IMG_0001.jpg"])
+                == [name])
         #expect(try store.count() == 1)
     }
 
@@ -360,8 +363,11 @@ struct FileOperatorTrashURLTests {
     /// then fails discards its in-memory results entirely. Writing it in its own
     /// transaction the moment it is known is what keeps a photo findable.
     @Test func trashURLIsRecordedEvenForAnItemThatThenFails() async throws {
-        let raw = try tree.file("lib/IMG_0001.CR2", bytes: 40)
-        let sidecar = try tree.file("lib/IMG_0001.xmp", bytes: 6)
+        // The RAW really does go to the real Trash before it is restored, so
+        // the fixture name must be unique to this test run — see
+        // `TempTree.uniqueName`.
+        let raw = try tree.file("lib/\(tree.uniqueName("IMG_0001", ext: "CR2"))", bytes: 40)
+        let sidecar = try tree.file("lib/\(tree.uniqueName("IMG_0001", ext: "xmp"))", bytes: 6)
         let store = try IndexStore.inMemory()
         try index(raw, into: store)
 
@@ -404,9 +410,13 @@ struct FileOperatorReplaceCaseTests {
     /// keeps an entry carrying a dead photo's `content_hash` in the table
     /// duplicate detection reads.
     @Test func replacingAFileWhoseNameDiffersOnlyInCaseRetiresItsRow() async throws {
-        let source = try tree.file("a/IMG_0001.jpg", bytes: 20)
+        // The occupant really is disposed into the real Trash, so the fixture
+        // name must be unique to this test run — `uniqueName` calls on the
+        // same tree share a tag, so the case-only difference under test
+        // survives alongside it.
+        let source = try tree.file("a/\(tree.uniqueName("IMG_0001", ext: "jpg"))", bytes: 20)
         let destination = try tree.directory("to")
-        let occupant = try tree.file("to/img_0001.JPG", bytes: 10)
+        let occupant = try tree.file("to/\(tree.uniqueName("img_0001", ext: "JPG"))", bytes: 10)
         let store = try IndexStore.inMemory()
         try index(source, into: store)
         let occupantID = try index(occupant, into: store)
@@ -415,7 +425,8 @@ struct FileOperatorReplaceCaseTests {
         let plan = try await op.plan(kind: .move, sources: [source], destination: destination)
         defer { emptyTrash(of: store, batchID: plan.batchID) }
         // The collision names the file as it really is, not as the source is.
-        #expect(plan.items[0].collisions.map(\.path.lastPathComponent) == ["img_0001.JPG"])
+        #expect(plan.items[0].collisions.map(\.path.lastPathComponent)
+                == [occupant.lastPathComponent])
 
         let results = try await op.execute(plan.resolvingAllCollisions(with: .replace))
         #expect(results[0].outcome == .completed)
@@ -423,7 +434,7 @@ struct FileOperatorReplaceCaseTests {
         let survivor = try #require(try store.search(SearchQuery(
             scope: .folder(path: destination.path, recursive: false))).first)
         #expect(survivor.id != occupantID)
-        #expect(survivor.contentHash == "hash-IMG_0001.jpg")
+        #expect(survivor.contentHash == "hash-\(source.lastPathComponent)")
 
         // Where the bytes actually are: the source moved, the destination holds
         // it, the displaced file is recoverable from the Trash, and no stash is
@@ -544,11 +555,15 @@ struct FileOperatorVanishedOccupantTests {
     /// record at all. #6 reading that would have written the sidecar's bytes
     /// over the RAW's path.
     @Test func asideRowsAreNeverAttributedToAnotherFile() async throws {
-        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
-        _ = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        // The xmp's occupant really is disposed into the real Trash, so the
+        // fixture names must be unique to this test run.
+        let rawName = tree.uniqueName("IMG_0001", ext: "CR2")
+        let xmpName = tree.uniqueName("IMG_0001", ext: "xmp")
+        let raw = try tree.file("from/\(rawName)", bytes: 48)
+        _ = try tree.file("from/\(xmpName)", bytes: 6)
         let destination = try tree.directory("to")
-        let occupantRaw = try tree.file("to/IMG_0001.CR2", bytes: 11)
-        let occupantXmp = try tree.file("to/IMG_0001.xmp", bytes: 12)
+        let occupantRaw = try tree.file("to/\(rawName)", bytes: 11)
+        let occupantXmp = try tree.file("to/\(xmpName)", bytes: 12)
         let store = try IndexStore.inMemory()
         try index(raw, into: store)
         try index(occupantRaw, into: store)
@@ -574,10 +589,10 @@ struct FileOperatorVanishedOccupantTests {
         // The file that *was* trashed says so, and says where.
         #expect(xmpAside.state == .complete)
         // Both files really moved.
-        #expect(try bytes(destination.appendingPathComponent("IMG_0001.CR2")) == 48)
-        #expect(try bytes(destination.appendingPathComponent("IMG_0001.xmp")) == 6)
+        #expect(try bytes(destination.appendingPathComponent(rawName)) == 48)
+        #expect(try bytes(destination.appendingPathComponent(xmpName)) == 6)
         #expect(!exists(raw))
-        #expect(!exists(tree.root.appendingPathComponent("from/IMG_0001.xmp")))
+        #expect(!exists(tree.root.appendingPathComponent("from/\(xmpName)")))
         let trashed = try #require(xmpAside.trashURL)
         // The bytes at that URL are the ones that row is about, which is the
         // whole failure: 12 was the xmp's, 11 the RAW's.
@@ -630,11 +645,15 @@ struct FileOperatorDisposalMarkTests {
     /// naming nothing, and the Trash renames on collision, so nothing derives
     /// the path.
     @Test func aFailedDisposalStillWritesTheMarksItAlreadyEarned() async throws {
-        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
-        _ = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        // The first occupant really is disposed into the real Trash, so the
+        // fixture names must be unique to this test run.
+        let rawName = tree.uniqueName("IMG_0001", ext: "CR2")
+        let xmpName = tree.uniqueName("IMG_0001", ext: "xmp")
+        let raw = try tree.file("from/\(rawName)", bytes: 48)
+        _ = try tree.file("from/\(xmpName)", bytes: 6)
         let destination = try tree.directory("to")
-        let occupantRaw = try tree.file("to/IMG_0001.CR2", bytes: 11)
-        let occupantXmp = try tree.file("to/IMG_0001.xmp", bytes: 12)
+        let occupantRaw = try tree.file("to/\(rawName)", bytes: 11)
+        let occupantXmp = try tree.file("to/\(xmpName)", bytes: 12)
         let store = try IndexStore.inMemory()
         try index(raw, into: store)
 
@@ -668,7 +687,7 @@ struct FileOperatorDisposalMarkTests {
         // that removes the copies at that point removes the only remaining
         // copy: source gone, destination gone, journal row `in_flight` naming
         // two paths that hold nothing.
-        for name in ["IMG_0001.CR2", "IMG_0001.xmp"] {
+        for name in [rawName, xmpName] {
             let atSource = tree.root.appendingPathComponent("from/\(name)")
             let atDestination = destination.appendingPathComponent(name)
             #expect(exists(atSource) || exists(atDestination),

@@ -161,6 +161,19 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   `FileOperationFailure` names the four cases that cannot make the promise. The same
   rule kills `try?` on any cleanup: a swallowed rollback is exactly how a row comes to
   claim `failed` over a filesystem that moved.
+- **A `FileOperator` test that reaches the real `~/.Trash` must mint its own fixture
+  name.** `swift test` runs suites in parallel, and Finder's Trash is one shared
+  directory keyed by name — two tests trashing an `IMG_0001.CR2` at once either collide
+  on the same slot or one test's journal-driven cleanup empties the other's item out
+  from under it (#35). `TempTree.uniqueName(_:ext:)` mints `<stem>-<tag>.<ext>` once per
+  `TempTree` instance, so every test gets its own name; a RAW and its sidecar keep
+  pairing up by sharing a stem. Only a test whose batch genuinely calls `trashItem` needs
+  it — kind `.trash` that survives long enough to trash something, or a `.replace`
+  collision whose occupant's disposal actually succeeds. A test that fails *before*
+  reaching `trashItem` (a vanished source, a locked folder, a disposal deliberately made
+  to fail so the stash is never disposed of) never touches the real Trash and may keep
+  the literal name — do not rename it "for consistency"; that is churn on a test the bug
+  never reached.
 - **A `move` journal row plus a destination that exists is not permission to unlink the
   source.** That shape is a cross-volume move whose copy landed and whose delete leg did
   not, and the launch-time reconcile (`IndexStore+Reconcile.swift`, run inside
