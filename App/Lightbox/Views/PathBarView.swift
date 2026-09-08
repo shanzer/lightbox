@@ -4,6 +4,10 @@ import LightboxCore
 struct PathBarView: View {
     @Bindable var model: BrowserModel
 
+    /// Reported into the model so the Undo command can tell whether ⌘Z belongs
+    /// to this field or to the grid.
+    @FocusState private var searchFocused: Bool
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 12) {
@@ -21,6 +25,11 @@ struct PathBarView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 200)
                     .help("Matches file names. The last word is a prefix, so \"bea\" finds \"beach\".")
+                    .focused($searchFocused)
+                    // So ⌘Z reaches the field's own undo while it is being
+                    // typed in, rather than reversing the last batch — see
+                    // `BrowserModel.isEditingText`.
+                    .reportingTextFocus(.search, isFocused: searchFocused, to: model)
 
                 Picker("Sort", selection: $model.sort.field) {
                     ForEach(SearchQuery.SortField.allCases, id: \.self) { field in

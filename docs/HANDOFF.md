@@ -109,10 +109,10 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 610 tests, 76 suites.
+# Core: 613 tests, 77 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 63 tests.
+# App: builds the SwiftUI target and runs its 100 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -163,7 +163,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 610 tests live. `App/` only wires it to views.
+where all the logic and all 613 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -201,6 +201,25 @@ or an explicit `LIGHTBOX_TEST_HOST=1`) `launchIndexURL(in:)` returns nil and
 `BrowserModel.init(at:)` has no default argument, so `IndexStore.defaultURL` has
 exactly one caller. Before that guard (#15) every App test run created, migrated
 and WAL-switched the real `~/Library/Application Support/Lightbox/index.sqlite`.
+The same argument now applies to `UserDefaults`: the companion-files preference
+goes through a `PreferenceStore` the model is handed, `UserDefaults.standard` in
+production and an in-memory double in every test, because `.standard` under a
+test host is the *user's* preferences domain. A `UserDefaults(suiteName:)` was
+tried first and is not enough — `removePersistentDomain` clears the values, but
+`cfprefsd` writes the file out afterwards anyway, so the run left empty plists
+in `~/Library/Preferences`.
+
+The App side, file by file:
+
+| File | What it does |
+|---|---|
+| `LightboxApp.swift` | The scene, the menu commands, and `FocusedValues.browserModel` — the key window the file commands act on |
+| `LaunchEnvironment.swift` | Whether this launch may open the real index (#15) |
+| `BrowserModel.swift` | The window's state: folder, records, selection, filters, progress; every async step carries a `Pass` |
+| `BrowserModel+FileOperations.swift` | Spec §8's batches: plan, collision sheet, run off the main thread, put the window back together |
+| `FileOperationState.swift` | `FileCommand`, `BatchProgress`, `CompletedBatch`, `OperationSummary`, `ActiveSheet`, `CollisionSheetModel` — the testable half of the sheets |
+| `DestinationChooser.swift` | The `NSOpenPanel` behind Move/Copy To…, with the companion checkbox as its accessory view |
+| `Views/` | Thin SwiftUI: grid, tree, filters, path bar, inspector, and the four file-operation sheets |
 
 `App/Lightbox.xcodeproj/project.pbxproj` is **hand-written** (objectVersion 77,
 `PBXFileSystemSynchronizedRootGroup`). Adding a `.swift` file under
@@ -281,7 +300,7 @@ row — which duplicate detection then deletes on.
 
 ## 7. Verify by hand on the mini
 
-Seven things automated tests could not cover. **None done yet** as of the
+Eight things automated tests could not cover. **None done yet** as of the
 2026-09-06 update. In rough priority:
 
 1. **Re-run the 50k benchmark.** All current numbers are Intel, and the choice of
@@ -338,9 +357,53 @@ Seven things automated tests could not cover. **None done yet** as of the
      volume, and continuing is correct. To see the abort, leave it unplugged.
 5. **⌘A with the search field focused.** Should select the field's text, not the
    grid. Tests could only warn, never assert.
-6. **Cold folder open shows an empty grid** for the entire first index pass
+6. **The file-operation UI, against the real library** (#7). Automated tests
+   cover the model and the sheets' logic; nothing automated can open a panel or
+   click Rename. With the Seagate library open, select 30 files including a
+   RAW+JPEG pair and Move To a folder that already holds one of them: the
+   collision sheet should name that one file and nothing else, choosing Rename
+   should run the batch, and the summary sheet should **not** appear. Then check
+   the rest of the surface — the companion checkbox on the panel and whether it
+   is remembered next time, ⌘⌫ with the grid focused, Delete Permanently naming
+   the right count, and Stop After This Item on a batch long enough to catch it
+   (the items already done stay done, and `op_journal` says so).
+
+   **Two of these are sheet *swaps*, and they are the part no test can reach.**
+   A `.sheet(item:)` asked for a new item while a sheet is up is the classic
+   macOS way to end up with no sheet at all and a model that believes one is
+   showing — here, a batch running with no progress indicator and no way to
+   cancel it. `BrowserModel.present(_:)` nils, yields, then presents; nothing in
+   an `xcodebuild test` run presents a real sheet, so collapsing that back to a
+   direct assignment leaves the whole suite green (measured). Both swaps have to
+   be watched by eye:
+   - **confirm-delete → progress.** Delete Permanently…, then Delete
+     Permanently in the sheet: the confirmation goes and the progress sheet
+     arrives. (The same swap as collisions → progress, which the Rename step
+     above already exercises.)
+   - **progress → summary.** A batch with a guaranteed failure — move a
+     selection into a folder you have `chmod -w`'d — so the progress sheet is
+     replaced by the summary rather than by nothing.
+
+   **And ⌘Z**, which is the live check the #6 entry in §8 was waiting on a UI
+   for: move 20 files, quit, relaunch, ⌘Z — they come back, and the menu item
+   then reads "Redo Move 20 Items"; and trash 5, empty the Trash, ⌘Z — five
+   per-item failures in the summary sheet saying the files are no longer in the
+   Trash, and nothing else claimed.
+
+   **Three of these need a real key window**, which is where both of the first
+   ⌘Z attempts shipped broken — see §8. The decision layer and the views' focus
+   reporting are now both covered by the suite; what no test can reach is the
+   menu bar delivering a keystroke to them.
+   - ⌘Z with the grid focused and a batch behind it **actually reverses it**.
+   - ⌘Z **while the search field or a size field is focused and has typing to
+     undo** undoes the *typing*, not the batch — and the menu item is enabled
+     while that field is focused, which is the regression the observable flag
+     exists to prevent.
+   - ⌘Z with nothing typed and nothing to reverse leaves the item greyed out
+     rather than beeping.
+7. **Cold folder open shows an empty grid** for the entire first index pass
    (~180 s at 50k). Known, ugly, deferred — the grid has no "indexing…" state.
-7. **A real index pass over the Seagate, under the new executors.** #28 moved
+8. **A real index pass over the Seagate, under the new executors.** #28 moved
    `IndexCoordinator` and `MetadataWriter` off the cooperative pool onto serial
    dispatch queues of their own. `CooperativePoolTests` proves *where* the work
    runs; it says nothing about the GUI path. Open a large folder on the external
@@ -721,8 +784,8 @@ all three are now done:
   image's verdict.
 
   Owed: the ⌘Z live check (move 20, quit, relaunch, undo; trash 5, empty the
-  Trash, undo). **It cannot be run yet** — there is no file-operation UI at all;
-  that is #7. The Core equivalents exist:
+  Trash, undo). **It can be run now** — #7 shipped the menu item, so this is
+  part of §7.6. The Core equivalents exist:
   `aBatchSurvivesQuittingAndIsUndoneAfterRelaunch` closes a file-backed store and
   undoes through a fresh one, and `anEmptiedTrashIsFivePerItemFailuresAndNothingElse`
   trashes five real files, empties them from the real Trash and asserts five
@@ -730,6 +793,144 @@ all three are now done:
   cross-volume undo. `performTransfer` is shared with the forward path, which is
   where the cross-volume legs are tested, but no test drives an undo across two
   real volumes.
+
+- ~~**The file-operation UI.**~~ **Done** (issue #7). Move To…, Copy To…, Move
+  to Trash (⌘⌫) and Delete Permanently… in the File menu, ⌘Z in the Edit menu,
+  with the collision, progress, summary and confirmation sheets behind them. All of it in `App/`; the only `Core` change was
+  `FileOperationFailure.explanation`, the sentence a summary row shows.
+  Five things worth carrying forward:
+
+  **The commands are wired through `@FocusedValue`, not a notification.** ⌘O,
+  ⌘R and ⌘A post to `NotificationCenter` and every open window responds, which
+  is harmless for "reload yourself" and wrong for "move these 300 files" — a
+  broadcast would start one batch per window. `FocusedValues.browserModel` is
+  set by `BrowserView` with `.focusedSceneValue`, so the command acts in the
+  key window and, as a bonus, gets its enabled state from that window's
+  selection.
+
+  **A disabled `CommandGroup` item has a nil `action`.** Measured, and it is
+  what makes the menu half of the enabled-state assertion possible: SwiftUI
+  strips the action off a disabled command item entirely, so `action == nil`
+  *is* "disabled" in `NSMenuItem` terms. The Cut/Copy/Paste note in
+  `LightboxApp` still holds for items with no `.disabled` on them — those
+  validate to enabled whatever the responder chain thinks.
+
+  **The grid updates with `reload()`, never `refresh()`.** `FileOperator`
+  rewrites the index rows in the same transaction that marks the journal
+  complete, so the index already describes the new world by the time a batch
+  returns; a rescan would re-walk the folder — minutes on the Seagate — to
+  learn it again. The test pins this by creating a file on disk the index has
+  never seen and asserting it does *not* appear.
+
+  **⌘Z replaces the stock `.undoRedo` group whole**, for the reason
+  `.pasteboard` was replaced: SwiftUI's stock Undo already carries ⌘Z, and
+  AppKit resolves two items sharing one key equivalent by stripping it off the
+  *custom* one — the collision that left ⌘A mouse-only. One item, titled from
+  `BrowserModel.undoMenuTitle`. **No Redo goes back**: `Core` journals a
+  reversal as an ordinary batch, so undoing the undo *is* the redo, and the
+  title flips to "Redo Move 12 Items" to say so. `CompletedBatch.isReversal` is
+  the whole of that mechanism on this side, and the *original* operation's kind
+  is carried through a reversal rather than read back off it — a copy's reversal
+  is journalled as a trash, so reading it back titles the redo "Undo Trash 3
+  Items", naming the machinery instead of what the user did.
+
+  **The title only names a batch when the press would reverse one.** That is
+  load-bearing rather than tidy: `undoMenuTitle` describes the last batch and
+  knows nothing about focus, so a window with a batch behind it and the search
+  field focused offered "Undo Move 3 Items" while ⌘Z undid typing — the single
+  claim this whole design rests on ("the title says which of the two the next
+  press will do"), false in exactly the state four review rounds were about.
+  `UndoCommand` computes the destination once and uses it for the title, the
+  enabled state and the action, so the three cannot disagree.
+
+  **⌘Z cannot be routed the way ⌘A is, and the first attempt at it was dead on
+  arrival.** ⌘A asks the responder chain and reads "nobody answered" as "the
+  grid means it". That works for `selectAll:` because nothing outside a text
+  view implements it. `undo:` is different: **`NSWindow` implements it**,
+  through its own `NSUndoManager`. Measured in a standalone AppKit app with a
+  real key window and a plain `NSView` focused:
+
+  ```
+  undo:       target=NSWindow    sendAction=true      ← always
+  selectAll:  target=nil         sendAction=false
+  copy:       target=nil         sendAction=false
+  ```
+
+  So `sendAction("undo:")` is true whenever *any* window is key, whatever is
+  focused. The shipped-then-caught version guarded on exactly that and swallowed
+  every ⌘Z while the menu item still read "Undo Move 12 Items" — and the App
+  suite could not see it, because the test host never gets a key window, so the
+  guard read false there and only there. **A test whose own failure message says
+  it proves nothing is not covering the path it names.**
+
+  **The first fix for that was right about focus and wrong about where to read
+  it.** It asked `NSApp.keyWindow?.firstResponder` inside the command body,
+  including in `.disabled`. That is an API property, not a measurement, and it
+  is enough on its own: **an `NSApp` read is not observable state, so a body
+  reading it acquires no SwiftUI dependency on it.** Such a body can only ever
+  be re-evaluated when something *else* it does observe changes, so the enabled
+  state was decided by whatever happened to invalidate the command last rather
+  than by where the focus actually was.
+
+  What that looked like on screen is deliberately *not* claimed here. The
+  obvious symptom — the item stuck greyed out, ⌘Z in the search field doing
+  nothing — could not be separated from SwiftUI refreshing command items lazily:
+  three probe shapes (an `@Observable` flag read directly by a command body,
+  `NSMenu.update()`, `performKeyEquivalent`) produced no observable refresh
+  signal at all, so the harness cannot distinguish "never re-evaluated" from
+  "re-evaluated somewhere the probe could not see". Whether the item re-enables
+  in a running app is §7.6's second and third ⌘Z checks, which is what they are
+  for. The fix does not rest on the answer: reading observed model state instead
+  removes the dependency question entirely, and it is the same mechanism the
+  four file commands already rely on.
+
+  So the flag is observable state the views publish. `BrowserModel.editingFields`
+  is a `Set<TextField>` written through `setEditing(_:_:)` by
+  `View.reportingTextFocus(_:isFocused:to:)`, which every text field in the app
+  must call — `PathBarView`'s search and `FilterPanelView`'s exact-size pair
+  today, and `BrowserModel.TextField` is the checklist for the next one. A set
+  rather than a `Bool` because focus moving between two fields produces two
+  reports in an order SwiftUI does not promise, and a single flag lets the field
+  that just lost focus clear what the field that gained it had already set.
+  There is no `NSApp` read left anywhere in the routing: one source of truth.
+
+  The decision is `UndoCommandAction.destination(for:)` over that state, and
+  `destination(isEditingText:canUndo:)` under it is a pure function of two
+  booleans — so the menu's real decision is testable with no key window, which
+  neither earlier version was. Text being edited wins even when the grid also
+  has a batch: ⌘Z belongs to the thing being typed in.
+
+  The item still may not simply be disabled on the grid's state, because it
+  replaces the stock group and is therefore the app's only ⌘Z; it greys out only
+  when the decision is `.nowhere` — nothing being edited *and* nothing to
+  reverse.
+
+  **The views' half is tested, and nearly was not.** `NSHostingView` renders the
+  real view and `makeFirstResponder` engages `@FocusState` *without* a key
+  window — measured, `isKey=false foundField=true isEditingText=true
+  fields=[.search]` — so `TextFocusReportingTests` drives both views for real. A
+  field that stops calling `reportingTextFocus` reddens it.
+
+  **A refusal is shown, never swallowed.** `undoability(of:)` is consulted
+  before `undo(batch:)`, and its `UndoRefusal` becomes the summary sheet's
+  headline through `BrowserModel.describe(refusal:)` — App copy, like
+  `FileOperatorError`'s and unlike `FileOperationFailure.explanation`, because a
+  refusal is a pre-flight answer to a caller rather than a row in a list. The
+  permanent-delete case is the one that has to arrive before the operation, and
+  `Core` reports it first whatever else the batch holds.
+
+  **The selection follows the files for a move and empties for trash/delete —
+  and empties after an undo.** A move out of the folder on screen has nothing to
+  follow, so it empties too; a copy leaves the selection alone, because the
+  sources did not go anywhere. An undo empties because it is the one run whose
+  items do not share a direction: undoing a copy trashes while undoing a move
+  restores, and a reversal can put photos back into folders that are not on
+  screen. A selection right for some of them and wrong for the rest is worse
+  than none.
+
+  Owed: the GUI live check, §7.6 — which now includes the ⌘Z pair the #6 entry
+  above lists (move 20, quit, relaunch, undo; trash 5, empty the Trash, undo),
+  because #7 is the UI that entry was waiting for.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And

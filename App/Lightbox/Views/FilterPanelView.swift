@@ -9,6 +9,11 @@ import LightboxCore
 struct FilterPanelView: View {
     @Bindable var model: BrowserModel
 
+    /// Reported into the model so ⌘Z reaches these fields' own undo while they
+    /// are being typed in — see `BrowserModel.isEditingText`.
+    @FocusState private var widthFocused: Bool
+    @FocusState private var heightFocused: Bool
+
     /// A struct rather than the tuple the brief used: Swift has no key paths
     /// to tuple elements, so `ForEach(_:id: \.0)` does not compile.
     private struct WidthPreset: Identifiable, Hashable {
@@ -54,9 +59,15 @@ struct FilterPanelView: View {
                     HStack(spacing: 6) {
                         TextField("Width", text: exactBinding(\.exactWidth))
                             .frame(width: 64)
+                            .focused($widthFocused)
+                            .reportingTextFocus(.exactWidth, isFocused: widthFocused,
+                                                to: model)
                         Text("×").foregroundStyle(.secondary)
                         TextField("Height", text: exactBinding(\.exactHeight))
                             .frame(width: 64)
+                            .focused($heightFocused)
+                            .reportingTextFocus(.exactHeight, isFocused: heightFocused,
+                                                to: model)
                     }
                     .textFieldStyle(.roundedBorder)
                 }
