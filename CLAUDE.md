@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 602 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 609 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 63 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -107,6 +107,15 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
 - **`setHashes(for:)` refuses a write whose row no longer matches the path/size/mtime
   that was hashed.** `files.id` is a reused rowid; without the guard one photo's hash
   lands on another photo's row, and duplicate detection deletes on it. Not optional.
+  **`FileOperator`'s two unlinks are guarded the same way (#33)** — the permanent
+  `delete` against the row it read, the cross-volume move against the `stat`
+  `verifyCopyLength` took of the source — because those are the only places where a
+  file that arrived in the plan/execute gap is destroyed rather than displaced. The
+  delete deliberately does not compare `inode`: `recordMetadataWrite` leaves it stale.
+  A refusal on the *selected* file refuses the whole item — a companion is a companion
+  only by basename, so it belongs to whatever is at that path now — and a row the plan
+  read that has since been pruned is disagreement, not absence of evidence; a companion
+  that never had a row of its own still deletes.
 - **Motion photos and chunk-flood files are guarded and tested.** Any new format parser
   needs both: strip trailing data past EOI/IEND, and coalesce ranges before reading.
 - **`st_dev` is a mount-time id**, not a volume identity — it changes on replug. Since

@@ -16,8 +16,24 @@ import Foundation
 /// create a `.Trashes` (exFAT, an SMB share, a folder the user cannot write), a
 /// `trashItem` that returns no URL, or a `SQLITE_BUSY` on the journal write.
 struct TransferState {
-    /// Every `(source, destination)` pair that landed, in the order it landed.
-    var moved: [(from: URL, to: URL)] = []
+    /// One file this transfer has put at its destination, **carrying the
+    /// reading taken of its source at the moment the copy was verified**.
+    ///
+    /// The reading rides in the element rather than in a second array indexed
+    /// alongside this one: the source-removal loop is the last thing standing
+    /// between a stranger's file and an `unlink`, and a list paired by position
+    /// is how both of phase 2's photo-losing bugs were written.
+    struct Landing {
+        let from: URL
+        let to: URL
+        /// `verifyCopyLength`'s `stat` of `from`, or nil for a `rename(2)` —
+        /// which copies nothing and removes no source, so it never reaches the
+        /// guard that reads this.
+        let sourceFacts: FileOperator.StatFacts?
+    }
+
+    /// Every source→destination landing, in the order it landed.
+    var moved: [Landing] = []
     /// Whether the sources have been unlinked. Only a cross-volume move ever
     /// sets it, and once it is set the destinations are irreplaceable.
     var sourcesRemoved = false
@@ -67,13 +83,16 @@ extension FileOperator {
             let destinationPreexisted = !state.byRename
                 && FileManager.default.fileExists(atPath: destination.path)
             do {
+                var sourceFacts: FileOperator.StatFacts?
                 if state.byRename {
                     try FileManager.default.moveItem(at: source, to: destination)
                 } else {
                     try copier(source, destination, sameVolume && !isMove)
-                    try Self.verifyCopyLength(source: source, destination: destination)
+                    sourceFacts = try Self.verifyCopyLength(source: source,
+                                                            destination: destination)
                 }
-                state.moved.append((source, destination))
+                state.moved.append(TransferState.Landing(from: source, to: destination,
+                                                         sourceFacts: sourceFacts))
             } catch {
                 var cleanup: [String] = []
                 var reason = FileOperationErrorMap.classify(error)
@@ -101,9 +120,48 @@ extension FileOperator {
         }
 
         if isMove && !state.byRename {
-            for source in files {
+            // Over the landings, not over `files`: the only sources this may
+            // unlink are the ones whose copies are known to have landed, and
+            // each landing carries the reading its copy was verified against.
+            for landing in state.moved {
+                // **The unlink is guarded on identity, not on the path** (#33).
+                // The window is narrow — the copies of the item's remaining
+                // files, plus the unlinks of the ones before this one — but it
+                // is a window in which the file at `from` can stop being the
+                // file that was copied, and this is one of the two places in
+                // the type where such a file is destroyed rather than
+                // displaced.
+                //
+                // A landing with no reading is unreachable here: only a
+                // `rename(2)` produces one, and this loop runs under
+                // `isMove && !byRename`. It refuses rather than trusting the
+                // path, because that is the safe direction for the one branch
+                // no test can reach.
+                guard let stamped = landing.sourceFacts else {
+                    return abandon(state, marks: [], reason: .modifiedSinceOperation)
+                }
+                // **A `stat` that fails is not a mismatch**, which is the rule
+                // `rowStillDescribes` states for the delete, read the same way
+                // here. Something else removed the source between the copy and
+                // this moment: "gone from the source, present at the
+                // destination" is the shape a finished move leaves behind, and
+                // there is nothing left to unlink. The copies are the only
+                // copies from now on, so the undo must be told — that is what
+                // `sourcesRemoved` is.
+                guard let current = Self.statFacts(landing.from) else {
+                    state.sourcesRemoved = true
+                    continue
+                }
+                // A file that is there and is not the one that was copied.
+                // `abandon` rather than an ordinary failure: the copy is
+                // already at the destination, so "nothing changed" is not a
+                // promise this path can make, and the rows stay `in_flight`
+                // carrying both paths for the reconcile to re-`stat`.
+                guard current == stamped else {
+                    return abandon(state, marks: [], reason: .modifiedSinceOperation)
+                }
                 do {
-                    try FileManager.default.removeItem(at: source)
+                    try FileManager.default.removeItem(at: landing.from)
                     // Set per file, so a removal that fails part way through
                     // still tells the undo that *some* source is gone.
                     state.sourcesRemoved = true
@@ -222,11 +280,14 @@ extension FileOperator {
     ///
     /// The rows stay `in_flight` carrying both paths — the shape #6 already has
     /// to handle — and **the message describes where the files actually are**,
-    /// which is not the same sentence in all three cases: a copy leaves its
-    /// originals untouched, a same-volume move leaves them renamed to the
-    /// destination, and only a cross-volume move that has unlinked leaves the
-    /// destination holding the last copy.
-    /// Internal so the three wordings can be asserted directly. A same-volume
+    /// which is not the same sentence in any of the four cases: a copy leaves
+    /// its originals untouched; a same-volume move leaves them renamed to the
+    /// destination; a cross-volume move that unlinked everything leaves the
+    /// destination holding the last copies; and one stopped part way through
+    /// its unlink loop — which the #33 identity guard can do at any landing —
+    /// has some originals gone and some still where they were, so it names
+    /// which are which rather than claiming either for all of them.
+    /// Internal so the four wordings can be asserted directly. A same-volume
     /// move offers no seam between the `rename(2)` and the disposal — no
     /// injected closure is called in between — so the branch that describes it
     /// is unreachable end to end, and a description nothing checks is a
@@ -245,7 +306,31 @@ extension FileOperator {
         let names = state.moved.map(\.to.lastPathComponent).joined(separator: ", ")
         let fate: String
         if state.sourcesRemoved {
-            fate = "the originals are gone and \(names) are now only at \(directory)"
+            // **Which ones**, when the unlink loop stopped part way through.
+            // `sourcesRemoved` is set by the first removal, and the #33 identity
+            // guard can refuse the very next file — so "the originals are gone"
+            // would send the user to the destination for files that never left
+            // their folder, and stop them looking at the source for the one
+            // that is still sitting there. Read from the filesystem rather than
+            // counted, because that is the question being answered.
+            let manager = FileManager.default
+            let partitioned = Dictionary(grouping: state.moved) {
+                manager.fileExists(atPath: $0.from.path)
+            }
+            let sourceNames = { (landings: [TransferState.Landing]) in
+                landings.map(\.from.lastPathComponent).joined(separator: ", ")
+            }
+            if let stillThere = partitioned[true], !stillThere.isEmpty {
+                // Phrased as labelled lists rather than as sentences, so the
+                // verb never has to agree with a count that is one file as
+                // often as it is three.
+                fate = "gone from their original paths and now only at "
+                     + "\(directory): \(sourceNames(partitioned[false] ?? [])); "
+                     + "still at their original paths: \(sourceNames(stillThere)); "
+                     + "copies of everything are at \(directory)"
+            } else {
+                fate = "the originals are gone and \(names) are now only at \(directory)"
+            }
         } else if state.byRename {
             fate = "\(names) have been moved to \(directory) and are no longer at their "
                  + "original paths"
@@ -265,7 +350,7 @@ extension FileOperator {
     /// copied from still exists, and once it does not, removing the copy is the
     /// loss rather than the undo. Kept as well as the flag, because the flag is
     /// the kind of thing a later refactor forgets to thread through.
-    static func rollbackMoves(_ moved: [(from: URL, to: URL)],
+    static func rollbackMoves(_ moved: [TransferState.Landing],
                               byRename: Bool) -> [String] {
         var problems: [String] = []
         for entry in moved.reversed() {

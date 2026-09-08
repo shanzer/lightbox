@@ -469,6 +469,56 @@ public actor FileOperator {
         return row.size == facts.size && row.mtime == facts.mtime
     }
 
+    /// Whether the file now at `url` is still the one `row` — and the plan —
+    /// described.
+    ///
+    /// `setHashes(for:)`'s guard, read rather than written, and matching it
+    /// field for field: the id the plan recorded, and `size`/`mtime`, which
+    /// together are exactly the evidence tier 0 uses to decide a file is
+    /// unchanged. The id matters on its own because `files.id` is a reused
+    /// rowid — a reconcile that dropped this row and indexed a new file can
+    /// hand the id straight to a different photo.
+    ///
+    /// **`inode` is deliberately not compared here, and is compared on the
+    /// transfer's window.** The reading this one is judged against comes off a
+    /// row that may be arbitrarily old, and `recordMetadataWrite` refreshes a
+    /// row's `size`/`mtime` after an exiftool write without refreshing its
+    /// `inode` — exiftool renames a rebuilt file into place, so the inode moves
+    /// and the row keeps the old one forever after. Comparing it would refuse
+    /// to delete every photo the app has ever edited. The transfer's facts are
+    /// seconds old and taken by this same execution, so they carry no such
+    /// staleness and use all four fields.
+    ///
+    /// **A row that is gone is not a row that agrees**, when the plan read one.
+    /// A reconcile can prune a row between the plan and the batch, and a
+    /// stranger can then take the path with nothing in the index describing it;
+    /// falling through to `removeItem` there is the pre-#33 unlink, decided by
+    /// the path alone. A nil `plannedID` is the other case entirely — a
+    /// companion is not indexed in its own right, so there is nothing recorded
+    /// about it to disagree with, and refusing would make a sidecar
+    /// undeletable.
+    ///
+    /// **This is stricter than undo's** `modifiedSinceOperation` check
+    /// (`FileOperator+Undo.swift`), which tolerates a missing row and carries
+    /// on. The asymmetry is the point: undo *displaces* — it moves a file back,
+    /// or sends a copy to the Trash — and a wrong guess there is recoverable,
+    /// while `delete` unlinks and a wrong guess is not. When the evidence is
+    /// missing the two paths must fall different ways.
+    ///
+    /// A `stat` that fails is not a mismatch: the file is gone, and
+    /// `removeItem` reports that as `sourceVanished`, which is the truer
+    /// sentence than "it changed".
+    static func rowStillDescribes(_ row: FileRecord?, at url: URL,
+                                  plannedID: Int64?) -> Bool {
+        guard let row else { return plannedID == nil }
+        // Not `let id = row.id, id != plannedID`: a nil id there would pass the
+        // check silently, and silence is the wrong direction for a guard whose
+        // false is one re-read and whose true is an `unlink`.
+        if let plannedID, row.id != plannedID { return false }
+        guard let facts = statFacts(url) else { return true }
+        return row.size == facts.size && row.mtime == facts.mtime
+    }
+
     // MARK: Trash
 
     /// Internal, not private, for the same reason `performTransfer` is: undo
@@ -557,25 +607,68 @@ public actor FileOperator {
     private func performDelete(_ item: PlannedItem) -> ItemExecution {
         var execution = ItemExecution()
         var firstFailure: FileOperationFailure?
+        // The selected file carries the id the plan read for it; a companion has
+        // none of its own, and neither does a selected file that was never
+        // indexed — a nil `plannedID` makes the guard permissive for that file
+        // by construction, because there is nothing recorded about it to
+        // disagree with. Carried *in the element* rather than as a second list
+        // indexed alongside `files`, which is how two of phase 2's photo-losing
+        // bugs were written.
+        let planned: [(url: URL, plannedID: Int64?)] =
+            [(item.source, item.recordID)] + item.companions.map { ($0, nil) }
+        // **Pre-sized, and `failed` until a file is actually unlinked.** The
+        // states are read back by offset against this item's journal rows, and
+        // `marks(_:_:)` falls back to `journalState` — `.complete` — for any
+        // offset this array does not reach. An array built by appending is one
+        // early exit away from marking an untouched row `complete`, which is the
+        // one lie the journal must never tell: `complete` is the state the
+        // reconcile is defined never to re-examine. Every path out of an
+        // iteration therefore leaves the default in place, and only a successful
+        // `removeItem` overwrites it.
+        execution.perFileState = Array(repeating: .failed, count: planned.count)
         // The one non-atomic item. An unlinked file does not come back, so rather
         // than pretend the item failed as a whole, each file's journal row
-        // records what happened to that file. The row is built only after
+        // records what happened to that file. The row is only marked after
         // `removeItem` has returned without throwing.
-        for file in item.files {
+        for (offset, entry) in planned.enumerated() {
+            let (file, plannedID) = entry
             do {
                 // Read first, and let a failed read throw: unlinking a photo
                 // whose row could not be looked up leaves the index describing
                 // a file that is gone, with nothing recorded to fix it.
                 let row = try store.record(atPath: file.path)
+                // **The unlink is guarded on identity, not on the path** — the
+                // read half of `setHashes(for:)`'s write guard (#33). This is
+                // the one irreversible path in the type, and the plan/execute
+                // gap is a human-length pause: a confirmation sheet, a
+                // re-sorted grid. A file that arrived in that gap is a photo
+                // nobody selected, and `removeItem` on the strength of the path
+                // alone destroys it. Nothing has happened yet, so this is an
+                // ordinary `failed`.
+                if !Self.rowStillDescribes(row, at: file, plannedID: plannedID) {
+                    if firstFailure == nil { firstFailure = .modifiedSinceOperation }
+                    // **A refusal on the selected file refuses the whole item**,
+                    // and this is the half of the guard that saves a file rather
+                    // than merely declining to destroy one. A companion is a
+                    // companion only because it shares the source's basename, so
+                    // once the source is not the file that was planned for, its
+                    // sidecars belong to *that* file: carrying on down the list
+                    // would leave the stranger's photo untouched and unlink the
+                    // stranger's `.xmp` — and a sidecar has no row of its own,
+                    // so nothing else stands between it and `removeItem`.
+                    // Every remaining row keeps its `failed` default, which is
+                    // exactly true: nothing was touched.
+                    if offset == 0 { break }
+                    continue
+                }
                 try FileManager.default.removeItem(at: file)
                 if let row, let id = row.id {
                     execution.mutations.append(.remove(id: id, path: file.path))
                 }
-                execution.perFileState.append(.complete)
+                execution.perFileState[offset] = .complete
             } catch {
                 let reason = FileOperationErrorMap.classify(error)
                 if firstFailure == nil { firstFailure = reason }
-                execution.perFileState.append(.failed)
             }
         }
         if let firstFailure { execution.outcome = .failed(firstFailure) }
@@ -616,15 +709,28 @@ public actor FileOperator {
     /// without it, a truncated copy would inherit the original's `content_hash`
     /// and become a file whose recorded digest describes bytes it does not
     /// contain, on a row nothing will ever re-hash.
-    static func verifyCopyLength(source: URL, destination: URL) throws {
+    ///
+    /// **Returns the source's reading**, because that reading is the evidence
+    /// the unlink needs later: a cross-volume move removes the source once
+    /// every copy has landed, and "the file that was copied" is the only file
+    /// it may remove. Taken here rather than re-`stat`ed at the unlink for the
+    /// same reason it is taken here at all — this is the moment the copy is
+    /// known to describe the source. See `TransferState.Landing`.
+    @discardableResult
+    static func verifyCopyLength(source: URL, destination: URL) throws -> StatFacts {
         guard let from = statFacts(source), let to = statFacts(destination) else {
             throw FileOperationCheckError.copyIncomplete
         }
         guard from.size == to.size else { throw FileOperationCheckError.copyIncomplete }
+        return from
     }
 
-    static func statFacts(_ url: URL)
-        -> (size: Int64, mtime: Double, device: Int64, inode: Int64)? {
+    /// The four `stat(2)` fields this type compares, in the shape tier 0 writes
+    /// them, so a record written by the walker and a reading taken here compare
+    /// field for field.
+    typealias StatFacts = (size: Int64, mtime: Double, device: Int64, inode: Int64)
+
+    static func statFacts(_ url: URL) -> StatFacts? {
         var st = stat()
         guard stat(url.path, &st) == 0 else { return nil }
         // The same expression the walker uses, so a record written by tier 0 and

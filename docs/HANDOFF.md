@@ -109,7 +109,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 602 tests, 75 suites.
+# Core: 609 tests, 76 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 63 tests.
@@ -163,7 +163,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 602 tests live. `App/` only wires it to views.
+where all the logic and all 609 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -174,7 +174,7 @@ where all the logic and all 602 tests live. `App/` only wires it to views.
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
 | Pipeline | `Coordinator/{IndexProgress,IndexCoordinator}.swift` | Two-tier pass (tier 0 = stat+metadata, tier 1 = hashes), progress, cancellation |
-| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Transfer,FileOperator+Replacements,FileOperator+Undo}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results; undo of the last batch as a new batch, and `undoability(of:)` (§8) |
+| Files | `Files/{FileOperation,FileOperationPlan,CompanionFiles,FileOperator,FileOperator+Transfer,FileOperator+Replacements,FileOperator+Undo}.swift` | Move/copy/trash/delete over a selection: pre-flight collision plan (with the claim's *kind*), companion files, `op_journal` ordering, rollback accounting, per-item results; both unlinks guarded on file identity (#33); undo of the last batch as a new batch, and `undoability(of:)` (§8) |
 | Bench | `Diagnostics/Benchmark.swift` | The 50k measurement harness |
 | Concurrency | `Concurrency/BlockingWork.swift` | Where Core's blocking sections run — off the cooperative pool (#28) |
 
@@ -316,7 +316,12 @@ Seven things automated tests could not cover. **None done yet** as of the
    and every `trash_url` naming a file that is really in the Trash. Worth
    repeating once onto an exFAT or SMB destination, where `.Trashes` cannot be
    created and the disposal fails: nothing may be lost, and the rows should be
-   `in_flight` naming both paths.
+   `in_flight` naming both paths. Since #33 the source removal also refuses a
+   source whose `stat` no longer matches the one its copy was verified against,
+   so an ordinary move must not trip it: a batch that reports
+   `modifiedSinceOperation` over files nothing touched means the reading taken
+   at `verifyCopyLength` and the one taken at the unlink disagree on a real
+   volume, which no simulated one would show.
 4. **Unplug the Seagate mid-hash, and replug it.** The unreachable-root guards
    were only ever tested against *simulated* unmounts. This is the one that lost
    the whole index twice during development, so it is worth doing for real.
@@ -523,6 +528,40 @@ all three are now done:
   Whether the destination pre-existed is now read **before** the attempt, and
   the gap arrival is reported as `destinationNotReplaceable` and left alone.
   "There is a file here now" never means "we created it".
+
+  **The unlinks are guarded on identity too** (issue #33). Every index *write*
+  in the type matched the row's id and its `size`/`mtime` before landing —
+  `setHashes(for:)`'s rule — while the two `removeItem` calls still trusted the
+  path alone. `performDelete` now re-reads each file's row and refuses when the
+  row's id is not the one the plan read, when its `size`/`mtime` no longer match
+  the disk, or when the row the plan read has been pruned — a missing row is
+  disagreement, not an absence of evidence, and that is deliberately stricter
+  than undo's identical-looking check, because undo displaces and `delete`
+  destroys. **A refusal on the selected file refuses the whole item**: a
+  companion rides along only because it shares the source's basename, so once
+  the source is a stranger's file the `.xmp` beside it is the stranger's too,
+  and it has no row of its own to be guarded by. `.modifiedSinceOperation`,
+  every row of the item `failed`, nothing touched.
+
+  The cross-volume source removal keeps the `stat` `verifyCopyLength` took of
+  each source — carried on `TransferState.Landing`, in the element, never in a
+  list paired by position — and refuses to unlink a source that no longer
+  matches it; there the copy is already at the destination, so it goes through
+  `abandon` and the rows stay `in_flight` naming both paths. **A source that has
+  vanished is not a mismatch**, on either path: something else removed it
+  between the copy and the unlink, "gone from the source, present at the
+  destination" is the finished shape of a move, and there is nothing left to
+  unlink — the loop marks `sourcesRemoved` and carries on, so an ordinary move
+  still completes. And `abandon` now says *which* sources went and which did
+  not, because the guard can stop the removal loop with the first source already
+  unlinked, and "the originals are gone" would send the user to the wrong folder
+  for the rest. `inode` is compared on the transfer's window and
+  deliberately not on the delete's: `recordMetadataWrite` refreshes a row's
+  `size`/`mtime` after an exiftool write but not its `inode`, so an inode read
+  off a row is stale for every photo the app has ever edited, and comparing it
+  would refuse to delete them. `replace` needs no such guard — a gap arrival at
+  an occupant path is moved aside and trashed under its own row, displaced
+  rather than destroyed.
 
   Owed: the Seagate live check. The batch was exercised over 50 real photos
   copied off `03_DEDUPED_ARCHIVE/2019` into a scratch directory on the boot

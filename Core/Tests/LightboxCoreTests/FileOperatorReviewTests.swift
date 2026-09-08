@@ -864,8 +864,8 @@ struct FileOperatorCrossVolumeLossTests {
         let destination = try tree.file("to/IMG_0001.jpg", bytes: 64)
         let vanished = tree.root.appendingPathComponent("from/IMG_0001.jpg")
 
-        let problems = FileOperator.rollbackMoves([(from: vanished, to: destination)],
-                                                  byRename: false)
+        let problems = FileOperator.rollbackMoves(
+            [.init(from: vanished, to: destination, sourceFacts: nil)], byRename: false)
         #expect(problems.count == 1)
         #expect(problems.first?.contains("IMG_0001.jpg") == true)
         #expect(exists(destination))
@@ -1153,20 +1153,20 @@ struct FileOperatorAbandonWordingTests {
         }
 
         var unlinked = TransferState(byRename: false)
-        unlinked.moved = [(from: from, to: to)]
+        unlinked.moved = [.init(from: from, to: to, sourceFacts: nil)]
         unlinked.sourcesRemoved = true
         let gone = await detail(unlinked)
         #expect(gone.contains("the originals are gone"))
         #expect(gone.contains(to.deletingLastPathComponent().path))
 
         var renamed = TransferState(byRename: true)
-        renamed.moved = [(from: from, to: to)]
+        renamed.moved = [.init(from: from, to: to, sourceFacts: nil)]
         let moved = await detail(renamed)
         #expect(moved.contains("no longer at their"))
         #expect(!moved.contains("the originals are gone"))
 
         var copied = TransferState(byRename: false)
-        copied.moved = [(from: from, to: to)]
+        copied.moved = [.init(from: from, to: to, sourceFacts: nil)]
         let untouched = await detail(copied)
         #expect(untouched.contains("the originals are untouched"))
         #expect(!untouched.contains("the originals are gone"))
@@ -1175,5 +1175,305 @@ struct FileOperatorAbandonWordingTests {
         // reported as itself rather than wrapped in a second description.
         let passthrough = await op.abandon(unlinked, marks: [], reason: .sourceRemovalFailed)
         #expect(passthrough.outcome == .failed(.sourceRemovalFailed))
+    }
+
+    /// **A partial unlink is not "the originals are gone."** The #33 guard can
+    /// stop the removal loop at its second file, with the first source already
+    /// unlinked and the rest still where they were. Told "the originals are
+    /// gone", a user goes looking at the destination for files that never left
+    /// their folder — and, worse, stops looking at the source for the one that
+    /// is still there.
+    @Test func abandonNamesWhichOriginalsWentAndWhichDidNot() async throws {
+        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
+        let adjustments = try tree.file("from/IMG_0001.aae", bytes: 7)
+        let sidecar = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        let destination = try tree.directory("to")
+        let store = try IndexStore.inMemory()
+        try index(raw, into: store)
+
+        // Three files, so the last copy is a seam *after* the middle file's
+        // `stat` was taken and *before* the removal loop reaches it. The RAW is
+        // unlinked; the `.aae` is refused.
+        let op = FileOperator(store: store, volumeReader: { url in
+            VolumeIdentity(device: url.path.hasSuffix("/to") ? 2 : 1,
+                           uuid: url.path.hasSuffix("/to") ? "VOL-B" : "VOL-A")
+        }, copier: { source, target, _ in
+            try FileManager.default.copyItem(at: source, to: target)
+            if source.pathExtension == "xmp" {
+                let doomed = source.deletingPathExtension().appendingPathExtension("aae")
+                try FileManager.default.removeItem(at: doomed)
+                try Data(repeating: 0x42, count: 99).write(to: doomed)
+            }
+        })
+        let plan = try await op.plan(kind: .move, sources: [raw], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+        #expect(plan.items[0].companions == [adjustments, sidecar])
+
+        let results = try await op.execute(plan)
+
+        // The RAW really did go; the other two really did not.
+        #expect(!exists(raw))
+        #expect(try bytes(adjustments) == 99)
+        #expect(try bytes(sidecar) == 6)
+
+        guard case .failed(.rollbackIncomplete(let detail)) = results[0].outcome else {
+            Issue.record("expected .rollbackIncomplete, got \(results[0].outcome)")
+            return
+        }
+        // **The partition, not the vocabulary.** Asserting that each name
+        // appears somewhere passes just as well when the two halves are swapped
+        // — and a message that puts the surviving originals under "gone" is
+        // worse than the one it replaced.
+        #expect(detail.contains("gone from their original paths and now only at"))
+        #expect(detail.contains(": IMG_0001.CR2; still at their original paths: "
+                                + "IMG_0001.aae, IMG_0001.xmp;"))
+        // The sentence that would send the user to the wrong folder.
+        #expect(!detail.contains("the originals are gone"))
+        #expect(!detail.contains("the originals are untouched"))
+    }
+}
+
+// MARK: - #33: the unlink is guarded on identity, not on the path
+
+/// **"There is a file here now" is not "this is the file we were asked to act
+/// on."** Every index *write* in this type is guarded on identity — id, path,
+/// size, mtime — because a row that no longer describes its file is a row that
+/// belongs to a different photo. The two unlinks were not: they removed whatever
+/// answered at the planned path, across the plan/execute gap for `delete` and
+/// across the copy/unlink window for a cross-volume `move`. Those are the only
+/// two places in the type where a file that arrived in the gap is *destroyed*
+/// rather than displaced.
+struct FileOperatorUnlinkIdentityTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// The irreversible path. A photo is planned for deletion, and in the gap
+    /// before the batch runs — a confirmation sheet is a human-length pause —
+    /// the file at that path is replaced by a different one. The row still says
+    /// 64 bytes; the disk says 99. Unlinking on the strength of the path alone
+    /// destroys a file nobody selected, permanently.
+    @Test func aDeleteRefusesToUnlinkAFileThatArrivedInTheGap() async throws {
+        let source = try tree.file("lib/IMG_0001.jpg", bytes: 64)
+        let store = try IndexStore.inMemory()
+        let planned = try index(source, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .delete, sources: [source], destination: nil)
+
+        // The gap. Same path, different file.
+        try FileManager.default.removeItem(at: source)
+        _ = try tree.file("lib/IMG_0001.jpg", bytes: 99)
+
+        let results = try await op.execute(plan)
+
+        // The newcomer survives, and the outcome says why nothing happened.
+        #expect(results[0].outcome == .failed(.modifiedSinceOperation))
+        #expect(exists(source))
+        #expect(try bytes(source) == 99)
+        // Nothing changed, so the row is untouched and the journal says `failed`.
+        let row = try #require(try store.record(atPath: source.path))
+        #expect(row.id == planned)
+        #expect(row.size == 64)
+        #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.failed])
+    }
+
+    /// The narrower window: a cross-volume move copies, then unlinks its
+    /// sources. The RAW's `stat` is taken when its copy is verified; the sidecar
+    /// is copied next, and that is the only seam between the two. Swapping the
+    /// RAW there is the same event as above, and the unlink must decline.
+    ///
+    /// **The rows stay `in_flight`, not `failed`.** The copy is already at the
+    /// destination, so "nothing changed" is not a promise this path can make —
+    /// exactly the rule `FileOperationFailure` states for the four outcomes the
+    /// operator cannot describe.
+    @Test func aCrossVolumeMoveRefusesToUnlinkASourceSwappedAfterItsCopy() async throws {
+        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
+        let sidecar = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        let destination = try tree.directory("to")
+        let store = try IndexStore.inMemory()
+        try index(raw, into: store)
+
+        let op = FileOperator(store: store, volumeReader: { url in
+            VolumeIdentity(device: url.path.hasSuffix("/to") ? 2 : 1,
+                           uuid: url.path.hasSuffix("/to") ? "VOL-B" : "VOL-A")
+        }, copier: { source, target, _ in
+            try FileManager.default.copyItem(at: source, to: target)
+            // The RAW's copy is done and verified; its source removal has not
+            // been reached. Something else replaces it.
+            if source.pathExtension == "xmp" {
+                let doomed = source.deletingPathExtension().appendingPathExtension("CR2")
+                try FileManager.default.removeItem(at: doomed)
+                try Data(repeating: 0x42, count: 99).write(to: doomed)
+            }
+        })
+        let plan = try await op.plan(kind: .move, sources: [raw], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+
+        let results = try await op.execute(plan)
+
+        // The newcomer is still at the source path, with its own bytes. This is
+        // the whole assertion: without the guard it is unlinked.
+        #expect(exists(raw))
+        #expect(try bytes(raw) == 99)
+        // The copy this batch made is at the destination, and the sidecar was
+        // never unlinked either — the item stopped at the first refusal.
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.CR2")) == 48)
+        #expect(try bytes(sidecar) == 6)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.xmp")) == 6)
+
+        guard case .failed(.rollbackIncomplete(let detail)) = results[0].outcome else {
+            Issue.record("expected .rollbackIncomplete, got \(results[0].outcome)")
+            return
+        }
+        #expect(detail.contains("modifiedSinceOperation"))
+
+        // Both paths hold something, so every row of the item stays `in_flight`
+        // carrying both, which is what the reconcile is built to re-`stat`.
+        let rows = try store.journalRows(batchID: plan.batchID)
+        #expect(rows.allSatisfy { $0.state == .inFlight })
+        let rawRow = try #require(rows.first { $0.src == raw.path })
+        #expect(rawRow.dst == destination.appendingPathComponent("IMG_0001.CR2").path)
+    }
+
+    /// The half of the guard `size`/`mtime` cannot cover on its own. A tier 0
+    /// pass ran in the gap and re-indexed the path, so the row sitting on it now
+    /// describes the *newcomer* and agrees with the disk field for field. What
+    /// does not agree is the id the plan read: `files.id` is a reused rowid, and
+    /// a row that was dropped and written again is not the row this delete was
+    /// planned against — the same reason `setHashes(for:)` matches on the id as
+    /// well as on the facts.
+    @Test func aDeleteRefusesWhenTheRowAtThePathIsNoLongerThePlannedOne() async throws {
+        let source = try tree.file("lib/IMG_0001.jpg", bytes: 64)
+        let store = try IndexStore.inMemory()
+        let planned = try index(source, into: store)
+        // A second row, so re-inserting cannot be handed the dropped row's id
+        // straight back: SQLite's next rowid is one past the highest in use.
+        try index(try tree.file("lib/IMG_0002.jpg", bytes: 8), into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .delete, sources: [source], destination: nil)
+
+        // The gap: a different file at the path, and an index that has caught up
+        // with it. Nothing about the row's facts betrays the swap.
+        try store.applyAndMark([.remove(id: planned, path: source.path)], marks: [])
+        try FileManager.default.removeItem(at: source)
+        _ = try tree.file("lib/IMG_0001.jpg", bytes: 99)
+        let reindexed = try index(source, into: store)
+        #expect(reindexed != planned)
+
+        let results = try await op.execute(plan)
+
+        #expect(exists(source))
+        #expect(try bytes(source) == 99)
+        #expect(results[0].outcome == .failed(.modifiedSinceOperation))
+        #expect(try store.record(atPath: source.path)?.id == reindexed)
+        #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.failed])
+    }
+
+    /// **The refusal is per item, not per file.** A companion is a companion
+    /// only because it shares the selected photo's basename — so once the file
+    /// at the source path is not the one that was planned for, the `.xmp` beside
+    /// it belongs to *that* file, not to the photo the user selected. Unlinking
+    /// it destroys a stranger's sidecar under a batch that refused to touch the
+    /// stranger's photo, which is the opposite of what the refusal claims.
+    @Test func aRefusedDeleteLeavesTheCompanionsOfTheFileItRefused() async throws {
+        let source = try tree.file("lib/IMG_0001.CR2", bytes: 64)
+        let sidecar = try tree.file("lib/IMG_0001.xmp", bytes: 6)
+        let store = try IndexStore.inMemory()
+        try index(source, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .delete, sources: [source], destination: nil)
+        #expect(plan.items[0].companions == [sidecar])
+
+        try FileManager.default.removeItem(at: source)
+        _ = try tree.file("lib/IMG_0001.CR2", bytes: 99)
+
+        let results = try await op.execute(plan)
+
+        // Both halves of the stranger's set survive. The sidecar is the
+        // assertion: it has no row of its own, so nothing but the item-level
+        // refusal stands between it and `removeItem`.
+        #expect(exists(sidecar))
+        #expect(try bytes(sidecar) == 6)
+        #expect(try bytes(source) == 99)
+        #expect(results[0].outcome == .failed(.modifiedSinceOperation))
+        // Every row of the item says `failed`, which is the truth: nothing was
+        // touched, so the reconcile has nothing to re-examine.
+        #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.failed, .failed])
+    }
+
+    /// A row that is **gone** is not a row that agrees. The plan read an id for
+    /// this file; by the time the batch runs a reconcile has pruned the row and
+    /// something else is at the path. Skipping the guard because there is
+    /// nothing to compare against is the pre-#33 behaviour — an unlink decided
+    /// by the path alone — on the one operation that cannot be taken back.
+    @Test func aDeleteRefusesWhenThePlannedRowIsGone() async throws {
+        let source = try tree.file("lib/IMG_0001.jpg", bytes: 64)
+        let store = try IndexStore.inMemory()
+        let planned = try index(source, into: store)
+
+        let op = FileOperator(store: store)
+        let plan = try await op.plan(kind: .delete, sources: [source], destination: nil)
+        #expect(plan.items[0].recordID == planned)
+
+        // The gap: the row is pruned and a stranger takes the path, so nothing
+        // in the index describes what is there.
+        try store.applyAndMark([.remove(id: planned, path: source.path)], marks: [])
+        try FileManager.default.removeItem(at: source)
+        _ = try tree.file("lib/IMG_0001.jpg", bytes: 99)
+
+        let results = try await op.execute(plan)
+
+        #expect(exists(source))
+        #expect(try bytes(source) == 99)
+        #expect(results[0].outcome == .failed(.modifiedSinceOperation))
+        #expect(try store.journalRows(batchID: plan.batchID).map(\.state) == [.failed])
+    }
+
+    /// **A source that is already gone is not a mismatch.** Something else
+    /// removed it between the copy and the unlink — and "gone from the source,
+    /// present at the destination" is the finished shape of a move, not a reason
+    /// to abandon one. The guard exists to stop this loop unlinking a file it
+    /// did not copy; there is nothing here to unlink, so it has nothing to
+    /// refuse. `rowStillDescribes` states the same rule for the delete: a `stat`
+    /// that fails is not a mismatch.
+    @Test func aCrossVolumeMoveTreatsAVanishedSourceAsAlreadyUnlinked() async throws {
+        let raw = try tree.file("from/IMG_0001.CR2", bytes: 48)
+        let sidecar = try tree.file("from/IMG_0001.xmp", bytes: 6)
+        let destination = try tree.directory("to")
+        let store = try IndexStore.inMemory()
+        try index(raw, into: store)
+
+        // The sidecar's copy is the seam: the RAW's copy has landed and its
+        // `stat` is taken, and the removal loop has not started.
+        let op = FileOperator(store: store, volumeReader: { url in
+            VolumeIdentity(device: url.path.hasSuffix("/to") ? 2 : 1,
+                           uuid: url.path.hasSuffix("/to") ? "VOL-B" : "VOL-A")
+        }, copier: { source, target, _ in
+            try FileManager.default.copyItem(at: source, to: target)
+            if source.pathExtension == "xmp" {
+                try FileManager.default.removeItem(
+                    at: source.deletingPathExtension().appendingPathExtension("CR2"))
+            }
+        })
+        let plan = try await op.plan(kind: .move, sources: [raw], destination: destination)
+        defer { emptyTrash(of: store, batchID: plan.batchID) }
+
+        let results = try await op.execute(plan)
+
+        let landedRaw = destination.appendingPathComponent("IMG_0001.CR2")
+        #expect(!exists(raw))
+        #expect(!exists(sidecar))
+        #expect(try bytes(landedRaw) == 48)
+        #expect(try bytes(destination.appendingPathComponent("IMG_0001.xmp")) == 6)
+        #expect(results[0].outcome == .completed)
+        let rows = try store.journalRows(batchID: plan.batchID)
+        #expect(rows.map(\.state) == [.complete, .complete])
+        #expect(rows[0].dst == landedRaw.path)
+        // The index followed the file rather than being left behind.
+        #expect(try store.record(atPath: raw.path) == nil)
+        #expect(try store.record(atPath: landedRaw.path) != nil)
     }
 }

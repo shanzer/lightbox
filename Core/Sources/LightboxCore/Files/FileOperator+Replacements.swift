@@ -41,6 +41,16 @@ extension FileOperator {
     /// `ItemExecution` the caller should hand back, because staging failure has
     /// two different shapes — one where the aside was cleanly undone and one
     /// where it was not — and only this function knows which happened.
+    ///
+    /// **Why this path needs no identity guard, where the two unlinks do**
+    /// (#33). The occupant is read from the filesystem here, not from the plan,
+    /// and a file that arrived at that path in the plan/execute gap is
+    /// *displaced* rather than destroyed: it is moved to the stash under its own
+    /// journal row and, if the item succeeds, sent to the Trash — recoverable
+    /// from the Finder and reversible by #6. `delete` and a cross-volume
+    /// `move`'s source removal are the only two places where the file at a
+    /// planned path is unlinked, and both therefore re-check that the file is
+    /// the one that was planned for before they touch it.
     func prepareReplacements(_ item: PlannedItem, asideOps: [Int64],
                              batchSources: Set<String>)
         -> Result<[StagedReplacement], ItemExecution> {
