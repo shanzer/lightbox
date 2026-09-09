@@ -43,16 +43,43 @@ enum FileCommand: String, CaseIterable, Sendable {
     }
 }
 
+/// What kind of batch the progress sheet is counting.
+///
+/// **One progress sheet, not two.** A metadata write is a batch of file writes
+/// with the same shape as a move — it takes minutes over a large selection, it
+/// is cancellable between items, and it reports per item — so it takes the same
+/// indicator, the same Stop button and the same `batchToken` discipline. The
+/// only thing that differs is the sentence at the top, which is what this
+/// enumeration is for.
+enum BatchKind: Equatable, Sendable {
+    case file(FileOperationKind)
+    /// A `MetadataWriter` run over the selection (spec §9).
+    case metadata
+}
+
 /// How far the batch in this window has got.
 ///
 /// A value, replaced wholesale, so the progress sheet cannot observe a
 /// half-updated count. `current` is the file the operator has just finished,
 /// which is what `FileOperator`'s handler reports.
 struct BatchProgress: Equatable, Sendable {
-    let kind: FileOperationKind
+    let kind: BatchKind
     var completed: Int
     var total: Int
     var current: URL?
+
+    init(kind: BatchKind, completed: Int, total: Int, current: URL?) {
+        self.kind = kind
+        self.completed = completed
+        self.total = total
+        self.current = current
+    }
+
+    /// The file-operation spelling, so the four batch commands and their tests
+    /// read as they did before metadata editing existed.
+    init(kind: FileOperationKind, completed: Int, total: Int, current: URL?) {
+        self.init(kind: .file(kind), completed: completed, total: total, current: current)
+    }
 
     var fraction: Double {
         guard total > 0 else { return 0 }
@@ -62,10 +89,12 @@ struct BatchProgress: Equatable, Sendable {
     var title: String {
         let noun = total == 1 ? "item" : "items"
         switch kind {
-        case .move: return "Moving \(total) \(noun)…"
-        case .copy: return "Copying \(total) \(noun)…"
-        case .trash: return "Moving \(total) \(noun) to the Trash…"
-        case .delete: return "Deleting \(total) \(noun)…"
+        case .file(.move): return "Moving \(total) \(noun)…"
+        case .file(.copy): return "Copying \(total) \(noun)…"
+        case .file(.trash): return "Moving \(total) \(noun) to the Trash…"
+        case .file(.delete): return "Deleting \(total) \(noun)…"
+        case .metadata:
+            return "Writing metadata to \(total) \(total == 1 ? "file" : "files")…"
         }
     }
 }
@@ -212,6 +241,18 @@ enum ActiveSheet: Identifiable {
     case progress
     case summary(OperationSummary)
     case confirmPermanentDelete(count: Int)
+    /// Spec §9's batch time operations: set, shift, assign a sequence.
+    case batchTime
+    /// The confirmation in front of erasing one metadata field across the
+    /// selection. Blank means unchanged everywhere, so an erase is a gesture of
+    /// its own — and one that rewrites every selected file with no ⌘Z behind
+    /// it, which is the same reason a permanent delete asks first.
+    case confirmMetadataClear(field: MetadataField, count: Int)
+    /// A metadata batch's per-item report. Separate from `.summary` because a
+    /// metadata write has warnings and no destination, and a file operation has
+    /// a destination and no warnings — one sheet serving both would be a switch
+    /// on which half of its own fields were populated.
+    case metadataSummary(MetadataSummary)
 
     var id: String {
         switch self {
@@ -219,6 +260,9 @@ enum ActiveSheet: Identifiable {
         case .progress: "progress"
         case .summary: "summary"
         case .confirmPermanentDelete: "confirmPermanentDelete"
+        case .batchTime: "batchTime"
+        case .confirmMetadataClear: "confirmMetadataClear"
+        case .metadataSummary: "metadataSummary"
         }
     }
 }

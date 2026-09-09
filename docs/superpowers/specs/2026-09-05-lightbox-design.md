@@ -555,6 +555,70 @@ to toggle, marquee, command-A, arrow-key navigation, and space for QuickLook.
 With several images selected, the inspector shows shared values and
 `(multiple values)` elsewhere; editing a field applies it across the selection.
 
+*(Amended: how "editing a field applies it across the selection" works, for #9.)*
+A commit is **one `MetadataWriter` batch over the whole selection**, run off the
+main thread behind the same progress sheet, the same Stop-after-this-item button
+and the same per-item summary a move gets — §11's rule that batches never fail
+as a unit applies unchanged. Six things the editor commits to:
+
+- **Return applies; blur does not.** A field that committed on focus change
+  would write to every selected file the moment the user clicked elsewhere.
+- **A blank box means unchanged — every box, no exceptions.** `onSubmit` fires
+  on Return whether or not the text changed, and an empty string is not "no
+  field was set": `MetadataWriter` turns one into an explicit tag-*removing*
+  write. Without this rule, tabbing into an untouched Artist box on a 300-file
+  selection and pressing Return erases Artist on 300 files and rewrites every
+  one of them, with no ⌘Z behind it. Erasing a tag is therefore its own
+  gesture: a ✕ beside the box, behind a confirmation naming the field and the
+  file count, and the summary says "cleared" rather than "written". Keywords
+  follow the same rule as the rest — one rule everywhere is worth more than the
+  convenience of an empty box clearing the set. Capture time, rating and GPS
+  have no erase at all, because `MetadataEdit` has no way to spell "remove
+  this".
+- **The time zone is a control, never a default.** It opens on the selection's
+  own `OffsetTimeOriginal` when they agree and on the machine's zone when they
+  do not, it is always visible, and a capture time with no zone is refused
+  *before* a batch starts (§9, constraint 1) rather than once per file
+  afterwards.
+- **Batch time operations are a sheet**: set to a fixed value; shift by an
+  offset, which keeps each file's own zone because it is fixing a clock rather
+  than moving photos between zones; and assign a sequence from a start time at a
+  fixed interval, numbered in the grid's current sort order. A sequence gives
+  every file a different instant, so it is one writer call per file rather than
+  one call over all of them. A shift refuses a selection where any file has no
+  capture time *or* no parseable zone, and says so before anything runs:
+  substituting the machine's zone would write an `OffsetTimeOriginal` nobody
+  asked for, which is constraint 1 read backwards.
+- **A RAW selection says "writes to an `.xmp` sidecar"** beside the fields, so
+  §9's second constraint is visible rather than merely true — counted, not
+  claimed, because a mixed RAW+JPEG selection is the common one and the notice
+  must not make a claim about the files it is not true of.
+- **Metadata edits are not ⌘Z-able in this phase, and the panel says so.**
+  `MetadataWriter` writes no `op_journal` rows, so there is nothing to reverse;
+  the last file operation stays ⌘Z's subject rather than being displaced by a
+  write that cannot be undone.
+- **Only capture time and time zone are seeded from the index.** `FileRecord`
+  has no columns for Artist, Copyright, Description, Keywords, Rating, Label or
+  GPS, so those boxes are blank-meaning-unchanged rather than showing a current
+  value that would cost one exiftool fork per selected file on every selection
+  change. Showing them is a later change to the schema, not to the inspector.
+
+With exiftool absent the editing controls are **replaced by** §11's explanation
+and the install command — not greyed out, because a disabled box carrying a
+value nobody can commit is furniture — plus a *Try Again* that re-runs the
+lookup, since a cached answer under an instruction reading "install it, then
+try again" is how a user who has just installed it concludes the app is broken.
+
+Stopping a batch reports nothing, exactly as a stopped move does: the writer
+returns every un-reached file as a per-item cancellation, and those are counted
+rather than listed, so a user who pressed Stop is not then shown "295 files
+could not be written".
+
+After a successful write the grid is refreshed **from the index, never by a
+rescan**: `MetadataWriter` is handed the store and rewrites each edited row's
+size, mtime and hashes as part of the write, so the index already describes the
+files on disk by the time the batch returns.
+
 ### Grid implementation
 
 `LazyVGrid` is far less code than `NSCollectionView`, and at 50k items with fast

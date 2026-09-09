@@ -1,18 +1,45 @@
 import SwiftUI
 import LightboxCore
 
-/// What the index knows about the selected files.
+/// What the index knows about the selected files, and — since #9 — the spec §9
+/// fields the selection can be edited through.
 ///
-/// **Read-only in phase 1.** Editing arrives with `MetadataWriter` in phase 2,
-/// and an editable field built now would be built twice: a writable inspector
-/// needs undo, per-field dirty state, and a write-back path that reconciles
-/// with the index, none of which exist yet.
+/// With more than one row selected every read-only field shows the value they
+/// agree on, or `(multiple values)` where they do not — the same rule the
+/// Finder's multiple-item Get Info uses. **The editable fields follow the other
+/// half of spec §10's sentence**: a commit applies across the whole selection,
+/// as one `MetadataWriter` batch with the progress sheet, the Stop button and
+/// the per-item summary a move gets.
 ///
-/// With more than one row selected every field shows the value they agree on,
-/// or `(multiple values)` where they do not — the same rule the Finder's
-/// multiple-item Get Info uses, and the one an editable version will need.
+/// Three things the editable half deliberately does *not* do:
+///
+/// - **It does not commit on blur.** Return applies; clicking away does not. A
+///   blur-commit writes to every selected file the moment focus moves, which
+///   for a 300-file selection is a batch nobody asked for. The fields say so.
+/// - **A blank box means unchanged — every box, no exceptions**, and for the
+///   two boxes that are pre-filled from the index the rule is stated against
+///   what they were filled with (`CaptureTimeSeed`) rather than against the
+///   empty string. `onSubmit`
+///   fires on Return whether or not the text changed, so tabbing into an
+///   untouched Artist box on a 300-file selection and pressing Return would
+///   otherwise erase Artist on 300 files and rewrite every one of them, with no
+///   ⌘Z behind it. Erasing a tag is the ✕ beside the box, behind a
+///   confirmation. `MetadataField.isClearable` says which fields have one and
+///   why the other three do not.
+/// - **It does not show the current Artist, Copyright, Description, Keywords,
+///   Rating, Label or GPS.** The index has no columns for them (`FileRecord`
+///   carries capture time, zone, camera and dimensions and nothing else of
+///   §9's set), and reading them would be one exiftool fork per selected file
+///   on every selection change. The boxes are therefore *blank meaning
+///   unchanged*, which their prompts say. Capture time and zone, which the
+///   index does hold, are seeded from it.
+/// - **It offers no undo.** A metadata edit writes no `op_journal` rows, so ⌘Z
+///   has nothing to reverse, and the panel says that rather than leaving the
+///   Edit menu's "Undo Move 3 Items" looking like it applies.
 struct InspectorView: View {
-    let records: [FileRecord]
+    @Bindable var model: BrowserModel
+
+    private var records: [FileRecord] { model.selectedRecords }
 
     /// Absent, agreed, or disagreed — three states, not two.
     ///
@@ -36,6 +63,27 @@ struct InspectorView: View {
         }
     }
 
+    // The editable drafts. Reset whenever the selection changes — a box still
+    // holding the previous selection's text is a box one Return away from
+    // writing it to the wrong photos.
+    @State private var captureTimeDraft = ""
+    @State private var captureZoneDraft = ""
+    @State private var artistDraft = ""
+    @State private var copyrightDraft = ""
+    @State private var descriptionDraft = ""
+    @State private var keywordsDraft = ""
+    @State private var ratingDraft = ""
+    @State private var labelDraft = ""
+    @State private var latitudeDraft = ""
+    @State private var longitudeDraft = ""
+    @State private var refusal: String?
+    /// What `reseed()` put in the capture-time pair, so a Return that changed
+    /// neither box can be recognised as changing nothing — see
+    /// `CaptureTimeSeed`.
+    @State private var captureSeed: CaptureTimeSeed?
+
+    @FocusState private var focused: BrowserModel.TextField?
+
     var body: some View {
         Form {
             if records.isEmpty {
@@ -53,6 +101,15 @@ struct InspectorView: View {
                     row("Size", shared {
                         ByteCountFormatter.string(fromByteCount: $0.size, countStyle: .file)
                     })
+                    // **These two go stale after a capture-time edit, and that
+                    // is issue #42.** `IndexStore.recordMetadataWrite` rewrites
+                    // the row's size, mtime and hashes and leaves
+                    // `capture_time`/`capture_offset` alone — and since it does
+                    // rewrite size and mtime, `needsReindex` never asks for the
+                    // file to be read again either, so the stale value is
+                    // permanent rather than merely late. Nothing this view can
+                    // do short of a rescan is honest; the fix is one `Core`
+                    // change to that call.
                     row("Captured", shared { record in
                         record.captureDate.map { Self.dateFormatter.string(from: $0) }
                     })
@@ -66,6 +123,8 @@ struct InspectorView: View {
                         Self.dateFormatter.string(from: $0.modifiedDate)
                     })
                 }
+
+                editing
 
                 if records.count == 1 {
                     Section("Location") {
@@ -89,7 +148,187 @@ struct InspectorView: View {
             }
         }
         .formStyle(.grouped)
+        // The probe forks `exiftool -ver`, so it happens once, off the main
+        // actor, the first time an inspector is on screen — not at launch.
+        .task { await model.resolveMetadataAvailability() }
+        .onChange(of: model.selection.selected, initial: true) { _, _ in reseed() }
     }
+
+    // MARK: - Editing
+
+    @ViewBuilder
+    private var editing: some View {
+        Section("Edit") {
+            if let explanation = model.metadataUnavailableExplanation {
+                // Spec §11: with exiftool absent the editing controls are
+                // **replaced by** the explanation and the command that fixes
+                // it — not rendered greyed out. A disabled box carrying a value
+                // nobody can commit is furniture; the sentence is the whole of
+                // what there is to say. Nothing else in the window changes.
+                Text(explanation)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(MetadataInspectorCopy.installCommand)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+                Button("Try Again") {
+                    Task { await model.resolveMetadataAvailability(recheck: true) }
+                }
+            } else if model.metadataAvailability == nil {
+                Text("Checking for exiftool…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                fields
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var fields: some View {
+        field("Capture time", text: $captureTimeDraft, prompt: WallClock.placeholder,
+              id: .inspectorCaptureTime) {
+            .captureTime(wallClock: captureTimeDraft, offset: captureZoneDraft,
+                         seed: captureSeed)
+        }
+        // **Always shown, never assumed.** A `DateTimeOriginal` with no
+        // `OffsetTimeOriginal` names a different instant on every machine that
+        // reads it, so the zone is a control rather than a default buried in
+        // the code — spec §9, constraint 1.
+        field("Time zone", text: $captureZoneDraft, prompt: "-05:00",
+              id: .inspectorCaptureZone) {
+            .captureTime(wallClock: captureTimeDraft, offset: captureZoneDraft,
+                         seed: captureSeed)
+        }
+        Button("Batch Time Operations…") { model.openBatchTimeSheet() }
+            .disabled(!model.canStartMetadataBatch)
+
+        field("Artist", text: $artistDraft, prompt: unchangedPrompt,
+              id: .inspectorArtist, clearing: .artist) { .artist(artistDraft) }
+        field("Copyright", text: $copyrightDraft, prompt: unchangedPrompt,
+              id: .inspectorCopyright, clearing: .copyright) { .copyright(copyrightDraft) }
+        field("Description", text: $descriptionDraft, prompt: unchangedPrompt,
+              id: .inspectorDescription, clearing: .description) { .description(descriptionDraft) }
+        field("Keywords", text: $keywordsDraft, prompt: unchangedPrompt,
+              id: .inspectorKeywords, clearing: .keywords) { .keywords(keywordsDraft) }
+        field("Rating", text: $ratingDraft, prompt: unchangedPrompt,
+              id: .inspectorRating) { .rating(ratingDraft) }
+        field("Label", text: $labelDraft, prompt: unchangedPrompt,
+              id: .inspectorLabel, clearing: .label) { .label(labelDraft) }
+        field("Latitude", text: $latitudeDraft, prompt: unchangedPrompt,
+              id: .inspectorLatitude) {
+            .gps(latitude: latitudeDraft, longitude: longitudeDraft)
+        }
+        field("Longitude", text: $longitudeDraft, prompt: unchangedPrompt,
+              id: .inspectorLongitude) {
+            .gps(latitude: latitudeDraft, longitude: longitudeDraft)
+        }
+
+        if let refusal {
+            Text(refusal)
+                .font(.callout)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        if let sidecar = MetadataEditRequest.sidecarNotice(records) {
+            Text(sidecar)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        Text("Press Return in a field to apply it to "
+            + (records.count == 1 ? "this image." : "all \(records.count) images."))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        Text(MetadataInspectorCopy.notUndoable)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// One editable field, through the shared `MetadataTextField` — the single
+    /// place `reportingTextFocus` is called, so there is one place to forget it
+    /// and `everyInspectorFieldReportsItsFocus` walks that place.
+    ///
+    /// `clearing` names the field the ✕ erases, and is absent for the three
+    /// that have no erase: `MetadataEdit` cannot spell "remove this capture
+    /// time / rating / position".
+    @ViewBuilder
+    private func field(_ label: String, text: Binding<String>, prompt: String,
+                       id: BrowserModel.TextField,
+                       clearing clearable: MetadataField? = nil,
+                       edit: @escaping () -> MetadataFieldEdit) -> some View {
+        MetadataTextField(
+            label: label, text: text, prompt: prompt, id: id, focused: $focused,
+            model: model, isEnabled: model.canEditMetadata,
+            onSubmit: { commit(edit()) },
+            clear: clearable.map { field in { model.confirmClearMetadataField(field) } })
+    }
+
+    private func commit(_ edit: MetadataFieldEdit) {
+        refusal = nil
+        Task {
+            if let failure = await model.commitMetadataField(edit) {
+                refusal = failure.message
+            }
+        }
+    }
+
+    /// **Every editable box carries this prompt**, because every one of them
+    /// means the same thing when empty: leave the tag alone. That is the rule
+    /// the whole editor turns on — `TextField.onSubmit` fires on Return whether
+    /// or not the text changed, so an empty box that erased would erase across
+    /// the selection on a stray Return. Erasing is the ✕ beside the box.
+    ///
+    /// It has to be said in the prompt or a blank box reads as "this file has
+    /// no Artist", which the index cannot actually tell us — see the type's own
+    /// documentation.
+    private var unchangedPrompt: String {
+        records.count == 1 ? "unchanged" : "unchanged for all \(records.count)"
+    }
+
+    /// Puts the drafts back in step with whatever is selected now.
+    ///
+    /// Capture time and zone come off the index, because those two columns
+    /// exist. The rest reset to empty, which is "unchanged" — the alternative,
+    /// leaving the previous selection's text in the boxes, is one Return away
+    /// from writing it to the wrong photos.
+    private func reseed() {
+        refusal = nil
+        artistDraft = ""
+        copyrightDraft = ""
+        descriptionDraft = ""
+        keywordsDraft = ""
+        ratingDraft = ""
+        labelDraft = ""
+        latitudeDraft = ""
+        longitudeDraft = ""
+
+        guard !records.isEmpty else {
+            captureTimeDraft = ""
+            captureZoneDraft = ""
+            captureSeed = nil
+            return
+        }
+        let offset = MetadataEditRequest.defaultOffset(for: records)
+        captureZoneDraft = offset
+        let zone = TimeZoneOffset.parse(offset) ?? .current
+        let dates = records.map(\.captureDate)
+        if let first = dates.first, let agreed = first, dates.allSatisfy({ $0 == agreed }) {
+            captureTimeDraft = WallClock.string(from: agreed, in: zone)
+        } else {
+            captureTimeDraft = ""
+        }
+        // Remembered, so a Return that changed neither box changes nothing.
+        // Without it these two are the one pair that escapes the
+        // blank-means-unchanged rule, by never being blank.
+        captureSeed = CaptureTimeSeed(wallClock: captureTimeDraft, offset: captureZoneDraft)
+    }
+
+    // MARK: - Read-only rendering
 
     /// A full content hash is 64 hex characters and would force the inspector
     /// as wide as a value nobody reads in full. The prefix is enough to

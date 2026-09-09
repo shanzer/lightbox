@@ -109,10 +109,10 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 619 tests, 78 suites.
+# Core: 622 tests, 78 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 102 tests.
+# App: builds the SwiftUI target and runs its 161 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -163,13 +163,14 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 619 tests live. `App/` only wires it to views.
+where all the logic and all 622 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
 | Walk | `Walker.swift`, `MediaType.swift` | Recursive enumeration; extension + UTI classification (RAW, HEIC, JPEG, PNG, WebP) |
 | Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift`, `Index/IndexStore+{FileOperations,Reconcile}.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity; the `op_journal` writes and the guarded row move/copy/remove; the launch-time reconcile of `in_flight` rows and journal retention |
 | Metadata | `Metadata/{ImageMetadata,MetadataReader}.swift` | ImageIO `CGImageSource` reads — dimensions, camera, capture time |
+| Metadata (write) | `Metadata/{MetadataEdit,MetadataWriter,MetadataWriter+Tags,ExiftoolLocator,ExiftoolRunner}.swift` | Spec §9's writes through exiftool: MWG composites, RAW sidecars, write-verify-commit, the `image_hash` tripwire, availability |
 | Hashing | `Hashing/*.swift` | Three hashes: `content_hash` (whole file), `image_hash` (format-stripped pixel data), `phash` (DCT perceptual) |
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode; own executor, and the PNG encode hopped off the pool (#30) |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
@@ -286,9 +287,12 @@ The App side, file by file:
 | `LaunchEnvironment.swift` | Whether this launch may open the real index (#15) |
 | `BrowserModel.swift` | The window's state: folder, records, selection, filters, progress; every async step carries a `Pass` |
 | `BrowserModel+FileOperations.swift` | Spec §8's batches: plan, collision sheet, run off the main thread, put the window back together |
-| `FileOperationState.swift` | `FileCommand`, `BatchProgress`, `CompletedBatch`, `OperationSummary`, `ActiveSheet`, `CollisionSheetModel` — the testable half of the sheets |
+| `FileOperationState.swift` | `FileCommand`, `BatchKind`, `BatchProgress`, `CompletedBatch`, `OperationSummary`, `ActiveSheet`, `CollisionSheetModel` — the testable half of the sheets |
+| `BrowserModel+MetadataEditing.swift` | Spec §9's writes: validate, one batch through `MetadataWriter`, the same progress sheet, reload from the index. Never `op_journal` (#9) |
+| `MetadataEditing.swift` | `MetadataEditRequest`, `MetadataFieldEdit`, `BatchTimeOperation`, `TimeZoneOffset`, `WallClock`, `ShiftAmount`, `MetadataSummary` — the editor with no view in it |
+| `MetadataWriting.swift` | The seam onto `MetadataWriter`, so the App suite runs where exiftool does not (#9) |
 | `DestinationChooser.swift` | The `NSOpenPanel` behind Move/Copy To…, with the companion checkbox as its accessory view |
-| `Views/` | Thin SwiftUI: grid, tree, filters, path bar, inspector, and the four file-operation sheets |
+| `Views/` | Thin SwiftUI: grid, tree, filters, path bar, the editable inspector, the four file-operation sheets and the two metadata ones |
 
 `App/Lightbox.xcodeproj/project.pbxproj` is **hand-written** (objectVersion 77,
 `PBXFileSystemSynchronizedRootGroup`). Adding a `.swift` file under
@@ -488,6 +492,31 @@ Eight things automated tests could not cover. **None done yet** as of the
    label test behind them (no injection seam), so the grep and a real window are
    all that cover them. Executor changes are exactly the kind that a unit suite
    passes and a real window reveals.
+
+9. **The inspector's editable fields, against the real library** (#9). The
+   acceptance line the issue names is owed to you, not to the suite: select 3
+   JPEGs, set Artist, and confirm `exiftool -Artist` reports it on each file.
+   Then the rest of the surface — the zone box defaulting from
+   `OffsetTimeOriginal` and being refused when emptied, the batch time sheet's
+   three operations, a sequence landing in the grid's sort order, a RAW
+   selection saying it writes to a sidecar, and Stop After This Item on a long
+   enough batch.
+
+   **The automated live-write test cannot run under `xcodebuild test`, and the
+   reason is a finding rather than a limitation of the test.** The App target's
+   test host is the real `Lightbox.app`, and a GUI-launched process gets
+   `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — measured. `ExiftoolLocator` searches
+   `PATH`, so `MetadataWriter.availability` is `.notFound` inside the test host
+   **on a machine with `/opt/homebrew/bin/exiftool` installed**, and
+   `settingArtistOnThreeJPEGsWritesAllThree` skips visibly rather than lying.
+   The same mechanism means **`Lightbox.app` launched from Finder will report
+   exiftool missing however it was installed**, because Homebrew's prefix is not
+   on a GUI process's `PATH`; the inspector will show §11's explanation
+   forever, and *Try Again* will not help. `LIGHTBOX_EXIFTOOL` is the escape
+   hatch today. Deciding what the shipped app should do — search the two
+   Homebrew prefixes after `PATH`, read the user's login shell once, or expose a
+   preference — is its own issue and is deliberately not settled here, because
+   "resolved via `PATH`, never a hardcoded prefix" is a standing rule.
 
 ## 8. Deferred, and what I'd do first in phase 2
 
@@ -1013,6 +1042,108 @@ all three are now done:
   Owed: the GUI live check, §7.6 — which now includes the ⌘Z pair the #6 entry
   above lists (move 20, quit, relaunch, undo; trash 5, empty the Trash, undo),
   because #7 is the UI that entry was waiting for.
+
+- ~~**The editable inspector.**~~ **Done** (issue #9). The spec §9 field set —
+  capture time with an explicit zone, Artist, Copyright, Description, Keywords,
+  Rating, Label and GPS as latitude/longitude boxes — plus a batch time sheet
+  with set / shift / assign-a-sequence, and the per-item summary. All of it in
+  `App/`; **`Core` was not touched at all**. Six things worth carrying forward:
+
+  **A commit is one writer batch, and the count is the assertion.** A field
+  edit over N files is a single `MetadataWriter.write` of N; a *sequence* gives
+  every file a different instant, so it is N calls of one.
+  `MetadataEditRequest` carries that as `groups` rather than flattening, and
+  the model's progress handler adds each group's `base` — a model that looped
+  per file would write the same bytes, pay for N `-stay_open` round trips, and
+  leave the sheet stuck at "1 of 5". `aFieldEditOnThreeFilesIsOneWriterBatchOfThree`
+  fails on both the wrong call count and the wrong batch size.
+
+  **The zone is refused twice, on purpose.** `MetadataWriter.validate` already
+  refuses a zone-less capture time at the API (spec §9, constraint 1), but that
+  refusal arrives as one `WriteOutcome` per file in a summary sheet — the wrong
+  shape for a typo in one box. `MetadataEditRequest.build` refuses it first,
+  before a batch starts, as a sentence under the field.
+  `anOffsetThisLayerAcceptsIsOneTheWriterAccepts` drives the real writer with an
+  executable path that does not exist — validation runs before any fork — so the
+  two layers cannot drift into disagreeing about what `±HH:MM` means.
+
+  **Blank means unchanged, in every box, and that is the rule the editor turns
+  on.** `TextField.onSubmit` fires on Return whether or not the text changed,
+  and `MetadataEdit.artist = ""` is *non-nil* — so `isEmpty` stays false and
+  `MetadataWriter+Tags` emits `-MWG:Creator=`, which erases the tag. Tabbing
+  into an untouched Artist box on a 300-file selection and pressing Return
+  therefore erased Artist on 300 files and rewrote every one of them, with no
+  ⌘Z. Every field now refuses a blank commit with `nothingToWrite`, keywords
+  included — they used to be the exception, and one rule everywhere is worth
+  more than that convenience. Erasing is the ✕ beside the box, behind a
+  confirmation, through `MetadataFieldEdit.clear`, and the summary says
+  "cleared". `MetadataField.isClearable` names the five that have one; capture
+  time, rating and GPS do not, because `MetadataEdit` cannot spell "remove
+  this".
+
+  **A stopped batch reports nothing.** `MetadataWriter` returns every un-reached
+  file as `.failure(.cancelled)` — the right shape for a result list, the wrong
+  one for a sheet. `MetadataSummary` counts them as `notReached` instead, and
+  `isWorthShowing` ignores that count, so Stop behaves as a stopped move does
+  (`OperationSummary.wasCancelled`) rather than raising "295 files could not be
+  written" in front of a user who watched the bar the whole time.
+
+  **One text field, not two.** `MetadataTextField` is the single place
+  `reportingTextFocus` is called; the inspector's ten boxes and the batch sheet's
+  six both go through it, so there is one place to forget the contract and two
+  tests walking that place.
+
+  **A metadata batch is a batch.** Same `batchToken`/`batchTask`/
+  `isBatchStarting` discipline, same `present(_:)` nil-yield-present sheet swap,
+  same Stop After This Item, same reload-not-refresh rule (pinned by the same
+  `ghost.jpg` trick #7 used). `BatchProgress.kind` became a `BatchKind` so one
+  progress sheet serves both; the file-operation spelling is kept as a
+  convenience initialiser so the four commands read as they did.
+  **What it does not share is `op_journal`** — there are no rows, so nothing
+  writes `lastCompletedBatch`, and the panel says metadata edits are not ⌘Z-able
+  in this phase rather than leaving "Undo Move 3 Items" looking like it applies.
+
+  **The focus contract is walked, not trusted.** #9 added ten text fields at
+  once, and a field that forgets `reportingTextFocus` leaves ⌘Z reversing the
+  last file batch while the user types in it.
+  `everyInspectorFieldReportsItsFocus` renders the real inspector in an
+  off-screen window, focuses each box and asserts the union against
+  `BrowserModel.TextField` — dropping the modifier from the one shared field
+  builder reddens it.
+
+  **The exiftool probe is injected, not discovered, in tests.** `MetadataWriting`
+  + `LiveMetadataWriter` is the seam: CI has no exiftool, so an availability
+  test built on the real lookup would pass there for the wrong reason. The one
+  test that writes bytes gates on `MetadataWriter.availability`, the same
+  property the writer reads — and skips even locally, for the `PATH` reason in
+  §7.9.
+
+  **The probe never runs on the main actor or the cooperative pool.**
+  `MetadataWriter.availability` forks `exiftool -ver`, so `LiveMetadataWriter`
+  pushes it onto `DispatchQueue.global` — which grows — and builds the writer
+  with the already-resolved answer so `MetadataWriter.init`'s default argument
+  is never evaluated on a caller's thread. The inspector's `.task` resolves it
+  once per window; nothing happens at launch.
+
+  **Only capture time and zone can be seeded**, and being seeded is itself a
+  trap. The index has no columns for the other six fields, so their boxes are
+  blank-meaning-unchanged and their prompts have to say so, or an empty box
+  reads as "this file has no Artist". The two that *are* filled cannot state
+  the rule as "blank": `onSubmit` fires on every Return, so tabbing through an
+  untouched inspector rewrote every selected file to the capture time it
+  already had — a fork, a stash, a rehash and a bumped mtime each, and no sheet,
+  because a clean success shows nothing. `CaptureTimeSeed` is what `reseed()`
+  put in the pair, and a commit still holding it changes nothing.
+
+  Separately, **`IndexStore.recordMetadataWrite` does not refresh
+  `capture_time`/`capture_offset` — that is issue #42**, a `Core` gap rather
+  than anything this layer can fix. After a capture-time edit the read-only
+  *Captured* row keeps showing the old value until something reindexes the
+  file, and nothing will: that same call updates the row's `size` and `mtime`,
+  which is exactly what `needsReindex` keys on, so the staleness is permanent
+  rather than merely late. Adding the two columns to that write is the fix, and
+  `InspectorView` and `BrowserModel+MetadataEditing.finish` both carry a comment
+  pointing at #42 so a reader of the code meets it.
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And

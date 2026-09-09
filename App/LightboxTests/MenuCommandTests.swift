@@ -775,7 +775,7 @@ struct TextFocusTeardownTests {
 /// renders no fields rather than one that had not laid out yet. Everything else
 /// in this file spins the run loop against a deadline for the same reason.
 @MainActor
-private func renderFields(_ view: some View, count: Int)
+func renderFields(_ view: some View, count: Int)
     -> (window: NSWindow, fields: [NSTextField]) {
     let host = NSHostingView(rootView: view)
     host.frame = NSRect(x: 0, y: 0, width: 900, height: 500)
@@ -816,7 +816,7 @@ private func renderFields(_ view: some View, count: Int)
 /// the wait fell straight through and the assertion read the state before
 /// SwiftUI had delivered anything.
 @MainActor
-private func focus(_ field: NSTextField, in model: BrowserModel) {
+func focus(_ field: NSTextField, in model: BrowserModel) {
     let before = model.editingFields
     field.window?.makeFirstResponder(field)
     let deadline = Date().addingTimeInterval(2)

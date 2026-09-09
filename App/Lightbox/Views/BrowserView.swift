@@ -50,7 +50,7 @@ struct BrowserView: View {
                         }
                         .frame(minWidth: 320)
 
-                        InspectorView(records: model.selectedRecords)
+                        InspectorView(model: model)
                             .frame(minWidth: 240, idealWidth: 300)
                     }
                     .overlay(alignment: .top) {
