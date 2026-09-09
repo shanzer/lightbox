@@ -34,6 +34,44 @@ import CoreGraphics
 /// once belongs in here too, not beside it.
 @Suite(.serialized)
 struct BlockingWorkFanOutTests {
+    /// **Why two of these three tests are opt-in (#49).**
+    ///
+    /// The ceiling and the fan-out bound are assertions about libdispatch's
+    /// queue *geometry*, and both were written and verified on a 10-core M4.
+    /// Neither holds on the 3-core `macos-26` runner, in opposite directions:
+    ///
+    /// | Test | Asserts | On CI |
+    /// |---|---|---|
+    /// | `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes` | 64 blocked closures accumulate | high-water **3–4** |
+    /// | `theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling` | peak `< 32` | observed **50** |
+    ///
+    /// The first fails because a non-overcommit queue will not grow to 64
+    /// threads on a 3-core box inside the watchdog's budget — the ceiling is
+    /// libdispatch's cap, not a floor any machine reaches. The second fails
+    /// because its own doc's prediction ("a three-core CI runner renders
+    /// *slower*, not faster, so its peak is lower than this machine's; this
+    /// cannot pass locally and fail there") is backwards: fewer cores means
+    /// each render is slower, so *more* encodes are in flight at once, not
+    /// fewer.
+    ///
+    /// So they are gated the way the benchmarks are, and for the same reason —
+    /// a measurement is only meaningful on hardware that can produce it. They
+    /// are not deleted, because the numbers they pin are quoted in
+    /// `BlockingWork.queue`, `ThumbnailCache.generate`, `CLAUDE.md` and
+    /// `HANDOFF`, and something has to be able to falsify them:
+    ///
+    /// ```bash
+    /// cd Core && LIGHTBOX_POOL_LIMITS=1 swift test --filter BlockingWorkFanOut
+    /// ```
+    ///
+    /// `aHashBlockedOnEveryCoreDoesNotStopTheRestOfTheProcess` stays
+    /// unconditional. It asserts the *property* #28 and #30 are about — that
+    /// blocking work does not stall the process — scales itself to
+    /// `activeProcessorCount`, and passes on CI. Gating the geometry must not
+    /// take the property with it.
+    static let measuresQueueGeometry =
+        ProcessInfo.processInfo.environment["LIGHTBOX_POOL_LIMITS"] == "1"
+
     let tree: TempTree
 
     init() throws { tree = try TempTree() }
@@ -75,7 +113,9 @@ struct BlockingWorkFanOutTests {
     /// loudly and on purpose: `BlockingWork.queue`, `ThumbnailCache.generate`,
     /// CLAUDE.md and HANDOFF all quote the number, and they must be corrected
     /// with it rather than the assertion being loosened.
-    @Test func theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes() async throws {
+    @Test(.enabled(if: BlockingWorkFanOutTests.measuresQueueGeometry,
+                   "needs LIGHTBOX_POOL_LIMITS=1 and a machine whose non-overcommit queue reaches 64 — see the suite's note (#49)"))
+    func theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes() async throws {
         let source = try Fixtures.writeImage(to: tree.root.appendingPathComponent("ceiling.jpg"),
                                              width: 400, height: 300)
         let root = tree.root
@@ -175,9 +215,16 @@ struct BlockingWorkFanOutTests {
     /// running alongside — that one parks 64 closures deliberately and drove
     /// this to 41 — which is why the suite is `.serialized`.
     ///
-    /// A three-core CI runner renders *slower*, not faster, so its peak is
-    /// lower than this machine's; this cannot pass locally and fail there.
-    @Test func theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling() async throws {
+    /// **That prediction was wrong, and CI falsified it (#49).** It used to
+    /// read: "a three-core CI runner renders *slower*, not faster, so its peak
+    /// is lower than this machine's; this cannot pass locally and fail there."
+    /// It failed there at **50** against this bound of 32. Slower renders do
+    /// not thin the queue — they leave each encode's neighbours still in
+    /// flight when it arrives, so a *smaller* machine piles up *more*. The
+    /// bound is calibrated to this one, which is why the test is now opt-in.
+    @Test(.enabled(if: BlockingWorkFanOutTests.measuresQueueGeometry,
+                   "needs LIGHTBOX_POOL_LIMITS=1 — the bound is calibrated to a 10-core machine; CI observed 50 against 32 (#49)"))
+    func theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling() async throws {
         let source = try Fixtures.writeImage(to: tree.root.appendingPathComponent("fan.jpg"),
                                              width: 400, height: 300)
         let root = tree.root

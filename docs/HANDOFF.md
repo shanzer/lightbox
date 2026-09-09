@@ -231,8 +231,18 @@ encode is 0.6 ms, so they arrive spread out, and
 guards it at half the ceiling (`< 32`), the margin absorbing other suites' use
 of the same queue, while
 `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes` pins the ceiling
-itself by holding every encode until 64 are in flight — no timing at all, since
-nothing is released until the 64th arrives. The sidebar has neither a
+itself by holding every encode until 64 are in flight.
+
+**Both are opt-in behind `LIGHTBOX_POOL_LIMITS=1` and do not run on CI (#49).**
+They are assertions about libdispatch's queue geometry, verified only on a
+10-core M4, and they fail on the 3-core runner in *opposite* directions: the
+ceiling test reaches a high-water of 3 or 4 rather than 64, and the fan-out test
+observes 50 against its bound of 32. The claim that "no timing at all" was
+involved held only on the machine it was written on — the 64 is libdispatch's
+cap, not a floor. `main` went red on #44's own merge commit before this was
+gated. The third test in that suite,
+`aHashBlockedOnEveryCoreDoesNotStopTheRestOfTheProcess`, is *not* gated: it
+asserts the property, scales to `activeProcessorCount`, and passes on CI. The sidebar has neither a
 measurement nor a
 test, and in slot-seconds it is the heaviest caller on this queue: a
 `contentsOfDirectory` plus an `lstat` per entry holds its slot for seconds on a

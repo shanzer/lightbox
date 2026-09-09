@@ -89,6 +89,7 @@ scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
 cd Core && swift test                                                     # ~15 s on M4
 cd App  && xcodebuild -scheme Lightbox -destination 'platform=macOS' test  # ~3 s after build
 cd Core && LIGHTBOX_BENCH=1 swift test --filter Benchmark --no-parallel   # needs ~/lightbox-bench
+cd Core && LIGHTBOX_POOL_LIMITS=1 swift test --filter BlockingWorkFanOut  # queue geometry; needs cores (#49)
 ```
 
 Toolchain: Xcode 26.x, Swift ≥ 6.2 (`swift-tools-version: 6.2`, `.macOS(.v26)`). Sole
@@ -180,12 +181,14 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   must turn up nothing doing synchronous IO or SQLite outside a hop. Today its only
   non-comment hit is `ThumbnailCache.generate`, whose `@concurrent` carries the async
   render and whose blocking half is hopped. `BlockingWork.run`'s
-  queue admits **64** concurrently-blocked closures and queues the surplus, so every
-  caller's fan-out *and how long it holds a slot* is written down in the table on
-  `BlockingWork.queue`. Two callers scale with the window rather than a constant: the
-  grid's cells and the sidebar's rows. The grid is the one that has been measured —
-  it peaks at 10 at worst, and `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes`
-  pins the 64 itself — but in slot-seconds `FolderTreeView` is the heavier of the two, and
+  queue admits **at most 64** concurrently-blocked closures and queues the surplus, so
+  every caller's fan-out *and how long it holds a slot* is written down in the table on
+  `BlockingWork.queue`. **64 is libdispatch's cap, not a number every machine reaches**
+  — a 3-core CI runner tops out around 3 or 4, and the two tests that measure this
+  geometry are therefore opt-in behind `LIGHTBOX_POOL_LIMITS=1` and skip on CI (#49).
+  Don't quote the 64 as though CI had checked it. Two callers scale with the window
+  rather than a constant: the grid's cells and the sidebar's rows. The grid is the one
+  that has been measured — it peaks at 10 at worst on a 10-core M4 — but in slot-seconds `FolderTreeView` is the heavier of the two, and
   the one with no test: a `contentsOfDirectory` plus an `lstat` per entry can hold a
   slot for seconds on a spun-down volume against the encode's 0.6 ms. Reproduce a
   narrowed pool with
