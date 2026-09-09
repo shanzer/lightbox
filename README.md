@@ -39,6 +39,7 @@ Benchmarks are off unless `LIGHTBOX_BENCH=1` and need the fixture library:
 ```bash
 swift scripts/make-fixture-library.swift ~/lightbox-bench 50000   # ~14 GB — exclude from backup first
 cd Core && LIGHTBOX_BENCH=1 swift test --filter Benchmark --no-parallel
+cd Core && LIGHTBOX_POOL_LIMITS=1 swift test --filter BlockingWorkFanOut  # queue geometry, needs cores (#49)
 ```
 
 ## Working on it
