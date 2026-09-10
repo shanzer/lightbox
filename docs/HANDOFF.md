@@ -76,9 +76,11 @@ and was split into named steps. Expect the same from any other dense
 bit-twiddling one-liner; the fix is always the same.
 
 The exiftool path change bit in **phase 2**, and is handled:
-`Metadata/ExiftoolLocator.swift` searches `PATH` at first use and hardcodes
-neither prefix, with `LIGHTBOX_EXIFTOOL` as an override for a non-standard
-install or a test stub. `MetadataWriter.availability` is the single answer to
+`Metadata/ExiftoolLocator.swift` resolves it at first use in four rungs —
+`LIGHTBOX_EXIFTOOL`, `PATH`, the user's login shell, then a named prefix list —
+hardcoding neither Homebrew prefix as *the* answer, with `LIGHTBOX_EXIFTOOL` as
+an override for a non-standard install or a test stub. The last two rungs are
+#41's; §7.9 has why a `PATH`-only lookup shipped a dead feature. `MetadataWriter.availability` is the single answer to
 "can we edit?", and the round-trip tests gate on that same property so a machine
 without exiftool (every CI runner) skips them visibly instead of failing. It was
 also used during design to empirically verify the image-hash rules survive
@@ -109,7 +111,7 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 622 tests, 78 suites.
+# Core: 632 tests, 79 suites.
 cd Core && swift test
 
 # App: builds the SwiftUI target and runs its 161 tests.
@@ -163,7 +165,7 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 622 tests live. `App/` only wires it to views.
+where all the logic and all 632 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
@@ -502,21 +504,40 @@ Eight things automated tests could not cover. **None done yet** as of the
    selection saying it writes to a sidecar, and Stop After This Item on a long
    enough batch.
 
-   **The automated live-write test cannot run under `xcodebuild test`, and the
-   reason is a finding rather than a limitation of the test.** The App target's
-   test host is the real `Lightbox.app`, and a GUI-launched process gets
-   `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — measured. `ExiftoolLocator` searches
-   `PATH`, so `MetadataWriter.availability` is `.notFound` inside the test host
-   **on a machine with `/opt/homebrew/bin/exiftool` installed**, and
-   `settingArtistOnThreeJPEGsWritesAllThree` skips visibly rather than lying.
-   The same mechanism means **`Lightbox.app` launched from Finder will report
-   exiftool missing however it was installed**, because Homebrew's prefix is not
-   on a GUI process's `PATH`; the inspector will show §11's explanation
-   forever, and *Try Again* will not help. `LIGHTBOX_EXIFTOOL` is the escape
-   hatch today. Deciding what the shipped app should do — search the two
-   Homebrew prefixes after `PATH`, read the user's login shell once, or expose a
-   preference — is its own issue and is deliberately not settled here, because
-   "resolved via `PATH`, never a hardcoded prefix" is a standing rule.
+   **A GUI-launched process gets `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, and that
+   used to make metadata editing dead in the shipped app.** The App target's
+   test host is the real `Lightbox.app`, so `MetadataWriter.availability` was
+   `.notFound` inside it **on a machine with `/opt/homebrew/bin/exiftool`
+   installed**, and `settingArtistOnThreeJPEGsWritesAllThree` skipped visibly
+   rather than lying — the same mechanism that made `Lightbox.app` launched from
+   Finder report exiftool missing however it was installed, with *Try Again*
+   unable to help.
+
+   **Settled in #41.** `ExiftoolLocator` now resolves in four rungs —
+   `LIGHTBOX_EXIFTOOL`, `PATH`, then `<$SHELL> -l -c 'command -v exiftool'`,
+   then the named list `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin` —
+   which keeps "never a hardcoded prefix" true in the sense that mattered: the
+   list is consulted only after the user's own `PATH` and login shell have both
+   been asked. The shell rung is `-l -c`, not `-l -i -c` (0.01–0.02 s against
+   0.49–0.67 s here, because `~/.zshrc` is where the slow things live), it is
+   the *real* login shell rather than `/bin/sh` (which sources `~/.profile` and
+   never `~/.zprofile`, where Homebrew writes its `PATH` line), and its output
+   is believed only as a first line that is absolute and executable. The whole
+   order is bounded — `loginShellProbeTimeout` 5 s plus `versionProbeTimeout`
+   10 s, which is the worst case now written into `BlockingWork.queue`'s table —
+   and cached, so *Try Again* re-runs all four rungs and a `.notFound` does not
+   refork a shell.
+
+   `settingArtistOnThreeJPEGsWritesAllThree` **runs** under `xcodebuild test`
+   now, and still skips cleanly on CI. Fixing it turned up a second thing worth
+   knowing: its fixture wrote a JPEG with no TIFF IFD, and ImageIO reports no
+   `{TIFF}` dictionary at all for such a file even after exiftool has put an
+   `IFD0:Artist` in it — so the read-back saw nil for a write that had actually
+   landed. The fixture seeds a Make and Model now, as `Core`'s always did.
+
+   Still out: **a stored exiftool location** (#51), the durable escape when all
+   four rungs miss, and the only route left if Lightbox is ever sandboxed —
+   rungs 3 and 4 both need to spawn a process.
 
 ## 8. Deferred, and what I'd do first in phase 2
 
@@ -1115,14 +1136,17 @@ all three are now done:
   + `LiveMetadataWriter` is the seam: CI has no exiftool, so an availability
   test built on the real lookup would pass there for the wrong reason. The one
   test that writes bytes gates on `MetadataWriter.availability`, the same
-  property the writer reads — and skips even locally, for the `PATH` reason in
-  §7.9.
+  property the writer reads. It used to skip even locally, for the `PATH` reason
+  in §7.9; since #41 it runs on any machine that has exiftool anywhere the four
+  rungs look, and skips only where there is none.
 
   **The probe never runs on the main actor or the cooperative pool.**
-  `MetadataWriter.availability` forks `exiftool -ver`, so `LiveMetadataWriter`
-  pushes it onto `DispatchQueue.global` — which grows — and builds the writer
-  with the already-resolved answer so `MetadataWriter.init`'s default argument
-  is never evaluated on a caller's thread. The inspector's `.task` resolves it
+  `MetadataWriter.availability` forks — a login shell when `PATH` misses, then
+  `exiftool -ver` (#41) — so `LiveMetadataWriter`
+  resolves it through Core's own hop (`BlockingWork.run`, #30/#44 — it used to
+  hand-roll a `DispatchQueue.global` one) and builds the writer with the
+  already-resolved answer so `MetadataWriter.init`'s default argument is never
+  evaluated on a caller's thread. The inspector's `.task` resolves it
   once per window; nothing happens at launch.
 
   **Only capture time and zone can be seeded**, and being seeded is itself a
