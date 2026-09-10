@@ -176,6 +176,15 @@ private extension NSLock {
 // MARK: - Fixtures
 
 /// A real JPEG, for the one test that runs the real writer.
+///
+/// **It carries a TIFF Make and Model, and that is not decoration.** A JPEG
+/// written with no properties at all has no TIFF IFD, and ImageIO then reports
+/// *no* `kCGImagePropertyTIFFDictionary` for it — even after exiftool has put an
+/// `IFD0:Artist` in the file, which `exiftool -a -G1` shows plainly. Read back
+/// through `{TIFF}`, a perfectly good write therefore looks like no write at
+/// all. Every real photo has a Make and Model, `Core`'s `Fixtures.writeImage`
+/// seeds the same two, and this fixture only looked like a photo until #41 made
+/// the test that uses it run for the first time.
 private func writeJPEG(to url: URL) throws {
     let width = 8, height = 8
     var pixels = [UInt8](repeating: 0x7F, count: width * height * 4)
@@ -191,16 +200,28 @@ private func writeJPEG(to url: URL) throws {
               url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
         throw MetadataError.unreadable
     }
-    CGImageDestinationAddImage(destination, image, nil)
+    let properties: [CFString: Any] = [
+        kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFMake: "TestCam",
+                                         kCGImagePropertyTIFFModel: "T1"],
+    ]
+    CGImageDestinationAddImage(destination, image, properties as CFDictionary)
     guard CGImageDestinationFinalize(destination) else { throw MetadataError.unreadable }
 }
 
 /// The same lookup the writer performs, as CONTRIBUTING requires of a skip
 /// guard. A guard that checked `/opt/homebrew/bin/exiftool` while the writer
 /// searched `PATH` would be green on CI and prove nothing.
+///
+/// **This line is #41's before/after evidence.** The test host is the real
+/// `Lightbox.app`, and a GUI-launched process gets
+/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — so until the lookup grew a
+/// login-shell rung and a prefix list, this skipped on a machine with exiftool
+/// installed, which is exactly what the shipped app did to every user. It runs
+/// on such a machine now, and still skips cleanly on CI, which has exiftool in
+/// none of the places the four rungs look.
 private let needsExiftool = ConditionTrait.enabled(
     if: MetadataWriter.availability.isAvailable,
-    "exiftool is not on PATH — the inspector's live write test is skipped")
+    "exiftool was not found — the inspector's live write test is skipped")
 
 // MARK: - Pure computations
 
@@ -1100,7 +1121,7 @@ struct InspectorLiveWriteTests {
         await model.open(root)
         await model.resolveMetadataAvailability()
         try #require(model.isMetadataEditingAvailable,
-                     "exiftool is on PATH but the window did not resolve it")
+                     "exiftool was located but the window did not resolve it")
         model.selectAll()
         #expect(model.selectedRecords.count == 3)
 

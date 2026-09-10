@@ -14,7 +14,7 @@ import ImageIO
 /// would produce a green run on CI that proves nothing at all.
 private let needsExiftool = ConditionTrait.enabled(
     if: MetadataWriter.availability.isAvailable,
-    "exiftool is not on PATH — MetadataWriter round-trip tests skipped")
+    "exiftool was not found — MetadataWriter round-trip tests skipped")
 
 // MARK: - Locating exiftool (no binary needed)
 
@@ -175,6 +175,253 @@ struct ExiftoolLocatorTests {
         }
         #expect(reason.contains("exiftool"))
     }
+}
+
+// MARK: - The four-rung lookup order (#41)
+
+/// A GUI-launched process gets `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so a
+/// `PATH`-only lookup answers `.notFound` on a machine that has exiftool and
+/// metadata editing is dead for every user who double-clicks the app. These
+/// cover the two rungs added for that — the login shell, then a named prefix
+/// list — and, as much as the seam allows, the fact that the *production* entry
+/// point really carries them.
+struct ExiftoolLookupOrderTests {
+    let tree: TempTree
+
+    init() throws { tree = try TempTree() }
+
+    /// A directory holding an executable `exiftool` that answers `-ver`.
+    private func fakeBinDirectory(named name: String) throws -> URL {
+        let directory = try tree.directory(name)
+        try script(at: directory.appendingPathComponent("exiftool"),
+                   "#!/bin/sh\necho 13.55\n")
+        return directory
+    }
+
+    private func script(at url: URL, _ body: String) throws {
+        try body.write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: url.path)
+    }
+
+    /// A `PATH` with nothing on it — a stand-in for launchd's
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`, which cannot be used literally here
+    /// because a machine is free to have exiftool in `/usr/bin`.
+    private func emptyPath() throws -> String { try tree.directory("empty-path").path }
+
+    // MARK: Rung 3 — the login shell
+
+    @Test func theLoginShellIsAskedWhenPATHMisses() throws {
+        let installed = try fakeBinDirectory(named: "brewish")
+            .appendingPathComponent("exiftool").path
+        let environment = ["PATH": try emptyPath()]
+
+        let found = ExiftoolLocator.locate(environment: environment,
+                                           shellProbe: { _ in installed })
+        #expect(found == installed)
+
+        let availability = ExiftoolLocator.check(environment: environment,
+                                                 shellProbe: { _ in installed })
+        #expect(availability == .available(path: installed, version: "13.55"))
+    }
+
+    /// Rung 4 is a list of places to look *after* the user's own configuration
+    /// has been asked, so it must not be reached while the shell is answering.
+    @Test func theShellsAnswerBeatsTheFallbackPrefixes() throws {
+        let fromShell = try fakeBinDirectory(named: "from-shell")
+            .appendingPathComponent("exiftool").path
+        let prefix = try fakeBinDirectory(named: "prefix")
+
+        let found = ExiftoolLocator.locate(environment: ["PATH": try emptyPath()],
+                                           shellProbe: { _ in fromShell },
+                                           prefixes: [prefix.path])
+        #expect(found == fromShell)
+    }
+
+    /// The whole point of the ordering: an override still wins outright, a
+    /// `PATH` hit is still the answer for a terminal-launched build, and in
+    /// that case **the shell is not forked at all** — this is on
+    /// `MetadataWriter.availability`'s synchronous path, and a fork nobody
+    /// needs is a parked cooperative thread nobody needs.
+    @Test func precedenceRunsOverrideThenPATHThenShellThenPrefixes() throws {
+        let onPath = try fakeBinDirectory(named: "onpath")
+        let override = try fakeBinDirectory(named: "override")
+            .appendingPathComponent("exiftool").path
+        let fromShell = try fakeBinDirectory(named: "shell")
+            .appendingPathComponent("exiftool").path
+        let prefix = try fakeBinDirectory(named: "prefixdir")
+
+        let forks = Counter()
+        let countingProbe: ExiftoolLocator.ShellProbe = { _ in
+            forks.increment()
+            return fromShell
+        }
+
+        #expect(ExiftoolLocator.locate(
+            environment: ["PATH": onPath.path,
+                          ExiftoolLocator.overrideEnvironmentKey: override],
+            shellProbe: countingProbe, prefixes: [prefix.path]) == override)
+        #expect(forks.value == 0, "an override must not fork a shell")
+
+        #expect(ExiftoolLocator.locate(
+            environment: ["PATH": onPath.path],
+            shellProbe: countingProbe,
+            prefixes: [prefix.path]) == onPath.appendingPathComponent("exiftool").path)
+        #expect(forks.value == 0, "a PATH hit must not fork a shell")
+
+        #expect(ExiftoolLocator.locate(
+            environment: ["PATH": try emptyPath()],
+            shellProbe: countingProbe, prefixes: [prefix.path]) == fromShell)
+        #expect(forks.value == 1)
+
+        #expect(ExiftoolLocator.locate(
+            environment: ["PATH": try emptyPath()],
+            shellProbe: { _ in nil },
+            prefixes: [prefix.path]) == prefix.appendingPathComponent("exiftool").path)
+    }
+
+    /// Nothing anywhere is `.notFound`, and the sentence has to name what was
+    /// searched: "not found on your PATH" sends a user who *has* exiftool
+    /// looking in the wrong place, which is exactly how #41 presented.
+    @Test func nothingAnywhereIsNotFoundAndTheSentenceNamesEveryRung() throws {
+        let availability = ExiftoolLocator.check(environment: ["PATH": try emptyPath()],
+                                                 shellProbe: { _ in nil },
+                                                 prefixes: [try tree.directory("nope").path])
+        #expect(availability == .notFound)
+
+        let sentence = try #require(availability.explanation)
+        #expect(sentence.contains("PATH"))
+        #expect(sentence.localizedCaseInsensitiveContains("login shell"))
+        for prefix in ExiftoolLocator.fallbackPrefixes {
+            #expect(sentence.contains(prefix), "the sentence does not name \(prefix)")
+        }
+    }
+
+    // MARK: Believing the shell
+
+    /// The probe runs the user's own startup files, so it is their privilege
+    /// and not an escalation — but its *output* is a string from an arbitrary
+    /// script, and Lightbox is about to `exec` it. A `~/.zprofile` that prints
+    /// a banner must not turn its first word into an exiftool.
+    @Test func hostileProbeOutputIsRejected() throws {
+        let real = try fakeBinDirectory(named: "real")
+            .appendingPathComponent("exiftool").path
+
+        // The first line only — trailing noise is ignored...
+        #expect(ExiftoolLocator.accept(probeOutput: "\(real)\n/bin/rm\n") == real)
+        #expect(ExiftoolLocator.accept(probeOutput: "\(real)\n") == real)
+        // ...and a banner ahead of the answer is not searched past.
+        #expect(ExiftoolLocator.accept(probeOutput: "Welcome!\n\(real)\n") == nil)
+
+        #expect(ExiftoolLocator.accept(probeOutput: "exiftool") == nil,      // relative
+                "a relative path must not be believed")
+        #expect(ExiftoolLocator.accept(probeOutput: "bin/exiftool") == nil)  // relative
+        #expect(ExiftoolLocator.accept(probeOutput: "/nonexistent/exiftool") == nil)
+        #expect(ExiftoolLocator.accept(probeOutput: "") == nil)
+        #expect(ExiftoolLocator.accept(probeOutput: "\n\(real)") == nil)
+
+        let plain = try tree.directory("plain-answer").appendingPathComponent("exiftool")
+        try "not executable".write(to: plain, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644],
+                                              ofItemAtPath: plain.path)
+        #expect(ExiftoolLocator.accept(probeOutput: plain.path) == nil)
+
+        // And the rejection is the locator's, not merely the helper's.
+        #expect(ExiftoolLocator.locate(environment: ["PATH": try emptyPath()],
+                                       shellProbe: { _ in "Welcome!\n\(real)\n" }) == nil)
+    }
+
+    // MARK: The real probe
+
+    /// The same hazard as `aVersionProbeThatNeverAnswersIsBoundedNotHung`, one
+    /// fork earlier: this runs on a cooperative-pool thread, so a shell that
+    /// never answers must be abandoned rather than waited on. A `~/.zprofile`
+    /// that reads from a tty is the realistic version of it.
+    @Test func aLoginShellThatNeverAnswersIsAbandonedAtTheTimeout() throws {
+        let shell = try tree.directory("hanging-shell").appendingPathComponent("sh")
+        try script(at: shell, "#!/bin/sh\nsleep 60\n")
+
+        let started = Date()
+        let answer = ExiftoolLocator.loginShellProbe(timeout: 0.75)(["SHELL": shell.path])
+        let elapsed = Date().timeIntervalSince(started)
+
+        #expect(answer == nil)
+        #expect(elapsed < 20, "the login-shell probe must be bounded; it took \(elapsed)s")
+    }
+
+    /// A shell that exits non-zero — which is what `command -v` does when it
+    /// finds nothing — is a miss, not a crash, and rung 4 follows it.
+    @Test func aShellThatFindsNothingIsAMiss() throws {
+        let shell = try tree.directory("empty-shell").appendingPathComponent("sh")
+        try script(at: shell, "#!/bin/sh\nexit 1\n")
+        #expect(ExiftoolLocator.loginShellProbe()(["SHELL": shell.path]) == nil)
+    }
+
+    /// `SHELL` is present in a Finder-launched process, so it is the first
+    /// source — but it is not believed on sight, and the passwd entry is the
+    /// fallback for a launch context that strips it.
+    @Test func theLoginShellIsSHELLThenPasswdAndNeitherIsBelievedOnSight() throws {
+        let shell = try tree.directory("a-shell").appendingPathComponent("sh")
+        try script(at: shell, "#!/bin/sh\nexit 0\n")
+        #expect(ExiftoolLocator.loginShellPath(environment: ["SHELL": shell.path]) == shell.path)
+
+        // Relative, missing, and not executable all fall through to passwd,
+        // which on any account this test can run under names a real shell.
+        let passwdShell = try #require(ExiftoolLocator.loginShellPath(environment: [:]))
+        #expect(passwdShell.hasPrefix("/"))
+        #expect(FileManager.default.isExecutableFile(atPath: passwdShell))
+        #expect(ExiftoolLocator.loginShellPath(environment: ["SHELL": "zsh"]) == passwdShell)
+        #expect(ExiftoolLocator.loginShellPath(
+            environment: ["SHELL": "/nonexistent/shell"]) == passwdShell)
+    }
+
+    // MARK: The production wiring
+
+    /// **The seam that can silently disable the whole fix.** `shellProbe:` and
+    /// `prefixes:` default to absent on the `environment:`-taking overload — they
+    /// have to, or `doesNotFallBackToAHardcodedHomebrewPrefix` would fork the
+    /// developer's shell and find their real exiftool. So every test above would
+    /// still pass with the production order wired to those defaults, and #41
+    /// would ship unfixed.
+    ///
+    /// `locate(systemEnvironment:)` is the production order with only its
+    /// environment injected; `locate()` is a one-line forward to it.
+    @Test func theProductionOrderCarriesTheRealShellProbe() throws {
+        let installed = try fakeBinDirectory(named: "installed")
+            .appendingPathComponent("exiftool").path
+        let shell = try tree.directory("answering-shell").appendingPathComponent("sh")
+        try script(at: shell, "#!/bin/sh\necho '\(installed)'\n")
+
+        let environment = ["PATH": try emptyPath(), "SHELL": shell.path]
+        #expect(ExiftoolLocator.locate(systemEnvironment: environment) == installed)
+        #expect(ExiftoolLocator.check(systemEnvironment: environment)
+                == .available(path: installed, version: "13.55"))
+    }
+
+    /// And the same for rung 4. Vacuous on CI, which has exiftool in none of
+    /// the three prefixes and would answer nil either way; on any developer
+    /// machine with a Homebrew or MacPorts exiftool it is the real check.
+    @Test func theProductionOrderCarriesTheFallbackPrefixes() throws {
+        let silent = try tree.directory("silent-shell").appendingPathComponent("sh")
+        try script(at: silent, "#!/bin/sh\nexit 1\n")
+
+        let expected = ExiftoolLocator.fallbackPrefixes
+            .map { URL(fileURLWithPath: $0).appendingPathComponent("exiftool").path }
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+
+        #expect(ExiftoolLocator.locate(
+            systemEnvironment: ["PATH": try emptyPath(), "SHELL": silent.path]) == expected)
+    }
+}
+
+/// A fork counter for the precedence test. `nonisolated(unsafe)` would do —
+/// nothing here is concurrent — but a lock costs nothing and does not have to
+/// be re-reasoned about if a later test hands the probe to two threads.
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.withLock { count += 1 } }
+    var value: Int { lock.withLock { count } }
 }
 
 // MARK: - What the API refuses (no binary needed)

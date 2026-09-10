@@ -79,7 +79,7 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 622 tests. No AppKit/SwiftUI.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 632 tests. No AppKit/SwiftUI.
 App/      Lightbox.xcodeproj — SwiftUI shell over Core; 161 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
@@ -94,8 +94,14 @@ cd Core && LIGHTBOX_POOL_LIMITS=1 swift test --filter BlockingWorkFanOut  # queu
 
 Toolchain: Xcode 26.x, Swift ≥ 6.2 (`swift-tools-version: 6.2`, `.macOS(.v26)`). Sole
 dependency GRDB.swift 7.11.1, pinned in both `Core/Package.resolved` and the xcodeproj's
-`Package.resolved` — bump both together. exiftool is resolved via `PATH`, never a
-hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on Intel).
+`Package.resolved` — bump both together. exiftool is resolved in **four rungs**
+(`ExiftoolLocator`, #41): `LIGHTBOX_EXIFTOOL`, then `PATH`, then the user's login shell
+(`<$SHELL> -l -c 'command -v exiftool'`), then the named list `/opt/homebrew/bin`,
+`/usr/local/bin`, `/opt/local/bin`. Rungs 3 and 4 exist because a **GUI-launched process
+gets `PATH=/usr/bin:/bin:/usr/sbin:/sbin`** and never sees Homebrew's prefix, so a
+`PATH`-only lookup made metadata editing dead for every user who double-clicked the app.
+No prefix is *the* answer — the list is consulted only after the user's own `PATH` and
+login shell have both been asked, and it is never hardcoded anywhere else.
 
 ### Gotchas that cost a debug session
 
@@ -247,6 +253,13 @@ hardcoded prefix (it's `/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on
   the batch — as it refuses `in_flight` and `failed`. Only `skipped` is harmless enough to
   ignore. A permanent delete is refused **before** it runs, which is the only moment the
   answer is any use, and undo trashes a copy rather than unlinking it (spec §8 amended).
+- **A JPEG with no TIFF IFD reads back as though the write never happened.** ImageIO
+  reports *no* `kCGImagePropertyTIFFDictionary` at all for a JPEG saved with no
+  properties, even after exiftool has put an `IFD0:Artist` in it that `exiftool -a -G1`
+  shows plainly — so a read-back through `{TIFF}` sees nil for a perfectly good write.
+  Every real photo has a Make and Model; both fixture writers (`Fixtures.writeImage` in
+  Core, `writeJPEG` in the App suite) seed those two for exactly this reason. A metadata
+  fixture written with `CGImageDestinationAddImage(dest, image, nil)` is not a photo.
 - **Swift 6.3.3 times out on dense bit-twiddling one-liners** that 6.3.2 accepted. Split
   into named steps; don't fight the type checker.
 - **`width>=1920` costs 474 ms at 50k.** That is row materialisation, not a missing index.

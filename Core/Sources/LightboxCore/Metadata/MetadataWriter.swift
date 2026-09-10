@@ -92,23 +92,30 @@ public actor MetadataWriter {
     /// `init(availability:hasher:)` and the condition of every
     /// `@Suite(.enabled(if:))` exiftool guard, neither of which can `await`.
     /// What makes that tolerable is that it forks essentially once per process
-    /// — every later read is a lock and a cached value — and that the fork is
-    /// `ExiftoolLocator.check`, bounded by `versionProbeTimeout` (ten seconds)
-    /// rather than by `ExiftoolRunner.commandTimeout` (two minutes). A fork per
-    /// *write*, which is what the actor's executor covers, is the shape that
-    /// starves a pool; this is not.
+    /// — every later read is a lock and a cached value — and that the forks are
+    /// `ExiftoolLocator.check`'s, bounded by `loginShellProbeTimeout` (five
+    /// seconds) and `versionProbeTimeout` (ten) rather than by
+    /// `ExiftoolRunner.commandTimeout` (two minutes). A fork per *write*, which
+    /// is what the actor's executor covers, is the shape that starves a pool;
+    /// this is not.
+    ///
+    /// **Two forks since #41, worst case fifteen seconds.** The login-shell
+    /// rung runs only when `PATH` misses — so a terminal-launched build and CI
+    /// pay one fork, and the GUI launch that #41 is about pays two. Both bounds
+    /// are on `ExiftoolLocator`; `BlockingWork.queue`'s table carries the same
+    /// number for the `recheckAvailability` row.
     ///
     /// Stated precisely, because "once" is not the whole story: **the first
-    /// read blocks its own thread for up to ten seconds**, and any thread that
-    /// races it into a cold cache forks a probe of its own rather than queueing
-    /// behind the first — `AvailabilityCache.value` deliberately probes outside
-    /// its lock, because parking every concurrent first reader on one lock for
-    /// ten seconds would empty a three-core pool by itself. So the cost is
-    /// bounded per thread rather than serialised across them, and it is paid
+    /// read blocks its own thread for up to fifteen seconds**, and any thread
+    /// that races it into a cold cache forks a probe of its own rather than
+    /// queueing behind the first — `AvailabilityCache.value` deliberately probes
+    /// outside its lock, because parking every concurrent first reader on one
+    /// lock for that long would empty a three-core pool by itself. So the cost
+    /// is bounded per thread rather than serialised across them, and it is paid
     /// once. This is the same shape as the `swift_once`-backed `static let` it
     /// replaced, so it is not a regression — but it is a cooperative thread
-    /// parked for up to ten seconds, and anything that starts calling this from
-    /// a hot path should hop it or hoist it.
+    /// parked for up to fifteen seconds, and anything that starts calling this
+    /// from a hot path should hop it or hoist it.
     ///
     /// The refreshable path — pressed repeatedly by a user who is installing
     /// exiftool while the window is open — is `recheckAvailability()`, and that
@@ -120,14 +127,19 @@ public actor MetadataWriter {
     /// A cached `static let` and an explanation reading "reopen the window" do
     /// not go together: reopening a window re-reads the cache, not `PATH`, so
     /// a user who installs exiftool and follows the instruction sees the same
-    /// message and concludes the app is broken. Rather than weaken the sentence
+    /// message and concludes the app is broken. (The message names every rung
+    /// searched, not just `PATH` — `ExiftoolAvailability.explanation`.) Rather than weaken the sentence
     /// to "restart Lightbox", the cache is refreshable, so the inspector can
     /// offer a *Try Again* that actually tries again.
     ///
-    /// **`async`, and still `static`, since #30.** `async` because it forks
-    /// `exiftool -ver` and blocks in a pipe read until the probe answers or
-    /// times out, and that must happen off the cooperative pool like every
-    /// other fork in this file. `static` rather than moved onto the actor for
+    /// **`async`, and still `static`, since #30.** `async` because it forks —
+    /// a login shell, then `exiftool -ver` (#41) — and blocks in a pipe read
+    /// until each probe answers or times out, and that must happen off the
+    /// cooperative pool like every other fork in this file. Which is also why
+    /// re-running the *whole* four-rung order here is cheap enough to do on a
+    /// button: a user who has just installed exiftool into a shell-configured
+    /// prefix gets it found without restarting the app.
+    /// `static` rather than moved onto the actor for
     /// two reasons: the answer it caches is process-wide, not per-writer — so
     /// an instance method would imply an ownership that does not exist, and
     /// would make the inspector construct a `MetadataWriter` purely to ask a
