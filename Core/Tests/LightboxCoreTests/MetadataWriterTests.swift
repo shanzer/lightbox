@@ -412,6 +412,280 @@ struct ExiftoolLookupOrderTests {
         #expect(ExiftoolLocator.locate(
             systemEnvironment: ["PATH": try emptyPath(), "SHELL": silent.path]) == expected)
     }
+
+    // MARK: Rung 1.5 — the stored path (#51)
+
+    /// The whole reason the rung exists: an install none of #41's four rungs
+    /// can see. `PATH` is empty, no shell answers, no prefix holds it — and the
+    /// user has pointed Lightbox at it by hand.
+    @Test func aStoredPathIsUsedWhenEveryOtherRungMisses() throws {
+        let elsewhere = try fakeBinDirectory(named: "elsewhere")
+            .appendingPathComponent("exiftool").path
+
+        let found = ExiftoolLocator.locate(environment: ["PATH": try emptyPath()],
+                                           shellProbe: { _ in nil },
+                                           prefixes: [],
+                                           storedPath: elsewhere)
+        #expect(found == elsewhere)
+
+        #expect(ExiftoolLocator.check(environment: ["PATH": try emptyPath()],
+                                      shellProbe: { _ in nil },
+                                      prefixes: [],
+                                      storedPath: elsewhere)
+                == .available(path: elsewhere, version: "13.55"))
+    }
+
+    /// Decision 1 of #51, one half: a stored path beats `PATH`.
+    ///
+    /// The user said this one, explicitly, in a file picker. A later
+    /// `brew install exiftool` must not quietly retire that — a different
+    /// exiftool writes different tags, so the substitution is not cosmetic.
+    /// **And the `PATH` rung must not even be walked**: the assertion is on the
+    /// answer, not on a fork count, because `PATH` costs no fork — so the test
+    /// puts a *working* exiftool on `PATH` and proves it was not the one chosen.
+    @Test func aStoredPathBeatsPATHAndTheShellAndThePrefixes() throws {
+        let onPath = try fakeBinDirectory(named: "onpath")
+        let stored = try fakeBinDirectory(named: "stored")
+            .appendingPathComponent("exiftool").path
+        let fromShell = try fakeBinDirectory(named: "shellish")
+            .appendingPathComponent("exiftool").path
+        let prefix = try fakeBinDirectory(named: "prefixish")
+
+        let forks = Counter()
+        let countingProbe: ExiftoolLocator.ShellProbe = { _ in
+            forks.increment()
+            return fromShell
+        }
+
+        let found = ExiftoolLocator.locate(environment: ["PATH": onPath.path],
+                                           shellProbe: countingProbe,
+                                           prefixes: [prefix.path],
+                                           storedPath: stored)
+        #expect(found == stored)
+        #expect(found != onPath.appendingPathComponent("exiftool").path)
+        #expect(forks.value == 0, "a stored path must not fork a shell")
+    }
+
+    /// Decision 1 of #51, the other half: `LIGHTBOX_EXIFTOOL` still wins
+    /// outright. #41 made that rung the override of last resort and #51 does
+    /// not demote it — a stored preference is a user's standing choice, an
+    /// environment variable is this launch's instruction.
+    @Test func theEnvironmentOverrideStillBeatsAStoredPath() throws {
+        let override = try fakeBinDirectory(named: "ovr")
+            .appendingPathComponent("exiftool").path
+        let stored = try fakeBinDirectory(named: "std")
+            .appendingPathComponent("exiftool").path
+
+        #expect(ExiftoolLocator.locate(
+            environment: [ExiftoolLocator.overrideEnvironmentKey: override],
+            storedPath: stored) == override)
+    }
+
+    /// Decision 3 of #51: no stored path leaves #41's order exactly as it was.
+    ///
+    /// Asserted rather than assumed, and asserted at every rung — this is the
+    /// test that fails if rung 1.5 is wired in a way that perturbs the others.
+    @Test func noStoredPathLeavesTheFourRungOrderUnchanged() throws {
+        let onPath = try fakeBinDirectory(named: "p")
+        let fromShell = try fakeBinDirectory(named: "s")
+            .appendingPathComponent("exiftool").path
+        let prefix = try fakeBinDirectory(named: "x")
+
+        for stored in [String?.none, ""] {
+            #expect(ExiftoolLocator.locate(environment: ["PATH": onPath.path],
+                                           shellProbe: { _ in fromShell },
+                                           prefixes: [prefix.path],
+                                           storedPath: stored)
+                    == onPath.appendingPathComponent("exiftool").path)
+
+            #expect(ExiftoolLocator.locate(environment: ["PATH": try emptyPath()],
+                                           shellProbe: { _ in fromShell },
+                                           prefixes: [prefix.path],
+                                           storedPath: stored) == fromShell)
+
+            #expect(ExiftoolLocator.locate(environment: ["PATH": try emptyPath()],
+                                           shellProbe: { _ in nil },
+                                           prefixes: [prefix.path],
+                                           storedPath: stored)
+                    == prefix.appendingPathComponent("exiftool").path)
+        }
+    }
+
+    /// Decision 2 of #51, and the sharp edge of the whole feature.
+    ///
+    /// A stored path that has stopped working **refuses**. It does not fall
+    /// through to `PATH`, the shell, or the prefixes — even though all three
+    /// would answer here. Silently running a *different* binary than the one
+    /// the user named is the surprise worth avoiding, and it is the same shape
+    /// as rung 1: a set-but-unusable `LIGHTBOX_EXIFTOOL` returns nil rather
+    /// than continuing.
+    @Test func aStoredPathThatStoppedWorkingRefusesRatherThanFallingThrough() throws {
+        let onPath = try fakeBinDirectory(named: "still-there")
+        let gone = try tree.directory("deleted").appendingPathComponent("exiftool").path
+
+        #expect(ExiftoolLocator.locate(environment: ["PATH": onPath.path],
+                                       shellProbe: { _ in
+                                           Issue.record("the shell must not be asked")
+                                           return nil
+                                       },
+                                       prefixes: [onPath.path],
+                                       storedPath: gone) == nil)
+
+        let availability = ExiftoolLocator.check(environment: ["PATH": onPath.path],
+                                                 shellProbe: { _ in nil },
+                                                 prefixes: [onPath.path],
+                                                 storedPath: gone)
+        guard case .storedPathUnusable(let path, _) = availability else {
+            Issue.record("expected .storedPathUnusable, got \(availability)")
+            return
+        }
+        #expect(path == gone)
+    }
+
+    /// The refusal has to *say which path*, because the remedy is different
+    /// from every other one. #41's `.notFound` sentence reads "looked on your
+    /// PATH, asked your login shell, and looked in …" — perfect advice for a
+    /// missing install and actively misleading when the real cause is a stored
+    /// path pointing at an unmounted volume.
+    @Test func theStoredPathRefusalNamesThePathAndOffersTheDefault() throws {
+        let gone = "/Volumes/NotMounted/bin/exiftool"
+        let availability = ExiftoolLocator.check(environment: ["PATH": try emptyPath()],
+                                                 shellProbe: { _ in nil },
+                                                 storedPath: gone)
+
+        let sentence = try #require(availability.explanation)
+        #expect(sentence.contains(gone), "the sentence does not name the stored path")
+        #expect(!sentence.contains("brew install"),
+                "install advice is wrong here — the install is fine, the path is not")
+        // The way out has to be in the sentence, or the user is stuck with a
+        // preference they cannot see and did not know was in force.
+        #expect(sentence.localizedCaseInsensitiveContains("default"))
+    }
+
+    /// A stored path is not exempt from the version floor or the `-ver` probe,
+    /// and both failures must still name it as *stored* — otherwise the
+    /// inspector offers "brew upgrade" for a binary Homebrew never installed.
+    @Test func aStoredPathThatIsTooOldOrSilentIsAlsoAStoredPathFailure() throws {
+        let old = try tree.directory("old-stored").appendingPathComponent("exiftool")
+        try script(at: old, "#!/bin/sh\necho 12.99\n")
+        let tooOld = ExiftoolLocator.check(environment: [:], storedPath: old.path)
+        guard case .storedPathUnusable(let oldPath, let oldReason) = tooOld else {
+            Issue.record("expected .storedPathUnusable, got \(tooOld)")
+            return
+        }
+        #expect(oldPath == old.path)
+        #expect(oldReason.contains("12.99"))
+        #expect(oldReason.contains(ExiftoolLocator.minimumVersion))
+
+        let silent = try tree.directory("silent-stored").appendingPathComponent("exiftool")
+        try script(at: silent, "#!/bin/sh\nexit 3\n")
+        let unusable = ExiftoolLocator.check(environment: [:], storedPath: silent.path)
+        guard case .storedPathUnusable(let silentPath, _) = unusable else {
+            Issue.record("expected .storedPathUnusable, got \(unusable)")
+            return
+        }
+        #expect(silentPath == silent.path)
+    }
+
+    // MARK: Validating a chosen file (#51, decision 4)
+
+    /// `Choose…` refuses a binary that is not exiftool rather than storing it.
+    /// Storing a known-bad path creates a persistent broken state that takes a
+    /// second trip through the picker to undo.
+    @Test func validateRefusesABinaryThatIsNotExiftool() throws {
+        // `/bin/echo` is executable, runs, and prints something that is not a
+        // version — the realistic misclick, and the one the issue names.
+        let echoed = ExiftoolLocator.validate("/bin/echo")
+        #expect(!echoed.isAvailable)
+
+        let missing = ExiftoolLocator.validate(
+            try tree.directory("nothing-here").appendingPathComponent("exiftool").path)
+        #expect(!missing.isAvailable)
+
+        let directory = try tree.directory("a-directory")
+        #expect(!ExiftoolLocator.validate(directory.path).isAvailable)
+
+        let plain = directory.appendingPathComponent("not-executable")
+        try "text".write(to: plain, atomically: true, encoding: .utf8)
+        #expect(!ExiftoolLocator.validate(plain.path).isAvailable)
+    }
+
+    @Test func validateRefusesAnExiftoolBelowTheMinimumAndAcceptsOneAbove() throws {
+        let old = try tree.directory("v12").appendingPathComponent("exiftool")
+        try script(at: old, "#!/bin/sh\necho 12.99\n")
+        #expect(ExiftoolLocator.validate(old.path)
+                == .tooOld(path: old.path, version: "12.99",
+                           minimum: ExiftoolLocator.minimumVersion))
+
+        let good = try fakeBinDirectory(named: "v13").appendingPathComponent("exiftool").path
+        #expect(ExiftoolLocator.validate(good) == .available(path: good, version: "13.55"))
+    }
+
+    /// **Found by the live check, not by the suite above.**
+    ///
+    /// `/bin/echo -ver` exits 0 and prints `-ver`, and a probe that believes
+    /// any non-empty stdout took that for a version number: the answer came
+    /// back `.tooOld(version: "-ver")`, so `Choose…` refused it — for the
+    /// wrong reason, in a sentence reading "is exiftool -ver; Lightbox needs
+    /// 13.0 or newer". `validateRefusesABinaryThatIsNotExiftool` passed
+    /// throughout, because it only asked whether the answer was unavailable.
+    ///
+    /// A version has to *look* like one before it is compared to the floor.
+    /// The distinction is not cosmetic: `.tooOld` tells the user to upgrade
+    /// exiftool, which is useless advice about a file that is not exiftool.
+    @Test func anExecutableThatPrintsSomethingOtherThanAVersionIsUnusableNotTooOld() throws {
+        let answer = ExiftoolLocator.validate("/bin/echo")
+        guard case .unusable(let path, let reason) = answer else {
+            Issue.record("expected .unusable for /bin/echo, got \(answer)")
+            return
+        }
+        #expect(path == "/bin/echo")
+        // What the sentence has to do: say it is not exiftool, and quote what
+        // it printed instead, so the user can see they picked the wrong file.
+        #expect(reason.localizedCaseInsensitiveContains("does not look like exiftool"))
+        #expect(reason.contains("-ver"), "the sentence does not quote what was printed")
+
+        // A version is digits and dots, and the floor comparison only runs
+        // once that is established.
+        #expect(ExiftoolLocator.looksLikeAVersion("13.55"))
+        #expect(ExiftoolLocator.looksLikeAVersion("13"))
+        #expect(ExiftoolLocator.looksLikeAVersion("13.55.1"))
+        #expect(!ExiftoolLocator.looksLikeAVersion("-ver"))
+        #expect(!ExiftoolLocator.looksLikeAVersion("v13.55"))
+        #expect(!ExiftoolLocator.looksLikeAVersion("usage: echo [-n] [string ...]"))
+        #expect(!ExiftoolLocator.looksLikeAVersion(""))
+        #expect(!ExiftoolLocator.looksLikeAVersion("13.55 and a comment"))
+    }
+
+    /// The rejected output is quoted back to the user, so it must be bounded
+    /// and printable: it is stdout from an arbitrary executable the user just
+    /// picked, and a megabyte of binary in a SwiftUI `Text` is a hung window.
+    @Test func aRejectedVersionIsQuotedBackBoundedAndPrintable() throws {
+        let shouty = try tree.directory("shouty").appendingPathComponent("exiftool")
+        try script(at: shouty, "#!/bin/sh\nhead -c 4000 /dev/zero | tr '\\0' 'A'\n")
+
+        let answer = ExiftoolLocator.validate(shouty.path)
+        guard case .unusable(_, let reason) = answer else {
+            Issue.record("expected .unusable, got \(answer)")
+            return
+        }
+        #expect(reason.count < 200, "the reason quotes unbounded output: \(reason.count) chars")
+    }
+
+    /// `validate` answers about **the file it was handed** and nothing else.
+    /// A version of this that fell back to the rungs would accept a misclick
+    /// and then quietly use the Homebrew exiftool, so the user's stored path
+    /// would be a lie — and on CI, where `/opt/homebrew` is empty, the test
+    /// that caught it would pass for the wrong reason.
+    @Test func validateNeverFallsBackToAnyRung() throws {
+        let onPath = try fakeBinDirectory(named: "decoy")
+        let decoy = onPath.appendingPathComponent("exiftool").path
+        let chosen = try tree.directory("chosen").appendingPathComponent("exiftool").path
+
+        let answer = ExiftoolLocator.validate(chosen)
+        #expect(!answer.isAvailable)
+        #expect(answer.executablePath != decoy)
+    }
 }
 
 /// A fork counter for the precedence test. `nonisolated(unsafe)` would do —

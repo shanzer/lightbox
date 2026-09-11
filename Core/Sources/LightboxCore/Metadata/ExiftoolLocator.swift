@@ -16,6 +16,22 @@ public enum ExiftoolAvailability: Sendable, Equatable {
     /// that wants an interactive terminal all land here, and calling any of
     /// them "not found" sends the user looking in the wrong place.
     case unusable(path: String, reason: String)
+    /// The **stored path** (#51's rung 1.5) is set and cannot be used — it is
+    /// not there, is not executable, did not answer `-ver`, or is below
+    /// `ExiftoolLocator.minimumVersion`.
+    ///
+    /// Kept distinct from `.unusable` and `.tooOld` for the same reason those
+    /// two are distinct from `.notFound`: the remedy is different, and only
+    /// this one has a remedy that costs a single click. Every other case is
+    /// answered by installing or upgrading exiftool; this one is answered by
+    /// choosing a different file or dropping back to the default lookup, and
+    /// `explanation` says so. Collapsing it into `.unusable` would offer
+    /// "reinstall it" for a binary Homebrew never installed, which is #41's
+    /// mistake — a true sentence pointing at the wrong thing — in a new place.
+    ///
+    /// `reason` carries which of the four it was, because "it did not work" is
+    /// not enough to act on.
+    case storedPathUnusable(path: String, reason: String)
 
     public var isAvailable: Bool {
         if case .available = self { return true }
@@ -27,6 +43,7 @@ public enum ExiftoolAvailability: Sendable, Equatable {
         case .available(let path, _): path
         case .tooOld(let path, _, _): path
         case .unusable(let path, _): path
+        case .storedPathUnusable(let path, _): path
         case .notFound: nil
         }
     }
@@ -55,6 +72,16 @@ public enum ExiftoolAvailability: Sendable, Equatable {
             Metadata editing needs exiftool. \(path) was found but did not \
             run: \(reason). Reinstall it (`brew reinstall exiftool`), then try \
             again. Browsing and search do not need it.
+            """
+        case .storedPathUnusable(let path, let reason):
+            // Names the path, because the user chose it and has no other way
+            // to see what is in force; names the way out, because a stored
+            // preference the user cannot find is worse than no preference.
+            // Deliberately no `brew` advice: the install is not the problem.
+            """
+            Lightbox is set to use exiftool at \(path), but \(reason). Choose \
+            a different exiftool, or use the default lookup instead. Browsing \
+            and search do not need it.
             """
         }
     }
@@ -127,16 +154,22 @@ public enum ExiftoolLocator {
     /// production resolution order with its environment injectable, so a test
     /// can prove this path really carries the shell probe and the prefixes
     /// rather than silently degrading to rungs 1 and 2.
-    public static func locate() -> String? {
-        locate(systemEnvironment: ProcessInfo.processInfo.environment)
+    /// - Parameter storedPath: rung 1.5 (#51), the path the user chose in the
+    ///   inspector. Nil — the default — is #41's four-rung order exactly.
+    ///   Core does not read preferences; this arrives from App.
+    public static func locate(storedPath: String? = nil) -> String? {
+        locate(systemEnvironment: ProcessInfo.processInfo.environment,
+               storedPath: storedPath)
     }
 
     /// Locates exiftool and asks it for its version.
     public static func check(
-        probeTimeout: TimeInterval = ExiftoolLocator.versionProbeTimeout
+        probeTimeout: TimeInterval = ExiftoolLocator.versionProbeTimeout,
+        storedPath: String? = nil
     ) -> ExiftoolAvailability {
         check(systemEnvironment: ProcessInfo.processInfo.environment,
-              probeTimeout: probeTimeout)
+              probeTimeout: probeTimeout,
+              storedPath: storedPath)
     }
 
     /// The production order — all four rungs, the real login shell — with only
@@ -149,21 +182,25 @@ public enum ExiftoolLocator {
     /// green (HANDOFF §6: a test that passes without exercising the code is
     /// worse than none).
     static func locate(systemEnvironment environment: [String: String],
-                       shellProbeTimeout: TimeInterval = loginShellProbeTimeout) -> String? {
+                       shellProbeTimeout: TimeInterval = loginShellProbeTimeout,
+                       storedPath: String? = nil) -> String? {
         locate(environment: environment,
                shellProbe: loginShellProbe(timeout: shellProbeTimeout),
-               prefixes: fallbackPrefixes)
+               prefixes: fallbackPrefixes,
+               storedPath: storedPath)
     }
 
     /// `check`'s half of the same seam.
     static func check(systemEnvironment environment: [String: String],
                       probeTimeout: TimeInterval = ExiftoolLocator.versionProbeTimeout,
-                      shellProbeTimeout: TimeInterval = loginShellProbeTimeout)
+                      shellProbeTimeout: TimeInterval = loginShellProbeTimeout,
+                      storedPath: String? = nil)
     -> ExiftoolAvailability {
         check(environment: environment,
               probeTimeout: probeTimeout,
               shellProbe: loginShellProbe(timeout: shellProbeTimeout),
-              prefixes: fallbackPrefixes)
+              prefixes: fallbackPrefixes,
+              storedPath: storedPath)
     }
 
     // MARK: - The resolution order
@@ -183,27 +220,82 @@ public enum ExiftoolLocator {
     ///     hardcoded-prefix test would otherwise find `/opt/homebrew/bin`.
     public static func locate(environment: [String: String],
                               shellProbe: ShellProbe? = nil,
-                              prefixes: [String] = []) -> String? {
-        if let override = environment[overrideEnvironmentKey], !override.isEmpty {
-            return isExecutable(override) ? override : nil
+                              prefixes: [String] = [],
+                              storedPath: String? = nil) -> String? {
+        switch resolve(environment: environment, shellProbe: shellProbe,
+                       prefixes: prefixes, storedPath: storedPath) {
+        case .found(let path, _): return path
+        case .storedPathBroken, .nothing: return nil
         }
+    }
+
+    /// What the rungs came back with, before anything has been forked at it.
+    ///
+    /// `locate` collapses this to `String?` and `check` needs all three cases,
+    /// which is the whole reason it exists: a nil from `locate` means "nothing
+    /// to run" and says nothing about *why*, and #51's stored-path refusal has
+    /// to say why. `fromStoredPreference` travels with a hit for the same
+    /// reason — a `-ver` failure on the user's chosen binary needs different
+    /// advice from one on something found on `PATH`.
+    enum Resolution: Equatable {
+        case found(path: String, fromStoredPreference: Bool)
+        /// Set, and not an executable file. The only stored-path failure that
+        /// can be known without forking; the rest surface in `check`.
+        case storedPathBroken(path: String)
+        case nothing
+    }
+
+    /// The rungs, in order, forking nothing.
+    static func resolve(environment: [String: String],
+                        shellProbe: ShellProbe? = nil,
+                        prefixes: [String] = [],
+                        storedPath: String? = nil) -> Resolution {
+        // Rung 1. An environment variable is this launch's instruction and
+        // still outranks the stored preference, which is a standing choice.
+        if let override = environment[overrideEnvironmentKey], !override.isEmpty {
+            return isExecutable(override) ? .found(path: override,
+                                                   fromStoredPreference: false)
+                                          : .nothing
+        }
+        // Rung 1.5 (#51). **Terminal either way** — a stored path that has
+        // stopped working refuses rather than falling through, exactly as rung
+        // 1 does. Running a different binary than the one the user named is
+        // the surprise this whole rung exists to avoid, and the empty string
+        // is "not set" so a cleared preference cannot strand the app.
+        if let storedPath, !storedPath.isEmpty {
+            return isExecutable(storedPath) ? .found(path: storedPath,
+                                                     fromStoredPreference: true)
+                                            : .storedPathBroken(path: storedPath)
+        }
+        return locateWithoutPreference(environment: environment,
+                                       shellProbe: shellProbe, prefixes: prefixes)
+    }
+
+    /// Rungs 2, 3 and 4 — #41's order, untouched.
+    private static func locateWithoutPreference(environment: [String: String],
+                                                shellProbe: ShellProbe?,
+                                                prefixes: [String]) -> Resolution {
         if let path = environment["PATH"] {
             for directory in path.split(separator: ":", omittingEmptySubsequences: true) {
                 let candidate = URL(fileURLWithPath: String(directory))
                     .appendingPathComponent("exiftool").path
-                if isExecutable(candidate) { return candidate }
+                if isExecutable(candidate) {
+                    return .found(path: candidate, fromStoredPreference: false)
+                }
             }
         }
         if let shellProbe, let answer = shellProbe(environment),
            let believable = accept(probeOutput: answer) {
-            return believable
+            return .found(path: believable, fromStoredPreference: false)
         }
         for prefix in prefixes {
             let candidate = URL(fileURLWithPath: prefix)
                 .appendingPathComponent("exiftool").path
-            if isExecutable(candidate) { return candidate }
+            if isExecutable(candidate) {
+                return .found(path: candidate, fromStoredPreference: false)
+            }
         }
-        return nil
+        return .nothing
     }
 
     /// Locates exiftool and asks it for its version.
@@ -213,20 +305,87 @@ public enum ExiftoolLocator {
         environment: [String: String],
         probeTimeout: TimeInterval = ExiftoolLocator.versionProbeTimeout,
         shellProbe: ShellProbe? = nil,
-        prefixes: [String] = []
+        prefixes: [String] = [],
+        storedPath: String? = nil
     ) -> ExiftoolAvailability {
-        guard let path = locate(environment: environment,
-                                shellProbe: shellProbe,
-                                prefixes: prefixes) else { return .notFound }
+        switch resolve(environment: environment, shellProbe: shellProbe,
+                       prefixes: prefixes, storedPath: storedPath) {
+        case .nothing:
+            return .notFound
+        case .storedPathBroken(let path):
+            return .storedPathUnusable(
+                path: path,
+                reason: "it is not there, or is not an executable file")
+        case .found(let path, let fromStoredPreference):
+            return interrogate(path, stored: fromStoredPreference,
+                               timeout: probeTimeout)
+        }
+    }
+
+    /// Ask a located binary what it is, and phrase the failures for whoever
+    /// chose it. The stored-path cases are the same three failures with a
+    /// remedy the user can act on, so they do not borrow `brew` advice.
+    private static func interrogate(_ path: String, stored: Bool,
+                                    timeout: TimeInterval) -> ExiftoolAvailability {
         let version: String
-        switch versionProbe(of: path, timeout: probeTimeout) {
-        case .ok(let reported): version = reported
-        case .failed(let reason): return .unusable(path: path, reason: reason)
+        switch versionProbe(of: path, timeout: timeout) {
+        case .ok(let reported):
+            // **A version has to look like one before it is compared to the
+            // floor.** `/bin/echo -ver` exits 0 and prints `-ver`; believing
+            // any non-empty stdout turned that into `.tooOld(version: "-ver")`
+            // and told the user to upgrade a program that is not exiftool.
+            // Found by #51's live check — the unit test only asked whether the
+            // answer was unavailable, which it was, for the wrong reason.
+            guard looksLikeAVersion(reported) else {
+                let reason = "it does not look like exiftool — `-ver` printed "
+                    + "\(quotedForDisplay(reported))"
+                return stored ? .storedPathUnusable(path: path, reason: reason)
+                              : .unusable(path: path, reason: reason)
+            }
+            version = reported
+        case .failed(let reason):
+            return stored ? .storedPathUnusable(path: path, reason: reason)
+                          : .unusable(path: path, reason: reason)
         }
         guard isAtLeastMinimum(version) else {
-            return .tooOld(path: path, version: version, minimum: minimumVersion)
+            return stored
+                ? .storedPathUnusable(
+                    path: path,
+                    reason: "it reports version \(version) and Lightbox needs "
+                          + "\(minimumVersion) or newer")
+                : .tooOld(path: path, version: version, minimum: minimumVersion)
         }
         return .available(path: path, version: version)
+    }
+
+    // MARK: - Validating a file the user chose (#51)
+
+    /// Is *this exact file* a usable exiftool?
+    ///
+    /// The gate behind the inspector's *Choose…*: storing a path that does not
+    /// work creates a state the user has to make a second trip through the
+    /// picker to escape, and #51 decided the picker refuses instead.
+    ///
+    /// **It consults no rung at all.** A version of this that fell back would
+    /// accept a misclick and then quietly run the Homebrew exiftool, leaving
+    /// the stored path a lie — and the test that caught it would pass on CI,
+    /// where the fallbacks are empty, for entirely the wrong reason.
+    ///
+    /// Also the security gate: the argument becomes `Process.executableURL`,
+    /// so it is required to be an existing, regular, executable file that
+    /// answers `-ver` plausibly before anything is remembered about it.
+    ///
+    /// Returns `.available`, `.tooOld` or `.unusable` — never
+    /// `.storedPathUnusable`, because at this point nothing is stored yet.
+    public static func validate(
+        _ path: String,
+        probeTimeout: TimeInterval = ExiftoolLocator.versionProbeTimeout
+    ) -> ExiftoolAvailability {
+        guard isExecutable(path) else {
+            return .unusable(path: path,
+                             reason: "it is not an executable file")
+        }
+        return interrogate(path, stored: false, timeout: probeTimeout)
     }
 
     // MARK: - Rung 3: the login shell
@@ -441,6 +600,39 @@ public enum ExiftoolLocator {
             if a != b { return a < b ? -1 : 1 }
         }
         return 0
+    }
+
+    /// Digits, and dots between them. Nothing else.
+    ///
+    /// Deliberately stricter than `numericComponents` can cope with: that
+    /// function maps anything unparseable to `0`, which silently turns a
+    /// program's usage message into version zero and then into "too old". The
+    /// floor comparison is only meaningful once this has said yes.
+    ///
+    /// `v13.55` is rejected too. exiftool prints a bare number, and accepting
+    /// decorations here means guessing at what some other program's output
+    /// meant — which is the mistake being fixed, one layer up.
+    static func looksLikeAVersion(_ text: String) -> Bool {
+        guard !text.isEmpty, text.count <= 32 else { return false }
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count <= 4 else { return false }
+        return parts.allSatisfy { part in
+            !part.isEmpty && part.allSatisfy(\.isNumber) && part.count <= 8
+        }
+    }
+
+    /// Untrusted output, made safe to put in a sentence.
+    ///
+    /// It is stdout from an executable the user just picked in a file panel:
+    /// it can be a megabyte, and it can be binary. Truncated to a clause and
+    /// stripped of anything that is not printable, because the destination is
+    /// a SwiftUI `Text` in the inspector.
+    private static func quotedForDisplay(_ text: String) -> String {
+        let printable = text.unicodeScalars.lazy
+            .filter { !CharacterSet.controlCharacters.contains($0) }
+            .prefix(60)
+        let cleaned = String(String.UnicodeScalarView(printable))
+        return cleaned.count < text.count ? "\"\(cleaned)…\"" : "\"\(cleaned)\""
     }
 
     private static func numericComponents(_ version: String) -> [Int] {
