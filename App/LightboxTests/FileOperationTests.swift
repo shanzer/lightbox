@@ -16,9 +16,22 @@ import Foundation
 @MainActor
 final class MemoryPreferences: PreferenceStore {
     private var flags: [String: Bool] = [:]
+    private var paths: [String: String] = [:]
 
     func flag(forKey key: String) -> Bool? { flags[key] }
     func setFlag(_ value: Bool, forKey key: String) { flags[key] = value }
+
+    /// Mirrors `UserDefaults`' half of this: an empty string is not a path,
+    /// and clearing *removes* the key rather than storing "" — #51's *Use
+    /// default* depends on the difference being visible to the next reader.
+    func path(forKey key: String) -> String? {
+        guard let stored = paths[key], !stored.isEmpty else { return nil }
+        return stored
+    }
+
+    func setPath(_ value: String?, forKey key: String) {
+        if let value, !value.isEmpty { paths[key] = value } else { paths[key] = nil }
+    }
 }
 
 /// Removes whatever a batch put in the Trash.
