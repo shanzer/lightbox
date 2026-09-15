@@ -101,7 +101,7 @@ The automated checks, in the order to run them:
 cd Core && swift test                                             # 622 tests, ~15 s on M4
 cd App  && xcodebuild -scheme Lightbox -destination 'platform=macOS' test   # 161 tests
 cd Core && LIGHTBOX_BENCH=1 swift test --filter Benchmark --no-parallel     # needs ~/lightbox-bench
-cd Core && LIGHTBOX_POOL_LIMITS=1 swift test --filter BlockingWorkFanOut  # queue geometry, needs cores (#49)
+cd Core && LIGHTBOX_POOL_LIMITS=1 swift test --filter BlockingWorkFanOut --no-parallel  # queue geometry, needs the process to itself (#49)
 ```
 
 The benchmark line needs the 50k fixture library

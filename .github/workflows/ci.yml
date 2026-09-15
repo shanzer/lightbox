@@ -49,3 +49,24 @@ jobs:
       - name: xcodebuild test
         working-directory: App
         run: xcodebuild -scheme Lightbox -destination 'platform=macOS' test
+
+
+  # The two tests that measure the pool's geometry, in a test process of their
+  # own. Not a "big machine" gate and not opt-in scenery: the 64 they pin is a
+  # process-wide constrained-thread budget, so any other suite running beside
+  # them holds part of what they are trying to count — that is #49, and it is
+  # why `.serialized` was not enough. They pass on this 3-core runner when the
+  # process is theirs; run them in the suite above and the ceiling test's
+  # high-water reads 4, here and on a 10-core M4 both.
+  pool-geometry:
+    name: pool geometry
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-xcode
+      - name: swift test --filter BlockingWorkFanOut
+        working-directory: Core
+        env:
+          LIGHTBOX_POOL_LIMITS: "1"
+        run: swift test --filter BlockingWorkFanOut --no-parallel

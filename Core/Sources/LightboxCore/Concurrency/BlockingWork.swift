@@ -122,7 +122,27 @@ public enum BlockingWork {
     /// is a much larger and non-fatal budget: exceed 64 concurrently-blocked
     /// closures and the surplus waits rather than deadlocking the process, but
     /// it still waits — and it waits *behind whoever else is here*, which is
-    /// why every caller's fan-out is written down:
+    /// why every caller's fan-out is written down.
+    ///
+    /// **"Whoever else is here" is not just this queue's callers (#49).** The 64
+    /// is libdispatch's cap on the *process's* constrained worker threads, and
+    /// every concurrent `DispatchQueue` in the process draws on it — this one,
+    /// and whatever GRDB, ImageIO, QuickLook and AppKit use internally. A second
+    /// concurrent queue created while this one holds all 64 admits **zero**
+    /// closures until a slot frees:
+    ///
+    /// ```
+    /// queue A saturated: peak=64
+    /// queue B while A holds 64: peak=0
+    /// ```
+    ///
+    /// That makes the table below a floor on the risk rather than the whole of
+    /// it, and it sharpens what saturation costs. "The surplus waits rather than
+    /// deadlocking" is still true and is still the reason blocking work belongs
+    /// here — but what waits is not only the surplus of *this* queue. At 64 held
+    /// slots, unrelated subsystems doing their own non-overcommit work stop
+    /// getting threads at all. Giving a caller its own queue is therefore not a
+    /// way to buy it headroom; there is one budget.
     ///
     /// A slot is held for as long as its closure blocks, so both columns
     /// matter: a caller with a small fan-out and a multi-second hold occupies
@@ -131,7 +151,7 @@ public enum BlockingWork {
     /// | Caller | Concurrently blocked, at most | How long each holds its slot |
     /// |---|---|---|
     /// | `IndexCoordinator`'s hashing pass | `IndexCoordinator.concurrency`, 4 | a whole-file read and decode |
-    /// | `ThumbnailCache.generate`'s encode | measured at most 10 for 200 simultaneous requests — `ThumbnailCache.generate` explains why, and `theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling` guards it at half the ceiling (`< 32`), the margin absorbing other suites' use of the same queue | 0.6 ms |
+    /// | `ThumbnailCache.generate`'s encode | measured at most 10 for 200 simultaneous requests on an idle process (3 on a 3-core runner) — `ThumbnailCache.generate` explains why, and `theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling` guards it at half the ceiling (`< 32`). It is bounded by render spread, not by construction: on a machine whose process is *busy*, the same 200 requests reached 50 (#49) | 0.6 ms |
     /// | `MetadataWriter.recheckAvailability` | 1 — a button | up to `ExiftoolLocator.loginShellProbeTimeout` + `versionProbeTimeout`, 15 s — two forks since #41, and only the second one is exiftool's |
     /// | `MetadataWriter.setStoredExiftoolPath` | 1 — a file picker | the same 15 s worst case, one fork fewer in practice: a stored path skips the shell rung by construction (#51) |
     /// | `ExiftoolLocator.validate`, via `LiveMetadataWriter.validate` | 1 — the same picker, once per chosen file | up to `versionProbeTimeout`, 10 s. One fork, never the shell: it asks about the chosen file and consults no rung (#51) |
@@ -146,6 +166,11 @@ public enum BlockingWork {
     /// bounded only by how tall the user's sidebar is, and each of its closures
     /// can hold a slot for seconds rather than for 0.6 ms. If this queue is
     /// ever found saturated, look there first.
+    ///
+    /// Both of those bounds are the window's, not ours, and #49's measurements
+    /// make that worth stating plainly: neither caller has a limiter, the 50
+    /// above shows the grid's spread thinning under load, and the budget they
+    /// would exhaust belongs to the whole process rather than to Lightbox.
     private static let queue = DispatchQueue(label: runLabel, qos: .userInitiated,
                                              attributes: .concurrent)
 

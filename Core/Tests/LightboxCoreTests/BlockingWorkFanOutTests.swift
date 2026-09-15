@@ -22,53 +22,73 @@ import CoreGraphics
 /// with this suite. Swift Testing serialises only *within* one suite, so a
 /// second `.serialized` suite would not have helped — it has to be this one.
 ///
-/// The residual is other suites' use of the same queue, and the largest of
-/// those is now the hashing pass at `IndexCoordinator.concurrency` of 4 apiece.
-/// That is what the fan-out bound's headroom absorbs. Note what contamination
-/// does and does not do: `peak` counts only this suite's own closures, because
-/// the counter lives in a test-local `LockBox` inside the injected installer,
-/// so a noisy neighbour changes the *arrival pattern* rather than the number —
-/// which is why the answer is serialisation and not a wider bound.
+/// The residual is other suites' use of the same budget, and `.serialized` does
+/// nothing about that — which is why both measuring tests additionally need a
+/// test process to themselves. See `measuresQueueGeometry` for what that costs
+/// and why isolation, not a wider bound, is the answer.
+///
+/// **What contamination does was misread here, and the correction is the whole
+/// of #49.** This used to say that `peak` counts only this suite's own closures
+/// — true, the counter is a test-local `LockBox` — and concluded that a noisy
+/// neighbour therefore changes the *arrival pattern* rather than the number. It
+/// changes the number. The closures a neighbour parks hold part of a budget
+/// that is process-wide, so this suite's own high-water falls by however many
+/// they hold: 64 alone, **4** inside a full parallel suite, on a 10-core M4 and
+/// on CI's 3 cores alike. Counting only your own arrivals does not isolate you
+/// from someone else's.
 ///
 /// Anything new in Core that blocks a lot of closures on `BlockingWork.run` at
 /// once belongs in here too, not beside it.
 @Suite(.serialized)
 struct BlockingWorkFanOutTests {
-    /// **Why two of these three tests are opt-in (#49).**
+    /// **Why two of these three tests need the process to themselves (#49).**
     ///
-    /// The ceiling and the fan-out bound are assertions about libdispatch's
-    /// queue *geometry*, and both were written and verified on a 10-core M4.
-    /// Neither holds on the 3-core `macos-26` runner, in opposite directions:
+    /// Not because of hardware. That was the first diagnosis and it was wrong,
+    /// in every particular; #49 has the measurements that retired it. What these
+    /// two need is a test process with no other suite in it, and the reason is
+    /// the resource they measure.
     ///
-    /// | Test | Asserts | On CI |
-    /// |---|---|---|
-    /// | `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes` | 64 blocked closures accumulate | high-water **3–4** |
-    /// | `theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling` | peak `< 32` | observed **50** |
+    /// **The 64 is a process-wide budget, not this queue's width.** libdispatch
+    /// caps the *process* at 64 constrained (non-overcommit) worker threads, and
+    /// every concurrent `DispatchQueue` in the process draws from that one pool
+    /// — `BlockingWork.queue`, any queue a test makes for itself, and whatever
+    /// GRDB, ImageIO and QuickLook use internally. Saturate it from one queue
+    /// and a second concurrent queue admits **zero** closures, not merely fewer:
     ///
-    /// The first fails because a non-overcommit queue will not grow to 64
-    /// threads on a 3-core box inside the watchdog's budget — the ceiling is
-    /// libdispatch's cap, not a floor any machine reaches. The second fails
-    /// because its own doc's prediction ("a three-core CI runner renders
-    /// *slower*, not faster, so its peak is lower than this machine's; this
-    /// cannot pass locally and fail there") is backwards: fewer cores means
-    /// each render is slower, so *more* encodes are in flight at once, not
-    /// fewer.
-    ///
-    /// So they are gated the way the benchmarks are, and for the same reason —
-    /// a measurement is only meaningful on hardware that can produce it. They
-    /// are not deleted, because the numbers they pin are quoted in
-    /// `BlockingWork.queue`, `ThumbnailCache.generate`, `CLAUDE.md` and
-    /// `HANDOFF`, and something has to be able to falsify them:
-    ///
-    /// ```bash
-    /// cd Core && LIGHTBOX_POOL_LIMITS=1 swift test --filter BlockingWorkFanOut
     /// ```
+    /// queue A saturated: peak=64
+    /// queue B while A holds 64: peak=0
+    /// ```
+    ///
+    /// So a test that counts only *its own* arrivals is not measuring the
+    /// ceiling; it is measuring the ceiling minus whatever the rest of the run
+    /// is holding. Under a full parallel suite the ceiling test's own high-water
+    /// comes in at **4** — on CI's 3 cores *and on a 10-core M4*, which is how
+    /// the hardware explanation was falsified. A private queue does not help;
+    /// that is what the `peak=0` above rules out.
+    ///
+    /// Three things follow, and all three are load-bearing:
+    ///
+    /// - **`.serialized` cannot fix this.** Swift Testing serialises within a
+    ///   suite; the contaminators are other suites. It was the right fix for the
+    ///   earlier 41-against-32 observation, which *was* this suite's two tests
+    ///   colliding, and it is kept for that.
+    /// - **Isolation is the gate, so the gate must not skip on CI.** These run
+    ///   in their own step (`LIGHTBOX_POOL_LIMITS=1 … --filter … --no-parallel`),
+    ///   where they pass on the 3-core runner — verified, not assumed. The
+    ///   variable means "this process is dedicated to measuring the pool", not
+    ///   "this machine is big enough".
+    /// - **The number is portable after all.** Driven directly, the queue
+    ///   reaches 64 in 137 ms on 3 cores and 30 ms on 10. The ceiling test used
+    ///   to route through `ThumbnailCache.generate`, which made its arrival rate
+    ///   a property of QuickLook; that is removed, and is why option 1 of #49
+    ///   was the right one.
     ///
     /// `aHashBlockedOnEveryCoreDoesNotStopTheRestOfTheProcess` stays
     /// unconditional. It asserts the *property* #28 and #30 are about — that
     /// blocking work does not stall the process — scales itself to
-    /// `activeProcessorCount`, and passes on CI. Gating the geometry must not
-    /// take the property with it.
+    /// `activeProcessorCount`, and does not depend on having the budget to
+    /// itself. Isolating the geometry must not take the property with it.
     static let measuresQueueGeometry =
         ProcessInfo.processInfo.environment["LIGHTBOX_POOL_LIMITS"] == "1"
 
@@ -87,12 +107,16 @@ struct BlockingWorkFanOutTests {
     /// test.
     ///
     /// The fix is to stop measuring a coincidence and start forcing it. Every
-    /// encode blocks on a semaphore that **nothing signals until 64 encodes
-    /// have arrived**, so the closures accumulate rather than passing through:
-    /// none can leave, so the 64th must arrive before anything is released. How
-    /// fast they arrive, how many cores are free, and how long QuickLook takes
-    /// stop mattering entirely — a slower machine takes longer to reach 64, it
-    /// does not reach a smaller number.
+    /// closure blocks on a semaphore that **nothing signals until 64 closures
+    /// have arrived**, so they accumulate rather than passing through: none can
+    /// leave, so the 64th must arrive before anything is released. How fast they
+    /// arrive and how many cores are free stop mattering — a slower machine
+    /// takes longer to reach 64, it does not reach a smaller number.
+    ///
+    /// What can still make it reach a smaller number is another *process*
+    /// participant holding part of the budget, which no amount of forcing inside
+    /// this test can fix. That is the isolation requirement, and it is the only
+    /// sensitivity left.
     ///
     /// That gives both bounds, neither of them timing-dependent:
     ///
@@ -108,17 +132,26 @@ struct BlockingWorkFanOutTests {
     /// `Process`'s does: it has to be able to run when the thing it is watching
     /// has gone wrong, and it must not need the resource under test.
     ///
-    /// 64 is libdispatch's limit for the non-overcommit root queue this
-    /// targets, not a Lightbox constant. If a future OS changes it, this fails
-    /// loudly and on purpose: `BlockingWork.queue`, `ThumbnailCache.generate`,
-    /// CLAUDE.md and HANDOFF all quote the number, and they must be corrected
-    /// with it rather than the assertion being loosened.
+    /// 64 is libdispatch's cap on the process's constrained worker threads, not
+    /// a Lightbox constant. If a future OS changes it, this fails loudly and on
+    /// purpose: `BlockingWork.queue`, `ThumbnailCache.generate`, CLAUDE.md and
+    /// HANDOFF all quote the number, and they must be corrected with it rather
+    /// than the assertion being loosened.
+    ///
+    /// **It drives `BlockingWork.run` directly, and that is the fix for #49.**
+    /// It used to go through `ThumbnailCache.generate`, so what it actually
+    /// measured was how many closures *QuickLook delivered* into the encode
+    /// concurrently — a property of the render stage and of the machine, not of
+    /// the queue. Isolated on the 3-core runner the render stage delivers 3;
+    /// driven directly the queue reaches 64 in 137 ms there, and in 30 ms on a
+    /// 10-core M4. Same claim, a tenth of the moving parts, and now portable.
+    ///
+    /// The remaining sensitivity is the one the suite's note explains and the
+    /// only one that survives measurement: the budget is process-wide, so this
+    /// needs the process to itself.
     @Test(.enabled(if: BlockingWorkFanOutTests.measuresQueueGeometry,
-                   "needs LIGHTBOX_POOL_LIMITS=1 and a machine whose non-overcommit queue reaches 64 — see the suite's note (#49)"))
-    func theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes() async throws {
-        let source = try Fixtures.writeImage(to: tree.root.appendingPathComponent("ceiling.jpg"),
-                                             width: 400, height: 300)
-        let root = tree.root
+                   "needs LIGHTBOX_POOL_LIMITS=1 — the 64 is a process-wide budget, so this needs a test process with no other suite in it (#49)"))
+    func theBlockingWorkQueueAdmitsExactlySixtyFourBlockedClosures() async throws {
         let requests = 200
         let expectedCeiling = 64
         let gate = SaturationGate(target: expectedCeiling)
@@ -138,22 +171,17 @@ struct BlockingWorkFanOutTests {
         watchdog.start()
 
         await withTaskGroup(of: Void.self) { group in
-            for i in 0..<requests {
+            for _ in 0..<requests {
                 group.addTask {
-                    _ = try? await ThumbnailCache.generate(
-                        from: source,
-                        to: root.appendingPathComponent("ceiling/\(i).png"),
-                        size: 128
-                    ) { image, target in
+                    await BlockingWork.run {
                         gate.enterAndBlock()
-                        defer { gate.leave() }
-                        try ThumbnailCache.install(image, at: target)
+                        gate.leave()
                     }
                 }
             }
             // A member of the group rather than a bare `Task`, so the group does
             // not finish before the release has happened. It needs a cooperative
-            // thread, and it can only get one because the blocked encodes are
+            // thread, and it can only get one because the blocked closures are
             // parked on a dispatch queue instead — which is #28's whole point.
             group.addTask {
                 await gate.waitForSaturation()
@@ -162,12 +190,15 @@ struct BlockingWorkFanOutTests {
         }
 
         let (reached, peak) = gate.tally
-        #expect(reached == requests, "only \(reached) of \(requests) renders reached the encode")
+        #expect(reached == requests, "only \(reached) of \(requests) closures reached the queue")
         #expect(!rescued.withLock { $0 }, """
-            \(requests) encodes blocked on BlockingWork.run's queue and it never had \
+            \(requests) closures blocked on BlockingWork.run's queue and it never had \
             \(expectedCeiling) of them in flight at once — the high-water mark was \
-            \(peak). The queue is narrower than the ceiling quoted in \
-            BlockingWork.queue, ThumbnailCache.generate, CLAUDE.md and HANDOFF.
+            \(peak). Either libdispatch's constrained-thread cap has changed — the \
+            number is quoted in BlockingWork.queue, ThumbnailCache.generate, CLAUDE.md \
+            and HANDOFF — or this ran alongside something else holding part of the \
+            budget, which is process-wide and is why this test wants the process to \
+            itself (#49).
             """)
         #expect(peak <= expectedCeiling, """
             BlockingWork.run admitted \(peak) concurrently-blocked closures, more than \
@@ -193,15 +224,16 @@ struct BlockingWorkFanOutTests {
     /// is sub-millisecond and QuickLook's render is not, so requests arrive at
     /// the hop spread out.
     ///
-    /// Measured on an M4 (10 cores), 200 simultaneous requests, during full
-    /// parallel `swift test` runs rather than in isolation — the number in
-    /// isolation is not the number that has to hold:
+    /// Measured with 200 simultaneous requests, in a dedicated test process on
+    /// both machine shapes this project runs on:
     ///
     /// | Run | High-water mark |
     /// |---|---|
-    /// | alone, either pool mode | 5–10 |
-    /// | full suite | 6–7 |
-    /// | full suite, `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` | 10 |
+    /// | M4, 10 cores, alone, either pool mode | 4–10 |
+    /// | `macos-26` runner, 3 cores, alone | 3 |
+    /// | M4, full parallel suite | 6–7 |
+    /// | M4, full parallel suite, `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` | 10 |
+    /// | CI, full parallel suite | **50** |
     ///
     /// The assertion is against half the ceiling rather than against 10,
     /// because the *property* under test is headroom, and because this is a
@@ -210,20 +242,23 @@ struct BlockingWorkFanOutTests {
     /// `fsync`, a render that starts answering from a cache) lands far past 32
     /// and is caught; ordinary scheduling noise does not get near it.
     ///
-    /// The margin between 10 and 32 is what absorbs other suites' use of the
-    /// same global queue. It does *not* absorb this suite's own ceiling test
-    /// running alongside — that one parks 64 closures deliberately and drove
-    /// this to 41 — which is why the suite is `.serialized`.
+    /// **Fewer cores do not raise this; a shared budget does (#49).** The 50 in
+    /// that last row was read as a hardware effect, and #49 wrote it up as one:
+    /// slower renders leaving each encode's neighbours still in flight. The same
+    /// runner produces **3** when it has the process to itself, so that was
+    /// wrong. What the 50 measures is 200 encodes competing with every other
+    /// suite for a budget that is process-wide — the ceiling test's own
+    /// high-water drops to 4 under the identical conditions, on both machines.
+    /// Both numbers are the one defect seen from its two sides, and it is
+    /// contamination, not core count.
     ///
-    /// **That prediction was wrong, and CI falsified it (#49).** It used to
-    /// read: "a three-core CI runner renders *slower*, not faster, so its peak
-    /// is lower than this machine's; this cannot pass locally and fail there."
-    /// It failed there at **50** against this bound of 32. Slower renders do
-    /// not thin the queue — they leave each encode's neighbours still in
-    /// flight when it arrives, so a *smaller* machine piles up *more*. The
-    /// bound is calibrated to this one, which is why the test is now opt-in.
+    /// So this keeps its bound and runs isolated, where it has 22 of headroom on
+    /// the narrower machine rather than the negative margin the full-suite run
+    /// suggested. What that headroom no longer has to absorb is other suites;
+    /// what it still absorbs is this suite's sibling, which parks 64 closures on
+    /// purpose and once drove this to 41 — and which is why `.serialized` stays.
     @Test(.enabled(if: BlockingWorkFanOutTests.measuresQueueGeometry,
-                   "needs LIGHTBOX_POOL_LIMITS=1 — the bound is calibrated to a 10-core machine; CI observed 50 against 32 (#49)"))
+                   "needs LIGHTBOX_POOL_LIMITS=1 — 200 encodes against a process-wide budget, so this needs a test process with no other suite in it (#49)"))
     func theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling() async throws {
         let source = try Fixtures.writeImage(to: tree.root.appendingPathComponent("fan.jpg"),
                                              width: 400, height: 300)
@@ -365,7 +400,7 @@ struct BlockingWorkFanOutTests {
 /// Holds every closure that enters until `target` of them have, then lets the
 /// test decide when to release them.
 ///
-/// This is what makes `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes`
+/// This is what makes `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedClosures`
 /// a fact rather than a race: because nothing leaves until the test says so,
 /// reaching `target` is a consequence of the queue being that wide and not of
 /// anything arriving quickly enough.
