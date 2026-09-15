@@ -76,11 +76,12 @@ and was split into named steps. Expect the same from any other dense
 bit-twiddling one-liner; the fix is always the same.
 
 The exiftool path change bit in **phase 2**, and is handled:
-`Metadata/ExiftoolLocator.swift` resolves it at first use in four rungs —
-`LIGHTBOX_EXIFTOOL`, `PATH`, the user's login shell, then a named prefix list —
-hardcoding neither Homebrew prefix as *the* answer, with `LIGHTBOX_EXIFTOOL` as
-an override for a non-standard install or a test stub. The last two rungs are
-#41's; §7.9 has why a `PATH`-only lookup shipped a dead feature. `MetadataWriter.availability` is the single answer to
+`Metadata/ExiftoolLocator.swift` resolves it at first use in five rungs —
+`LIGHTBOX_EXIFTOOL`, the user's stored path, `PATH`, the user's login shell,
+then a named prefix list — hardcoding neither Homebrew prefix as *the* answer,
+with `LIGHTBOX_EXIFTOOL` as an override for a non-standard install or a test
+stub. Rungs 4 and 5 are #41's and rung 2 is #51's; §7.9 has why a `PATH`-only
+lookup shipped a dead feature, and what the stored path had to get right. `MetadataWriter.availability` is the single answer to
 "can we edit?", and the round-trip tests gate on that same property so a machine
 without exiftool (every CI runner) skips them visibly instead of failing. It was
 also used during design to empirically verify the image-hash rules survive
@@ -111,10 +112,10 @@ prompt is expected, not a bug.
 ```bash
 cd ~/src/lightbox
 
-# Core: 632 tests, 79 suites.
+# Core: 647 tests, 79 suites.
 cd Core && swift test
 
-# App: builds the SwiftUI target and runs its 161 tests.
+# App: builds the SwiftUI target and runs its 170 tests.
 cd ../App && xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 ```
 
@@ -165,14 +166,14 @@ three itself and does not depend on any of this.
 ## 5. What exists
 
 `Core/` — `LightboxCore`, a headless package with no AppKit/SwiftUI dependency,
-where all the logic and all 632 tests live. `App/` only wires it to views.
+where all the logic and all 647 tests live. `App/` only wires it to views.
 
 | Area | Files | What it does |
 |---|---|---|
 | Walk | `Walker.swift`, `MediaType.swift` | Recursive enumeration; extension + UTI classification (RAW, HEIC, JPEG, PNG, WebP) |
 | Index | `Index/{FileRecord,IndexStore,VolumeIdentity}.swift`, `Index/IndexStore+{FileOperations,Reconcile}.swift` | SQLite via GRDB, schema + migrations (v2 = `volume_uuid`), FTS5, path scoping, volume identity; the `op_journal` writes and the guarded row move/copy/remove; the launch-time reconcile of `in_flight` rows and journal retention |
 | Metadata | `Metadata/{ImageMetadata,MetadataReader}.swift` | ImageIO `CGImageSource` reads — dimensions, camera, capture time |
-| Metadata (write) | `Metadata/{MetadataEdit,MetadataWriter,MetadataWriter+Tags,ExiftoolLocator,ExiftoolRunner}.swift` | Spec §9's writes through exiftool: MWG composites, RAW sidecars, write-verify-commit, the `image_hash` tripwire, availability |
+| Metadata (write) | `Metadata/{MetadataEdit,MetadataWriter,MetadataWriter+Tags,ExiftoolLocator,ExiftoolRunner}.swift` | Spec §9's writes through exiftool: MWG composites, RAW sidecars, write-verify-commit, the `image_hash` tripwire, availability, the five-rung lookup and its stored path (#41, #51) |
 | Hashing | `Hashing/*.swift` | Three hashes: `content_hash` (whole file), `image_hash` (format-stripped pixel data), `phash` (DCT perceptual) |
 | Thumbnails | `Thumbnails/ThumbnailCache.swift` | QuickLookThumbnailing, on-demand, concurrent decode; own executor, and the PNG encode hopped off the pool (#30) |
 | Search | `Search/*.swift` | Structural query → SQL compiler, FTS5 text, facets, folder tree, Finder-style selection |
@@ -294,6 +295,7 @@ The App side, file by file:
 | `MetadataEditing.swift` | `MetadataEditRequest`, `MetadataFieldEdit`, `BatchTimeOperation`, `TimeZoneOffset`, `WallClock`, `ShiftAmount`, `MetadataSummary` — the editor with no view in it |
 | `MetadataWriting.swift` | The seam onto `MetadataWriter`, so the App suite runs where exiftool does not (#9) |
 | `DestinationChooser.swift` | The `NSOpenPanel` behind Move/Copy To…, with the companion checkbox as its accessory view |
+| `ExiftoolChooser.swift` | The `NSOpenPanel` behind the inspector's *Choose…*, for an exiftool the five rungs cannot find (#51). Validates nothing — the caller does, off the main thread |
 | `Views/` | Thin SwiftUI: grid, tree, filters, path bar, the editable inspector, the four file-operation sheets and the two metadata ones |
 
 `App/Lightbox.xcodeproj/project.pbxproj` is **hand-written** (objectVersion 77,
@@ -513,7 +515,8 @@ Eight things automated tests could not cover. **None done yet** as of the
    Finder report exiftool missing however it was installed, with *Try Again*
    unable to help.
 
-   **Settled in #41.** `ExiftoolLocator` now resolves in four rungs —
+   **Settled in #41**, and extended by #51 with the stored path described
+   below. `ExiftoolLocator` resolves in four rungs when no path is stored —
    `LIGHTBOX_EXIFTOOL`, `PATH`, then `<$SHELL> -l -c 'command -v exiftool'`,
    then the named list `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin` —
    which keeps "never a hardcoded prefix" true in the sense that mattered: the
@@ -535,9 +538,38 @@ Eight things automated tests could not cover. **None done yet** as of the
    `IFD0:Artist` in it — so the read-back saw nil for a write that had actually
    landed. The fixture seeds a Make and Model now, as `Core`'s always did.
 
-   Still out: **a stored exiftool location** (#51), the durable escape when all
-   four rungs miss, and the only route left if Lightbox is ever sandboxed —
-   rungs 3 and 4 both need to spawn a process.
+   **And #51 closed the last gap.** A user-set exiftool location, chosen from
+   the inspector's *Edit* section — the place that already explains the
+   problem — and remembered in `UserDefaults` through `PreferenceStore`. It
+   sits between `LIGHTBOX_EXIFTOOL` and `PATH`: an explicit statement beats
+   discovery, and without that a later `brew install exiftool` would silently
+   retire a choice the user made by hand. Four things about it are
+   load-bearing:
+
+   - **It refuses rather than falling through.** A stored path that has been
+     deleted, unmounted or upgraded away produces `.storedPathUnusable`, which
+     *names the path* and offers *Use default* — it does not quietly run
+     whatever is on `PATH` instead. Same shape as rung 1.
+   - **Setting it and invalidating the availability cache are one call**
+     (`MetadataWriter.setStoredExiftoolPath`). They are not independently
+     useful: a path set over a warm cache is a choice the user watches do
+     nothing, and the next write runs the binary they just replaced, because
+     `MetadataWriter.init` captures availability once.
+   - **A remembered path has to be put *into force* at launch**, not merely
+     read into a property. `BrowserModel.resolveMetadataAvailability` does it
+     on the first resolve. The version that only read it passed every test in
+     the App suite and left editing dead on the next launch — which is the
+     whole failure #41 was about, re-created one layer up. There is a test
+     named after it.
+   - **A version is only compared to the floor once it looks like a version.**
+     `/bin/echo -ver` exits 0 and prints `-ver`; the probe believed any
+     non-empty stdout, so the picker refused it as `.tooOld(version: "-ver")`
+     and advised upgrading a program that is not exiftool. Found by the live
+     check, not by the suite — the unit test asked only whether the answer was
+     unavailable, which it was, for the wrong reason.
+
+   Still out: **a security-scoped bookmark** for the stored path, which only
+   pays off under App Sandbox and would follow adopting it.
 
 ## 8. Deferred, and what I'd do first in phase 2
 

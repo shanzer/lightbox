@@ -79,8 +79,8 @@ four-phase breakdown.
 ### Layout and commands
 
 ```
-Core/     LightboxCore — headless SwiftPM package; all logic, all 632 tests. No AppKit/SwiftUI.
-App/      Lightbox.xcodeproj — SwiftUI shell over Core; 161 tests. Depends on Core as ../Core.
+Core/     LightboxCore — headless SwiftPM package; all logic, all 647 tests. No AppKit/SwiftUI.
+App/      Lightbox.xcodeproj — SwiftUI shell over Core; 170 tests. Depends on Core as ../Core.
 docs/     spec, plan, notes, HANDOFF.md, and docs/agents/ (issue conventions).
 scripts/  make-fixture-library.swift (50k benchmark library), sync-labels.sh.
 ```
@@ -94,14 +94,28 @@ cd Core && LIGHTBOX_POOL_LIMITS=1 swift test --filter BlockingWorkFanOut  # queu
 
 Toolchain: Xcode 26.x, Swift ≥ 6.2 (`swift-tools-version: 6.2`, `.macOS(.v26)`). Sole
 dependency GRDB.swift 7.11.1, pinned in both `Core/Package.resolved` and the xcodeproj's
-`Package.resolved` — bump both together. exiftool is resolved in **four rungs**
-(`ExiftoolLocator`, #41): `LIGHTBOX_EXIFTOOL`, then `PATH`, then the user's login shell
-(`<$SHELL> -l -c 'command -v exiftool'`), then the named list `/opt/homebrew/bin`,
-`/usr/local/bin`, `/opt/local/bin`. Rungs 3 and 4 exist because a **GUI-launched process
-gets `PATH=/usr/bin:/bin:/usr/sbin:/sbin`** and never sees Homebrew's prefix, so a
-`PATH`-only lookup made metadata editing dead for every user who double-clicked the app.
-No prefix is *the* answer — the list is consulted only after the user's own `PATH` and
-login shell have both been asked, and it is never hardcoded anywhere else.
+`Package.resolved` — bump both together. exiftool is resolved in **five rungs**
+(`ExiftoolLocator`, #41 and #51): `LIGHTBOX_EXIFTOOL`, then **the user's stored path**,
+then `PATH`, then the user's login shell (`<$SHELL> -l -c 'command -v exiftool'`), then
+the named list `/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`. Rungs 3–5 exist
+because a **GUI-launched process gets `PATH=/usr/bin:/bin:/usr/sbin:/sbin`** and never
+sees Homebrew's prefix, so a `PATH`-only lookup made metadata editing dead for every user
+who double-clicked the app. No prefix is *the* answer — the list is consulted only after
+the user's own `PATH` and login shell have both been asked, and it is never hardcoded
+anywhere else.
+
+**The stored path (#51) is terminal, exactly as `LIGHTBOX_EXIFTOOL` is**: when it is set
+and cannot be used, the lookup *refuses* and says which path failed
+(`.storedPathUnusable`) rather than falling through to the rungs below. Running a
+different binary than the one the user picked is the surprise the rung exists to avoid,
+and a different exiftool writes different tags. Core reads no preferences — the path
+arrives from App (`BrowserModel.storedExiftoolPathKey`) through
+`MetadataWriter.setStoredExiftoolPath`, which sets it and re-probes in one call because
+a path set without invalidating the availability cache is a choice that silently does
+nothing. A binary chosen in the picker is validated (`ExiftoolLocator.validate`) before
+it is stored, and **a version is only compared to the floor once it looks like a
+version** — `/bin/echo -ver` prints `-ver`, which the probe used to accept and report as
+"too old".
 
 ### Gotchas that cost a debug session
 

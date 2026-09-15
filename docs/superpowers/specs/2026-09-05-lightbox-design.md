@@ -609,6 +609,30 @@ value nobody can commit is furniture — plus a *Try Again* that re-runs the
 lookup, since a cached answer under an instruction reading "install it, then
 try again" is how a user who has just installed it concludes the app is broken.
 
+*(Amended: the explanation also carries a* Choose… *button, for #51.)* The
+lookup can miss an exiftool that is genuinely installed — a manual tarball, a
+Nix or pkgsrc prefix, anything outside `PATH`, the login shell's configuration
+and the three named prefixes — and a GUI-launched process cannot be given
+`LIGHTBOX_EXIFTOOL` without `launchctl setenv`. So the explanation offers
+*Choose…*, which picks the program by hand and remembers it. Three rules govern
+it:
+
+- **It is validated before it is stored.** A file that is not a usable exiftool
+  is refused with the reason, not remembered — storing a misclick leaves a
+  broken state that costs a second trip through the picker to escape.
+- **A stored path that stops working refuses and says which path**, rather than
+  falling through to the ordinary lookup. Running a different binary than the
+  one the user chose is a silent substitution, and a different exiftool version
+  writes different tags.
+- **Where it is in force, the Edit section says so** — the path, *Change…* and
+  *Use Default* — because editing then works and nothing else in the window
+  reveals which program is doing it. A preference the user cannot see is one
+  they cannot undo.
+
+It is *not* a settings window: this is where the user is standing when they hit
+the problem, which is the same argument §8 makes for the companion-files
+checkbox living on the Move/Copy panel.
+
 Stopping a batch reports nothing, exactly as a stopped move does: the writer
 returns every un-reached file as a per-item cancellation, and those are counted
 rather than listed, so a user who pressed Stop is not then shown "295 files
@@ -634,7 +658,7 @@ No optional dependency renders the app unusable.
 
 | Condition | Behaviour |
 |---|---|
-| exiftool absent | Editing disabled with an explanation; browsing and search unaffected |
+| exiftool absent | Editing disabled with an explanation; browsing and search unaffected. *(Amended, #51: the explanation also offers* Choose… *, and a stored path that has stopped working names itself rather than reading as "not found".)* |
 | CLIP model absent | Semantic search offers to download the model; everything else works |
 | Index corrupt | Integrity check at launch, offer to rebuild |
 | Volume unmounted | Scanning pauses, resumes on remount |

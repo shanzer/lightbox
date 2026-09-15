@@ -50,6 +50,65 @@ extension BrowserModel {
         return metadataAvailability.explanation
     }
 
+    /// The stored path, but only when it is the one actually in force.
+    ///
+    /// The inspector's footnote reads from this rather than from
+    /// `storedExiftoolPath` directly: a path that is stored but overridden by
+    /// `LIGHTBOX_EXIFTOOL` is not what is running, and a footnote claiming
+    /// otherwise is a lie the user has no way to check. Comparing against the
+    /// resolved answer's own path is what makes it honest.
+    var storedExiftoolPathInForce: String? {
+        guard let storedExiftoolPath,
+              metadataAvailability?.executablePath == storedExiftoolPath else { return nil }
+        return storedExiftoolPath
+    }
+
+    /// Whether *Use default* has anything to undo. True whenever a path is
+    /// stored — including one that has stopped working, which is exactly when
+    /// the user needs the way out most.
+    var canClearStoredExiftoolPath: Bool { storedExiftoolPath != nil }
+
+    /// #51's *Choose…*, after the panel has returned a file.
+    ///
+    /// Validates first and stores only on success, so a misclick cannot leave
+    /// a preference that takes a second trip through the picker to escape.
+    /// Returns the refusal's sentence, or nil when the path was accepted.
+    @discardableResult
+    func chooseStoredExiftoolPath(_ path: String) async -> String? {
+        let verdict = await metadataEditor.validate(path)
+        guard verdict.isAvailable else {
+            return Self.refusal(for: verdict, path: path)
+        }
+        storedExiftoolPath = path
+        metadataAvailability = await metadataEditor.setStoredPath(path)
+        return nil
+    }
+
+    /// #51's *Use default*: back to the four rungs.
+    func clearStoredExiftoolPath() async {
+        storedExiftoolPath = nil
+        metadataAvailability = await metadataEditor.setStoredPath(nil)
+    }
+
+    /// What to say about a file the picker refused.
+    ///
+    /// Not `ExiftoolAvailability.explanation`: that copy is written for a
+    /// lookup that came up short and advises `brew reinstall`, which is the
+    /// wrong instruction for a file the user just pointed at by hand.
+    private static func refusal(for verdict: ExiftoolAvailability, path: String) -> String {
+        let name = (path as NSString).lastPathComponent
+        switch verdict {
+        case .tooOld(_, let version, let minimum):
+            return "\(name) is exiftool \(version); Lightbox needs \(minimum) or newer."
+        case .unusable(_, let reason), .storedPathUnusable(_, let reason):
+            return "\(name) cannot be used: \(reason)."
+        case .notFound:
+            return "\(name) could not be found."
+        case .available:
+            return ""
+        }
+    }
+
     /// Resolves the probe once per window, or again on request.
     ///
     /// - Parameter recheck: for the *Try Again* button. The explanation says
@@ -58,9 +117,25 @@ extension BrowserModel {
     func resolveMetadataAvailability(recheck: Bool = false) async {
         let writer = metadataEditor
         guard recheck || metadataAvailability == nil else { return }
-        let answer = recheck
-            ? await writer.recheckAvailability()
-            : await writer.availability()
+        let answer: ExiftoolAvailability
+        if recheck {
+            answer = await writer.recheckAvailability()
+        } else if let storedExiftoolPath {
+            // **A remembered path has to be put into force, not just read.**
+            // `init` fills the property from the preference; that alone leaves
+            // the next launch showing the path in the footnote while resolving
+            // through #41's four rungs — which on the machine this feature
+            // exists for means editing is still dead (#51).
+            //
+            // It re-probes per window rather than asking whether the process
+            // already has this path in force. One bounded fork on the first
+            // inspector open of each window is the same cost `availability()`
+            // may pay anyway, and the alternative is a second source of truth
+            // about what is installed.
+            answer = await writer.setStoredPath(storedExiftoolPath)
+        } else {
+            answer = await writer.availability()
+        }
         metadataAvailability = answer
     }
 

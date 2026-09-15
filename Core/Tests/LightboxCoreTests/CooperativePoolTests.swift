@@ -231,4 +231,72 @@ struct CooperativePoolTests {
         #expect(cache.value == stub,
                 "the recheck's answer never reached the cache, so the next reader re-probes")
     }
+
+    /// #51: **setting a stored path must invalidate the cached answer.**
+    ///
+    /// The cache is warm with the answer the *old* lookup produced. A user who
+    /// chooses a path in the inspector and gets that stale answer back sees
+    /// nothing happen — and worse, the next write runs the binary they just
+    /// replaced, because `MetadataWriter.init` captures availability once.
+    /// Path and cache therefore change together, in one call, so the
+    /// invalidation cannot be forgotten at a call site.
+    ///
+    /// The stub answers are two values no real probe can produce, for the
+    /// reason the test above gives: on CI a real probe says `.notFound`, so an
+    /// assertion against it would pass with the invalidation deleted.
+    @Test func settingAStoredPathInvalidatesTheCachedAnswer() async {
+        let before = ExiftoolAvailability.tooOld(path: "/nowhere/old",
+                                                 version: "0.1", minimum: "13.0")
+        let after = ExiftoolAvailability.tooOld(path: "/nowhere/new",
+                                                version: "0.2", minimum: "13.0")
+        let cache = MetadataWriter.AvailabilityCache()
+        await MetadataWriter.recheckAvailability(in: cache) { before }
+        #expect(cache.value == before)
+
+        let returned = await MetadataWriter.setStoredExiftoolPath("/nowhere/new",
+                                                                 in: cache) { after }
+
+        #expect(returned == after)
+        #expect(cache.value == after, "the stored path was set over a stale cached answer")
+        #expect(cache.storedPath == "/nowhere/new")
+    }
+
+    /// Clearing it is the *Use default* button, and has to invalidate just the
+    /// same — a cleared preference that leaves the old answer cached is a user
+    /// staring at a refusal naming a path that is no longer in force.
+    @Test func clearingTheStoredPathAlsoInvalidatesAndReturnsToTheRungs() async {
+        let cache = MetadataWriter.AvailabilityCache()
+        await MetadataWriter.setStoredExiftoolPath("/nowhere/chosen", in: cache) {
+            .storedPathUnusable(path: "/nowhere/chosen", reason: "it is gone")
+        }
+        #expect(cache.storedPath == "/nowhere/chosen")
+
+        let cleared = ExiftoolAvailability.tooOld(path: "/nowhere/default",
+                                                  version: "0.3", minimum: "13.0")
+        let returned = await MetadataWriter.setStoredExiftoolPath(nil, in: cache) { cleared }
+
+        #expect(returned == cleared)
+        #expect(cache.storedPath == nil)
+        #expect(cache.value == cleared)
+    }
+
+    /// The production probe the cache runs must actually carry the stored path
+    /// down to the locator. Without this the two tests above pass with
+    /// `storedPath` written to a field nothing reads — the stored path is
+    /// remembered, reported in the UI, and never used.
+    @Test func theCachesOwnProbeResolvesThroughTheStoredPath() async {
+        let cache = MetadataWriter.AvailabilityCache()
+        // A path that exists and is executable on every machine this runs on,
+        // but is emphatically not exiftool: the answer has to be *about it*.
+        _ = await MetadataWriter.setStoredExiftoolPath("/bin/echo", in: cache)
+
+        guard case .storedPathUnusable(let path, _) = cache.value else {
+            Issue.record("""
+                expected .storedPathUnusable for a stored /bin/echo, got \
+                \(cache.value) — the stored path never reached the locator
+                """)
+            return
+        }
+        #expect(path == "/bin/echo")
+    }
 }

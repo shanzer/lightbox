@@ -172,6 +172,46 @@ public actor MetadataWriter {
         await cache.recheck(probe: probe)
     }
 
+    /// Sets the stored exiftool path for this process and re-resolves (#51).
+    ///
+    /// The inspector's *Choose…* and *Use default*, and whatever App does at
+    /// launch to install the remembered preference. One call rather than a
+    /// setter plus a recheck, because the two are not independently useful and
+    /// doing only the first is a silent bug — see `AvailabilityCache.stored`.
+    ///
+    /// Pass nil (or "") to clear it and return to #41's four-rung order.
+    ///
+    /// `async` for the same reason `recheckAvailability` is: it forks, and the
+    /// fork hops off the cooperative pool through `BlockingWork.run`. The
+    /// answer is process-wide, like the cache it replaces.
+    @discardableResult
+    public static func setStoredExiftoolPath(_ path: String?) async -> ExiftoolAvailability {
+        await setStoredExiftoolPath(path, in: availabilityCache) {
+            ExiftoolLocator.check(storedPath: path)
+        }
+    }
+
+    /// Test seam, matching `recheckAvailability(in:probe:)` and injectable for
+    /// exactly the same reason: the production cache is process-wide and has
+    /// no restore, so a test that set a stored path in it would leave every
+    /// later exiftool round-trip in the run resolving through that path.
+    ///
+    /// The probe defaults to the production one so a test can prove the stored
+    /// path actually reaches `ExiftoolLocator` rather than being written to a
+    /// field nothing reads.
+    @discardableResult
+    static func setStoredExiftoolPath(
+        _ path: String?,
+        in cache: AvailabilityCache,
+        probe: (@Sendable () -> ExiftoolAvailability)? = nil
+    ) async -> ExiftoolAvailability {
+        let resolve = probe ?? { ExiftoolLocator.check(storedPath: path) }
+        return await cache.setStoredPath(path, probe: resolve)
+    }
+
+    /// The exiftool the user chose, or nil for the four-rung lookup (#51).
+    public static var storedExiftoolPath: String? { availabilityCache.storedPath }
+
     private static let availabilityCache = AvailabilityCache()
 
     /// A lock rather than a `static let`, purely so `recheckAvailability` can
@@ -199,6 +239,25 @@ public actor MetadataWriter {
         /// unnecessary.
         private var generation: UInt64 = 0
 
+        /// Rung 1.5's value for this process (#51): the exiftool the user
+        /// chose in the inspector, or nil for #41's four-rung lookup.
+        ///
+        /// **It lives here, next to the cached answer, because the two must
+        /// change together.** A stored path set without invalidating the cache
+        /// is a choice the user watches do nothing — and then the next write
+        /// runs the old binary anyway, because `MetadataWriter.init` captures
+        /// availability once. Putting them in one type makes the invalidation
+        /// impossible to forget at a call site; `setStoredPath` is the only
+        /// way in, and it always bumps the generation.
+        ///
+        /// Core reads no preferences of its own: this arrives from App, which
+        /// owns `PreferenceStore`.
+        private var stored: String?
+
+        /// What rung 1.5 currently holds. For the inspector's footnote, which
+        /// has to name the path that is actually in force.
+        var storedPath: String? { lock.withLock { stored } }
+
         /// The cached answer, probing for it once if nothing has been cached.
         ///
         /// **The probe runs outside the lock.** Holding `NSLock` across
@@ -216,9 +275,10 @@ public actor MetadataWriter {
                 return cached
             }
             let startedAt = generation
+            let storedPath = stored
             lock.unlock()
 
-            let fresh = ExiftoolLocator.check()
+            let fresh = ExiftoolLocator.check(storedPath: storedPath)
 
             lock.lock()
             defer { lock.unlock() }
@@ -260,6 +320,33 @@ public actor MetadataWriter {
 
         func recheck(probe: @escaping @Sendable () -> ExiftoolAvailability) async -> ExiftoolAvailability {
             let startedAt = beginRecheck()
+            let fresh = await BlockingWork.run(probe)
+            return store(fresh, from: startedAt)
+        }
+
+        /// Records the new stored path and drops the cached answer, returning
+        /// the generation the replacement must still be current for.
+        ///
+        /// Clearing the cache rather than leaving it is the point: a reader
+        /// that arrives between this and the recheck landing must re-probe
+        /// through the *new* path, not serve the answer the old one produced.
+        private func beginStoredPathChange(to path: String?) -> UInt64 {
+            lock.lock()
+            defer { lock.unlock() }
+            // The empty string is not a path. It arrives from a preference
+            // store that has been written and then emptied, and treating it as
+            // "set" would strand the app on a rung that can never answer.
+            stored = (path?.isEmpty ?? true) ? nil : path
+            cached = nil
+            generation += 1
+            return generation
+        }
+
+        /// Sets rung 1.5 and re-resolves in one step.
+        func setStoredPath(_ path: String?,
+                           probe: @escaping @Sendable () -> ExiftoolAvailability)
+        async -> ExiftoolAvailability {
+            let startedAt = beginStoredPathChange(to: path)
             let fresh = await BlockingWork.run(probe)
             return store(fresh, from: startedAt)
         }

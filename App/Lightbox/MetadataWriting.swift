@@ -21,6 +21,13 @@ protocol MetadataWriting: Sendable {
     /// cached answer plus "install it, then try again" is how a user who has
     /// just installed exiftool concludes the app is broken.
     func recheckAvailability() async -> ExiftoolAvailability
+    /// Is this file a usable exiftool? #51's *Choose…* gate — asked **before**
+    /// anything is stored, so a misclick is refused rather than remembered.
+    /// Consults no rung: it answers about the file it was handed.
+    func validate(_ path: String) async -> ExiftoolAvailability
+    /// Puts #51's stored path into force for the process and re-resolves.
+    /// Nil returns to the four-rung lookup.
+    func setStoredPath(_ path: String?) async -> ExiftoolAvailability
     /// One batch. Never throws — the per-item results are the report (spec §11).
     /// `progress` is called once per finished item with `(completed, total)`.
     func write(_ edit: MetadataEdit, to urls: [URL],
@@ -59,6 +66,22 @@ actor LiveMetadataWriter: MetadataWriting {
         // The writer captured the *old* answer at init and would keep refusing
         // every item with it. Dropped, so the next write builds one that has
         // heard about the install that just happened.
+        writer = nil
+        return fresh
+    }
+
+    /// No cache to touch: this is a question about a file the user just picked,
+    /// asked once, and its answer is not this window's availability.
+    func validate(_ path: String) async -> ExiftoolAvailability {
+        await BlockingWork.run { ExiftoolLocator.validate(path) }
+    }
+
+    func setStoredPath(_ path: String?) async -> ExiftoolAvailability {
+        let fresh = await MetadataWriter.setStoredExiftoolPath(path)
+        resolved = fresh
+        // Same reason as `recheckAvailability`: the writer captured the *old*
+        // answer at init and would keep running the binary the user just
+        // replaced.
         writer = nil
         return fresh
     }

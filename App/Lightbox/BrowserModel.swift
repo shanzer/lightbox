@@ -45,11 +45,26 @@ protocol PreferenceStore: AnyObject {
     /// see `BrowserModel.readIncludeCompanions(from:)`.
     func flag(forKey key: String) -> Bool?
     func setFlag(_ value: Bool, forKey key: String)
+    /// Nil when nothing is stored. Distinct from the flag accessors because
+    /// #51's stored exiftool path is the first non-Bool preference here; the
+    /// setter takes an optional so *Use default* erases the key rather than
+    /// writing an empty string a later reader has to second-guess.
+    func path(forKey key: String) -> String?
+    func setPath(_ value: String?, forKey key: String)
 }
 
 extension UserDefaults: PreferenceStore {
     func flag(forKey key: String) -> Bool? { object(forKey: key) as? Bool }
     func setFlag(_ value: Bool, forKey key: String) { set(value, forKey: key) }
+
+    func path(forKey key: String) -> String? {
+        guard let stored = object(forKey: key) as? String, !stored.isEmpty else { return nil }
+        return stored
+    }
+
+    func setPath(_ value: String?, forKey key: String) {
+        if let value, !value.isEmpty { set(value, forKey: key) } else { removeObject(forKey: key) }
+    }
 }
 
 /// The state behind one browser window: which folder is open, what the index
@@ -473,6 +488,23 @@ final class BrowserModel {
 
     static let includeCompanionsKey = "LightboxIncludeCompanionFiles"
 
+    /// Where #51's chosen exiftool is remembered.
+    static let storedExiftoolPathKey = "LightboxExiftoolPath"
+
+    /// The exiftool the user chose, or nil for #41's four-rung lookup.
+    ///
+    /// Assigning writes the preference but does **not** put the path into
+    /// force — `chooseStoredExiftoolPath(_:)` and `clearStoredExiftoolPath()`
+    /// do both, and are what the inspector calls. This stays assignable
+    /// because reading a remembered path at init has to seed it without
+    /// re-validating a binary nobody has asked about yet.
+    var storedExiftoolPath: String? {
+        didSet {
+            guard storedExiftoolPath != oldValue else { return }
+            preferences.setPath(storedExiftoolPath, forKey: Self.storedExiftoolPathKey)
+        }
+    }
+
     /// Whether an image's sidecars and RAW/JPEG partner travel with it.
     ///
     /// Spec §8: default on, toggleable, because not doing it silently orphans
@@ -608,6 +640,7 @@ final class BrowserModel {
         fileOperator = FileOperator(store: store)
         self.preferences = preferences
         includeCompanions = Self.readIncludeCompanions(from: preferences)
+        storedExiftoolPath = preferences.path(forKey: Self.storedExiftoolPathKey)
     }
 
     /// Takes an already-open store, for tests and previews that must not touch
@@ -626,6 +659,7 @@ final class BrowserModel {
         fileOperator = FileOperator(store: store)
         self.preferences = preferences
         includeCompanions = Self.readIncludeCompanions(from: preferences)
+        storedExiftoolPath = preferences.path(forKey: Self.storedExiftoolPathKey)
     }
 
     /// Defaults to on when nothing has been written yet, which is why

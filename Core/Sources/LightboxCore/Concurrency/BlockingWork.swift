@@ -133,6 +133,8 @@ public enum BlockingWork {
     /// | `IndexCoordinator`'s hashing pass | `IndexCoordinator.concurrency`, 4 | a whole-file read and decode |
     /// | `ThumbnailCache.generate`'s encode | measured at most 10 for 200 simultaneous requests — `ThumbnailCache.generate` explains why, and `theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling` guards it at half the ceiling (`< 32`), the margin absorbing other suites' use of the same queue | 0.6 ms |
     /// | `MetadataWriter.recheckAvailability` | 1 — a button | up to `ExiftoolLocator.loginShellProbeTimeout` + `versionProbeTimeout`, 15 s — two forks since #41, and only the second one is exiftool's |
+    /// | `MetadataWriter.setStoredExiftoolPath` | 1 — a file picker | the same 15 s worst case, one fork fewer in practice: a stored path skips the shell rung by construction (#51) |
+    /// | `ExiftoolLocator.validate`, via `LiveMetadataWriter.validate` | 1 — the same picker, once per chosen file | up to `versionProbeTimeout`, 10 s. One fork, never the shell: it asks about the chosen file and consults no rung (#51) |
     /// | `BrowserModel.reload`'s search | 1 — one query pass at a time | 93 ms for a 50k-row reload |
     /// | `FolderTreeView.loadWithLookahead` | one per sidebar row that appears, so it scales with sidebar height | a `contentsOfDirectory` plus an `lstat` per entry — **seconds** on a spun-down external volume |
     ///

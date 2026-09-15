@@ -119,11 +119,41 @@ final class RecordingMetadataWriter: MetadataWriting, @unchecked Sendable {
         lock.withLock { _availability = availability }
     }
 
+    /// #51: the paths handed to `setStoredPath`, in order. `[nil]` is a clear.
+    private var _storedPaths: [String?] = []
+    /// What `validate` answers. Available by default — a test that cares about
+    /// a refusal says so.
+    private var _validation: ExiftoolAvailability = .available(path: "/stub/exiftool",
+                                                               version: "13.55")
+
+    var storedPaths: [String?] { lock.withLock { _storedPaths } }
+
+    func refuseValidation(reason: String) {
+        lock.withLock {
+            _validation = .unusable(path: "/stub/refused", reason: reason)
+        }
+    }
+
     func availability() async -> ExiftoolAvailability { lock.withLock { _availability } }
 
     func recheckAvailability() async -> ExiftoolAvailability {
         lock.withLock {
             _rechecks += 1
+            return _availability
+        }
+    }
+
+    func validate(_ path: String) async -> ExiftoolAvailability { lock.withLock { _validation } }
+
+    func setStoredPath(_ path: String?) async -> ExiftoolAvailability {
+        lock.withLock {
+            _storedPaths.append(path)
+            // The real one re-resolves; a stub that reports the new path as
+            // available is what lets the caller's `metadataAvailability`
+            // assertion mean something.
+            if let path {
+                _availability = .available(path: path, version: "13.55")
+            }
             return _availability
         }
     }
@@ -1297,4 +1327,166 @@ private func allTextFields(in window: NSWindow) -> [NSTextField] {
     }
     if let content = window.contentView { walk(content) }
     return found
+}
+
+// MARK: - The stored exiftool path (#51)
+
+/// Rung 1.5 from the window's side: remembering the path, putting it into
+/// force, and taking it back out.
+///
+/// The resolution order itself is Core's and is asserted there
+/// (`ExiftoolLocatorTests`). What can only be asserted here is the wiring —
+/// that a chosen path is written to the preference, read back on the next
+/// launch, and handed to the writer rather than remembered and ignored.
+@MainActor
+struct StoredExiftoolPathTests {
+    private func model(_ preferences: MemoryPreferences) throws -> BrowserModel {
+        BrowserModel(store: try IndexStore.inMemory(), preferences: preferences)
+    }
+
+    /// The acceptance line: a chosen path survives relaunch. Two models over
+    /// one preference store is the same shape
+    /// `theCompanionToggleIsRememberedAndReachesThePlan` uses, and it is where
+    /// "remembered" is actually observable — a model that only kept the value
+    /// in memory would pass every single-model assertion.
+    @Test func aChosenPathIsRememberedAcrossModels() throws {
+        let preferences = MemoryPreferences()
+        let first = try model(preferences)
+        first.storedExiftoolPath = "/opt/elsewhere/bin/exiftool"
+
+        let second = try model(preferences)
+        #expect(second.storedExiftoolPath == "/opt/elsewhere/bin/exiftool")
+    }
+
+    /// *Use default.* Clearing has to erase the preference, not write an empty
+    /// string that a later reader treats as a path — Core normalises "" to nil
+    /// as a backstop, and this is the other end of that.
+    @Test func clearingThePathRemovesThePreference() throws {
+        let preferences = MemoryPreferences()
+        let first = try model(preferences)
+        first.storedExiftoolPath = "/opt/elsewhere/bin/exiftool"
+        first.storedExiftoolPath = nil
+
+        #expect(try model(preferences).storedExiftoolPath == nil)
+        #expect(preferences.path(forKey: BrowserModel.storedExiftoolPathKey) == nil)
+    }
+
+    /// A stored path is only worth anything if it reaches the thing that runs
+    /// exiftool. Without this the preference is remembered, shown in the
+    /// footnote, and never used — which is the bug this test exists to catch,
+    /// because every other test here passes with the writer never told.
+    @Test func settingThePathTellsTheWriterAndReResolves() async throws {
+        let preferences = MemoryPreferences()
+        let model = try model(preferences)
+        let writer = RecordingMetadataWriter(availability: .notFound)
+        model.metadataWriter = writer
+
+        await model.chooseStoredExiftoolPath("/opt/elsewhere/bin/exiftool")
+
+        #expect(writer.storedPaths == ["/opt/elsewhere/bin/exiftool"])
+        #expect(model.storedExiftoolPath == "/opt/elsewhere/bin/exiftool")
+    }
+
+    /// Decision 4: a file that is not a usable exiftool is **refused, not
+    /// stored**. Storing it leaves a broken state that costs a second trip
+    /// through the picker to escape.
+    @Test func aRefusedChoiceIsNotStored() async throws {
+        let preferences = MemoryPreferences()
+        let model = try model(preferences)
+        let writer = RecordingMetadataWriter(availability: .notFound)
+        model.metadataWriter = writer
+        writer.refuseValidation(reason: "it is not an executable file")
+
+        let refusal = await model.chooseStoredExiftoolPath("/bin/echo")
+
+        #expect(refusal != nil)
+        #expect(model.storedExiftoolPath == nil)
+        #expect(preferences.path(forKey: BrowserModel.storedExiftoolPathKey) == nil)
+        #expect(writer.storedPaths.isEmpty, "a refused path must never be put into force")
+    }
+
+    /// The footnote's job: when a stored path is in force and working, the
+    /// Edit section still has to say which binary it is using. Nothing else in
+    /// the window reveals it, and a preference the user cannot see is one they
+    /// cannot undo.
+    @Test func theFootnoteNamesThePathOnlyWhenOneIsInForce() throws {
+        let preferences = MemoryPreferences()
+        let model = try model(preferences)
+        model.metadataAvailability = .available(path: "/opt/homebrew/bin/exiftool",
+                                                version: "13.55")
+
+        #expect(model.storedExiftoolPathInForce == nil,
+                "the footnote must not appear for a path found by the ordinary rungs")
+
+        model.storedExiftoolPath = "/opt/elsewhere/bin/exiftool"
+        model.metadataAvailability = .available(path: "/opt/elsewhere/bin/exiftool",
+                                                version: "13.55")
+        #expect(model.storedExiftoolPathInForce == "/opt/elsewhere/bin/exiftool")
+    }
+
+    /// A stored path that has rotted must still offer the way out. The
+    /// explanation is Core's and names the path; what this asserts is that the
+    /// window puts the *Use default* affordance up for it — the failure mode
+    /// being a user stuck with a refusal naming a file they cannot unpick.
+    @Test func aBrokenStoredPathStillOffersTheDefault() throws {
+        let preferences = MemoryPreferences()
+        let model = try model(preferences)
+        model.storedExiftoolPath = "/Volumes/Gone/bin/exiftool"
+        model.metadataAvailability = .storedPathUnusable(
+            path: "/Volumes/Gone/bin/exiftool", reason: "it is not there")
+
+        #expect(model.canClearStoredExiftoolPath)
+        let sentence = try #require(model.metadataUnavailableExplanation)
+        #expect(sentence.contains("/Volumes/Gone/bin/exiftool"))
+    }
+
+    /// **The relaunch half of the acceptance line, and the one that is easy to
+    /// ship broken.** Reading the preference at init only fills a property;
+    /// unless the path is also put *into force*, the next launch shows the
+    /// remembered path in the footnote and resolves through #41's four rungs
+    /// anyway — which on the machine this feature exists for means editing is
+    /// still dead. Every other test in this suite passes with that bug present.
+    @Test func aRememberedPathIsPutIntoForceOnTheFirstResolve() async throws {
+        let preferences = MemoryPreferences()
+        preferences.setPath("/opt/elsewhere/bin/exiftool",
+                            forKey: BrowserModel.storedExiftoolPathKey)
+
+        let model = try model(preferences)
+        let writer = RecordingMetadataWriter(availability: .notFound)
+        model.metadataWriter = writer
+
+        await model.resolveMetadataAvailability()
+
+        #expect(writer.storedPaths == ["/opt/elsewhere/bin/exiftool"],
+                "the remembered path was read but never put into force")
+        #expect(model.metadataAvailability?.executablePath == "/opt/elsewhere/bin/exiftool")
+    }
+
+    /// And with nothing remembered, the first resolve must stay on the plain
+    /// lookup — no stored-path call at all, or #41's order is perturbed for
+    /// every user who never touched this feature.
+    @Test func noRememberedPathLeavesTheOrdinaryResolveAlone() async throws {
+        let model = try model(MemoryPreferences())
+        let writer = RecordingMetadataWriter()
+        model.metadataWriter = writer
+
+        await model.resolveMetadataAvailability()
+
+        #expect(writer.storedPaths.isEmpty)
+    }
+
+    /// *Use default* has to reach the writer too, or the window returns to the
+    /// four rungs while the process keeps running the old binary.
+    @Test func clearingTellsTheWriterAsWell() async throws {
+        let preferences = MemoryPreferences()
+        let model = try model(preferences)
+        let writer = RecordingMetadataWriter()
+        model.metadataWriter = writer
+        model.storedExiftoolPath = "/opt/elsewhere/bin/exiftool"
+
+        await model.clearStoredExiftoolPath()
+
+        #expect(model.storedExiftoolPath == nil)
+        #expect(writer.storedPaths == [nil])
+    }
 }

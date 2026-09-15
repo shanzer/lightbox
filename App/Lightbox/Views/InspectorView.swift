@@ -74,6 +74,10 @@ struct InspectorView: View {
     @State private var keywordsDraft = ""
     @State private var ratingDraft = ""
     @State private var labelDraft = ""
+    /// Why the last *Choose…* was refused, or nil. Cleared by the next
+    /// successful choice; not model state because it is about one interaction
+    /// with one panel, not about the window (#51).
+    @State private var exiftoolRefusal: String?
     @State private var latitudeDraft = ""
     @State private var longitudeDraft = ""
     @State private var refusal: String?
@@ -172,8 +176,26 @@ struct InspectorView: View {
                 Text(MetadataInspectorCopy.installCommand)
                     .font(.callout.monospaced())
                     .textSelection(.enabled)
-                Button("Try Again") {
-                    Task { await model.resolveMetadataAvailability(recheck: true) }
+                HStack {
+                    Button("Try Again") {
+                        Task { await model.resolveMetadataAvailability(recheck: true) }
+                    }
+                    // #51: the escape when none of the four rungs can see the
+                    // install. Offered here rather than in a settings window
+                    // because this is where the user is standing when they hit
+                    // the problem — the same call `DestinationChooser` makes.
+                    Button("Choose…") { chooseExiftool() }
+                    if model.canClearStoredExiftoolPath {
+                        Button("Use Default") {
+                            Task { await model.clearStoredExiftoolPath() }
+                        }
+                    }
+                }
+                if let refusal = exiftoolRefusal {
+                    Text(refusal)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             } else if model.metadataAvailability == nil {
                 Text("Checking for exiftool…")
@@ -181,7 +203,37 @@ struct InspectorView: View {
                     .foregroundStyle(.secondary)
             } else {
                 fields
+                // **Only when a stored path is what is running.** Editing works
+                // and nothing else in the window says which exiftool is doing
+                // it, so a preference the user set once — possibly months ago,
+                // possibly on a volume now unplugged — would otherwise be
+                // invisible until it broke.
+                if let inForce = model.storedExiftoolPathInForce {
+                    HStack {
+                        Text("Using exiftool at \(inForce)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button("Change…") { chooseExiftool() }
+                            .buttonStyle(.link)
+                        Button("Use Default") {
+                            Task { await model.clearStoredExiftoolPath() }
+                        }
+                        .buttonStyle(.link)
+                    }
+                }
             }
+        }
+    }
+
+    /// Runs the picker, then hands the choice to the model, which validates it
+    /// before storing anything (#51, decision 4).
+    private func chooseExiftool() {
+        guard let path = ExiftoolChooser.chooseExecutable() else { return }
+        Task {
+            exiftoolRefusal = await model.chooseStoredExiftoolPath(path)
         }
     }
 
