@@ -232,19 +232,37 @@ the one that has been **measured** — 200 simultaneous requests peak at **at mo
 pool narrowed to one thread), because QuickLook's render is milliseconds and the
 encode is 0.6 ms, so they arrive spread out, and
 `BlockingWorkFanOutTests.theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling`
-guards it at half the ceiling (`< 32`), the margin absorbing other suites' use
-of the same queue, while
-`theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes` pins the ceiling
-itself by holding every encode until 64 are in flight.
+guards it at half the ceiling (`< 32`), while
+`theBlockingWorkQueueAdmitsExactlySixtyFourBlockedClosures` pins the ceiling
+itself by holding every closure until 64 are in flight.
 
-**Both are opt-in behind `LIGHTBOX_POOL_LIMITS=1` and do not run on CI (#49).**
-They are assertions about libdispatch's queue geometry, verified only on a
-10-core M4, and they fail on the 3-core runner in *opposite* directions: the
-ceiling test reaches a high-water of 3 or 4 rather than 64, and the fan-out test
-observes 50 against its bound of 32. The claim that "no timing at all" was
-involved held only on the machine it was written on — the 64 is libdispatch's
-cap, not a floor. `main` went red on #44's own merge commit before this was
-gated. The third test in that suite,
+**Both need a test process to themselves, and CI gives them one (#49).** They
+run in the `pool-geometry` job — `LIGHTBOX_POOL_LIMITS=1 swift test --filter
+BlockingWorkFanOut --no-parallel` — and they pass there, on the 3-core runner.
+The variable means "this process is dedicated to measuring the pool", not "this
+machine is big enough".
+
+That distinction is the correction #49 made, and it went the whole way down. The
+first diagnosis was hardware: the tests were said to hold only on a 10-core M4
+and to fail on the 3-core runner in *opposite* directions, the 64 being
+libdispatch's cap rather than a floor any machine reaches. Every part of that is
+false. Driven directly the queue reaches 64 on the runner in **137 ms** (30 ms on
+the M4); the ceiling test's old high-water of 3–4 there was the *render stage*
+delivering that many encodes, not the queue admitting them, which is why it now
+drives `BlockingWork.run` with no QuickLook in the way. And the failures
+reproduce on a 10-core M4 — high-water **4** — whenever the full parallel suite
+runs alongside.
+
+The cause is that **the 64 is a process-wide budget**. libdispatch caps the
+process, not the queue, at 64 constrained worker threads; every concurrent
+`DispatchQueue` draws on the same pool, and a second queue created while one
+holds all 64 admits **zero** closures. So a test counting only its own arrivals
+still loses slots to every other suite, `.serialized` cannot help (it serialises
+within a suite, and the contaminators are other suites), and a private queue
+cannot either. That is what turned `main` red on #44's own merge commit. It also
+means saturation is not a Lightbox-local event: at 64 held slots, unrelated
+subsystems doing non-overcommit work stop getting threads at all. The third test
+in that suite,
 `aHashBlockedOnEveryCoreDoesNotStopTheRestOfTheProcess`, is *not* gated: it
 asserts the property, scales to `activeProcessorCount`, and passes on CI. The sidebar has neither a
 measurement nor a

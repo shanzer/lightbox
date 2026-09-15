@@ -155,12 +155,20 @@ public actor ThumbnailCache {
     /// QuickLook's render is milliseconds and the encode is 0.6 ms, so the
     /// requests arrive at the hop spread out rather than together.
     /// `theEncodeFanOutStaysWellUnderTheBlockingWorkCeiling` guards it at half
-    /// the ceiling (`< 32`), the margin absorbing other suites' use of the same
-    /// queue, and
-    /// `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedEncodes` pins the
-    /// ceiling itself by holding every encode until 64 are in flight, so the
+    /// the ceiling (`< 32`), and
+    /// `theBlockingWorkQueueAdmitsExactlySixtyFourBlockedClosures` pins the
+    /// ceiling itself by holding every closure until 64 are in flight, so the
     /// number depends on the queue's width rather than on how fast anything
     /// runs — the margin is two assertions, not a remembered scratch run.
+    ///
+    /// **The 10 is an idle-process number, and the spread that produces it
+    /// thins under load (#49).** The same 200 requests reached **50** on a busy
+    /// 3-core runner: slower renders do not thin the queue, they leave each
+    /// encode's neighbours still in flight when it arrives. Nothing here bounds
+    /// the fan-out by construction — it is bounded by QuickLook being slower
+    /// than the encode, which is an observation about two speeds rather than a
+    /// limit. Both measuring tests therefore run in a test process of their own,
+    /// because the 64 they count against is a budget the whole process shares.
     ///
     /// Not the *only* caller that scales with the window, though it is the only
     /// measured one: `FolderTreeView.loadWithLookahead` fans out with sidebar

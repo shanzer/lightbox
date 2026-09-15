@@ -50,34 +50,23 @@ jobs:
         working-directory: App
         run: xcodebuild -scheme Lightbox -destination 'platform=macOS' test
 
-  # TEMPORARY — evidence for #49, removed with the fix. Not a gate: it reports
-  # the queue geometry a 3-core runner actually produces, because nothing local
-  # can measure that and #49's preferred option is written down there as
-  # untested. `continue-on-error` because the second step is *expected* to fail
-  # here — that failure, with its numbers, is the point.
-  pool-probe:
-    name: pool geometry probe (#49, temporary)
+
+  # The two tests that measure the pool's geometry, in a test process of their
+  # own. Not a "big machine" gate and not opt-in scenery: the 64 they pin is a
+  # process-wide constrained-thread budget, so any other suite running beside
+  # them holds part of what they are trying to count — that is #49, and it is
+  # why `.serialized` was not enough. They pass on this 3-core runner when the
+  # process is theirs; run them in the suite above and the ceiling test's
+  # high-water reads 4, here and on a 10-core M4 both.
+  pool-geometry:
+    name: pool geometry
     runs-on: macos-26
-    continue-on-error: true
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-xcode
-      - name: machine shape
-        run: |
-          sysctl -n hw.activecpu hw.ncpu hw.memsize
-          sw_vers -productVersion
-          swift --version
-      # --no-parallel: probe A parks 200 closures on the process-global queue
-      # and holds them, so anything sharing it would starve.
-      - name: probe — report actual geometry
+      - name: swift test --filter BlockingWorkFanOut
         working-directory: Core
-        env:
-          LIGHTBOX_POOL_PROBE: "1"
-        run: swift test --filter PoolGeometryProbe --no-parallel
-      - name: the gated assertions, for their failure numbers
-        working-directory: Core
-        continue-on-error: true
         env:
           LIGHTBOX_POOL_LIMITS: "1"
         run: swift test --filter BlockingWorkFanOut --no-parallel
