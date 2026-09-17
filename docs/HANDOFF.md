@@ -1209,15 +1209,13 @@ all three are now done:
   because a clean success shows nothing. `CaptureTimeSeed` is what `reseed()`
   put in the pair, and a commit still holding it changes nothing.
 
-  Separately, **`IndexStore.recordMetadataWrite` does not refresh
-  `capture_time`/`capture_offset` — that is issue #42**, a `Core` gap rather
-  than anything this layer can fix. After a capture-time edit the read-only
-  *Captured* row keeps showing the old value until something reindexes the
-  file, and nothing will: that same call updates the row's `size` and `mtime`,
-  which is exactly what `needsReindex` keys on, so the staleness is permanent
-  rather than merely late. Adding the two columns to that write is the fix, and
-  `InspectorView` and `BrowserModel+MetadataEditing.finish` both carry a comment
-  pointing at #42 so a reader of the code meets it.
+  **`IndexStore.recordMetadataWrite` refreshes the indexed metadata columns
+  too (#42)**, from a `MetadataReader` read-back of the rewritten file, in the
+  same guarded `UPDATE` as the stat and hashes. That matters because the call
+  refreshes `size`/`mtime`, which is what `needsReindex` keys on, so any column
+  it skipped would stay stale for good. A failed read-back records nothing and
+  warns `indexRowNotUpdated`. Sidecar writes still leave the RAW's row alone:
+  tier 0 does not read `.xmp` (#57).
 
 Also known and deferred: the `width>=1920` query takes 474 ms at 50k. That is
 row materialisation, not a missing index — do not "fix" it by adding one. And

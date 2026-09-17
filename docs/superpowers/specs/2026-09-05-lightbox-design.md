@@ -542,6 +542,16 @@ Four deliberate constraints:
 
 Optionally, the file's modification time is preserved across a metadata edit.
 
+*(Amended, #42.)* After a successful in-place write, the file's index row is brought back
+in step in a single guarded statement: its new size and mtime, its re-verified hashes, and
+every metadata column tier 0 indexes (dimensions, capture time and zone, make, model,
+orientation). Those columns come from **re-reading the rewritten file with tier 0's own
+reader, not from the edit that was sent**. MWG decides what actually lands, and the row
+must match what a rescan would build. This has to happen at write time: once size and mtime
+are refreshed, no later pass re-reads the file. If the read-back fails, nothing is recorded
+and the row stays stale, so the next pass re-indexes the file. A RAW's sidecar write leaves
+its row alone, because the index does not read sidecars (#57).
+
 ## 10. User interface
 
 Three panes. Left: folder tree, saved searches, and faceted filters with counts.

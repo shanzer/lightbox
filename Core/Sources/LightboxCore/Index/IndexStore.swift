@@ -616,8 +616,8 @@ public final class IndexStore: Sendable {
     /// 999 bound variables, which the four fixed parameters also come out of.
     private static let stampChunkSize = 500
 
-    /// Records the new `size`/`mtime` and re-verified hashes for a row whose
-    /// file was just rewritten by `MetadataWriter`.
+    /// Records the new `size`/`mtime`, re-read metadata and re-verified hashes
+    /// for a row whose file was just rewritten by `MetadataWriter`.
     ///
     /// A metadata write changes the bytes, so the row's `size`, `mtime` and
     /// `content_hash` are all stale the instant exiftool returns. Left that
@@ -628,6 +628,17 @@ public final class IndexStore: Sendable {
     ///
     /// `phash` is deliberately untouched: an EXIF edit does not move a pixel,
     /// so the perceptual hash on the row is still the right one.
+    ///
+    /// **The indexed metadata columns are written from `metadata`, and in the
+    /// same statement as the stat (#42).** Refreshing `size` and `mtime` is
+    /// what tells `needsReindex` the row describes the file, so any column
+    /// left out here is never re-read: an edited capture time used to stay
+    /// wrong in the index for good. `metadata` is what `MetadataReader` — tier
+    /// 0's reader — sees in the rewritten file, not the edit that was sent;
+    /// MWG composites decide what actually lands, and a row built from the
+    /// request would disagree with the one a rescan would build. Every column
+    /// tier 0 fills from a read is written, so the two cannot drift. One
+    /// `UPDATE` under one guard means a refusal moves none of them.
     ///
     /// **Guarded exactly like `setHashes(for:)`, and for the same reason.** The
     /// `WHERE` matches on the `path`, `size` and `mtime` the row carried
@@ -641,15 +652,23 @@ public final class IndexStore: Sendable {
     /// Returns whether the write landed.
     @discardableResult
     public func recordMetadataWrite(for record: FileRecord, size: Int64, mtime: Double,
+                                    metadata: ImageMetadata,
                                     content: String?, image: String?, imageKind: String?,
                                     hashedAt: Double) throws -> Bool {
         guard let id = record.id else { return false }
         return try pool.write { db in
             try db.execute(sql: """
-                UPDATE files SET size = ?, mtime = ?, content_hash = ?, image_hash = ?,
+                UPDATE files SET size = ?, mtime = ?, width = ?, height = ?,
+                                 capture_time = ?, capture_offset = ?,
+                                 camera_make = ?, camera_model = ?, orientation = ?,
+                                 content_hash = ?, image_hash = ?,
                                  image_hash_kind = ?, hashed_at = ?
                 WHERE id = ? AND path = ? AND size = ? AND mtime = ?
-                """, arguments: [size, mtime, content, image, imageKind, hashedAt,
+                """, arguments: [size, mtime, metadata.width, metadata.height,
+                                 metadata.captureTime?.timeIntervalSince1970,
+                                 metadata.captureOffset, metadata.cameraMake,
+                                 metadata.cameraModel, metadata.orientation,
+                                 content, image, imageKind, hashedAt,
                                  id, record.path, record.size, record.mtime])
             return db.changesCount == 1
         }

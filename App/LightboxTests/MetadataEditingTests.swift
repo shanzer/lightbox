@@ -1174,6 +1174,34 @@ struct InspectorLiveWriteTests {
             #expect(!FileManager.default.fileExists(atPath: url.path + "_original"))
         }
     }
+
+    /// #42: after a capture-time edit the reload hands the inspector a row
+    /// carrying the *new* capture time — the *Captured* and *Time zone* rows
+    /// read `captureDate` and `captureOffset` off exactly these records. The
+    /// write refreshes size and mtime too, so nothing would ever re-read the
+    /// file to correct a stale date later.
+    @Test(needsExiftool) func aCaptureTimeEditShowsInTheInspectorAfterTheReload() async throws {
+        let root = try tree.directory("library")
+        try writeJPEG(to: root.appendingPathComponent("IMG_0001.jpg"))
+        let model = BrowserModel(store: try IndexStore.inMemory(), preferences: preferences)
+        await model.open(root)
+        await model.resolveMetadataAvailability()
+        try #require(model.isMetadataEditingAvailable)
+        model.selectAll()
+
+        let refusal = await model.commitMetadataField(
+            .captureTime(wallClock: "2021-07-08 09:10:11", offset: "-04:00", seed: nil))
+        #expect(refusal == nil)
+        if case .metadataSummary(let summary)? = model.activeSheet {
+            #expect(summary.failures.isEmpty, "\(summary.failures.map(\.detail))")
+        }
+
+        let record = try #require(model.selectedRecords.first)
+        // 09:10:11 at -04:00 is 13:10:11 UTC.
+        let expected = try #require(ISO8601DateFormatter().date(from: "2021-07-08T13:10:11Z"))
+        #expect(record.captureDate == expected)
+        #expect(record.captureOffset == "-04:00")
+    }
 }
 
 // MARK: - The focus contract
