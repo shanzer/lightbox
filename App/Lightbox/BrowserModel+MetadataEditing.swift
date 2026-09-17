@@ -315,16 +315,9 @@ extension BrowserModel {
         // and actually reversing whatever file operation came before it.
 
         // See this extension's own documentation for why this is `reload()`.
-        //
-        // **It will not refresh the inspector's *Captured* row after a
-        // capture-time edit, and that is issue #42, not a bug here.**
-        // `IndexStore.recordMetadataWrite` rewrites the row's size, mtime and
-        // hashes and leaves `capture_time`/`capture_offset` alone — and because
-        // it *does* rewrite size and mtime, which is exactly what
-        // `needsReindex` keys on, no later pass re-reads the file either. So
-        // the row this reload fetches still carries the old capture time. The
-        // fix is one `Core` change to that call; nothing this layer can do
-        // short of a rescan would be honest.
+        // The rows it fetches already carry the edited capture time:
+        // `IndexStore.recordMetadataWrite` re-records the indexed metadata
+        // columns from a read-back of each rewritten file (#42).
         await reload()
 
         let summary = MetadataSummary(outcomes: outcomes, wasCancelled: cancelled,

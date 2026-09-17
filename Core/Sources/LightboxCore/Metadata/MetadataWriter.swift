@@ -354,6 +354,7 @@ public actor MetadataWriter {
 
     private let exiftool: ExiftoolAvailability
     private let hasher: any FileHashing
+    private let reader: any MetadataReading
     private var runner: ExiftoolRunner?
 
     /// Test seam: when set, stands in for the read-back step and returns the
@@ -371,9 +372,11 @@ public actor MetadataWriter {
     }
 
     public init(availability: ExiftoolAvailability = MetadataWriter.availability,
-                hasher: any FileHashing = FileHasher()) {
+                hasher: any FileHashing = FileHasher(),
+                reader: any MetadataReading = MetadataReader()) {
         self.exiftool = availability
         self.hasher = hasher
+        self.reader = reader
     }
 
     // No `deinit` here: an actor's deinit is nonisolated and cannot touch a
@@ -686,9 +689,15 @@ public actor MetadataWriter {
 
         if store != nil {
             var landed = false
-            if let record = recordBefore {
+            // Re-read through tier 0's own reader rather than copying the edit
+            // into the row (#42): what MWG lands is not always what was sent,
+            // and the row must match what a rescan would build. A read-back
+            // that fails records nothing at all — a fresh stat beside a stale
+            // date is the bug, and leaving the old stat queues a real re-read.
+            if let record = recordBefore, let metadata = try? reader.read(url) {
                 landed = (try? store?.recordMetadataWrite(
                     for: record, size: rehash.size, mtime: rehash.mtime,
+                    metadata: metadata,
                     content: rehash.contentHash, image: rehash.imageHash,
                     imageKind: rehash.imageHashKind,
                     hashedAt: Date().timeIntervalSince1970)) ?? false == true

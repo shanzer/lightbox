@@ -1905,6 +1905,67 @@ struct MetadataWriteFailurePathTests {
             .sweptOrphanedBackup(leftover.lastPathComponent)) == true)
     }
 
+    /// #42: the row's indexed metadata follows the file, not just its stat.
+    /// Refreshing `size`/`mtime` alone is what made a stale `capture_time`
+    /// permanent — `needsReindex` keys on exactly those two, so tier 0 never
+    /// looks at the file again. Asserted without a rescan, on the values the
+    /// reader sees in the rewritten file.
+    @Test(needsExiftool) func aCaptureTimeEditRefreshesTheRowWithoutARescan() async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("dated.jpg"))
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(indexedRecord(for: url))
+
+        let instant = Date(timeIntervalSince1970: 1_600_000_000)
+        let writer = MetadataWriter()
+        let outcomes = await writer.write(
+            MetadataEdit(captureTime: CaptureTime(date: instant, offset: "-05:00")),
+            to: [url], updating: store)
+        try #require(outcomes[0].error == nil)
+        #expect(outcomes[0].success?.warnings.contains(.indexRowNotUpdated) == false)
+
+        let row = try #require(try store.record(atPath: url.path))
+        #expect(row.captureTime == instant.timeIntervalSince1970)
+        #expect(row.captureOffset == "-05:00")
+        // The fixture's Make survives an unrelated edit, so a refresh that
+        // wrote the columns from an empty read would show up here.
+        #expect(row.cameraMake == (try MetadataReader().read(url)).cameraMake)
+        #expect(row.cameraMake != nil)
+        #expect(try store.needsReindex(path: url.path, size: row.size, mtime: row.mtime) == false)
+    }
+
+    /// A rewritten file whose metadata cannot be read back records nothing —
+    /// not the hashes, not the stat. The row is left describing the old file,
+    /// so tier 0 re-reads it on the next pass rather than trusting a row that
+    /// pairs a fresh stat with a stale date.
+    @Test(needsExiftool) func anUnreadableReadBackLeavesTheWholeRowAlone() async throws {
+        let url = try Fixtures.writeImage(to: tree.root.appendingPathComponent("noread.jpg"))
+        let store = try IndexStore.inMemory()
+        _ = try store.upsert(indexedRecord(for: url))
+        let seeded = try #require(try store.record(atPath: url.path))
+
+        let writer = MetadataWriter(reader: FailingMetadataReader())
+        let outcomes = await writer.write(
+            MetadataEdit(captureTime: CaptureTime(date: Date(timeIntervalSince1970: 1_600_000_000),
+                                                  offset: "+00:00")),
+            to: [url], updating: store)
+        try #require(outcomes[0].error == nil, "the write itself succeeded")
+        #expect(outcomes[0].success?.warnings.contains(.indexRowNotUpdated) == true)
+        #expect(try store.record(atPath: url.path) == seeded)
+    }
+
+    private func indexedRecord(for url: URL) throws -> FileRecord {
+        let stat = try FileManager.default.attributesOfItem(atPath: url.path)
+        return FileRecord(
+            id: nil, path: url.path, parentDir: url.deletingLastPathComponent().path,
+            name: url.lastPathComponent, ext: url.pathExtension,
+            size: (stat[.size] as! NSNumber).int64Value,
+            mtime: (stat[.modificationDate] as! Date).timeIntervalSince1970,
+            device: 1, inode: 1, width: 64, height: 48,
+            captureTime: 1, captureOffset: "+09:00", cameraMake: nil, cameraModel: nil,
+            orientation: 1, contentHash: nil, imageHash: nil, imageHashKind: nil,
+            phash: nil, hashedAt: nil, indexedAt: 100)
+    }
+
     /// A row the store cannot produce means the index was *not* updated, and
     /// silently swallowing that is how an index drifts out of step with disk.
     @Test(needsExiftool) func anAbsentIndexRowIsReportedNotSwallowed() async throws {
@@ -1966,4 +2027,9 @@ struct MetadataWriteFailurePathTests {
         #expect(outcomes.contains { $0.error == .cancelled },
                 "the rest must report cancellation rather than being written")
     }
+}
+
+/// A read-back that fails after exiftool has already rewritten the file.
+private struct FailingMetadataReader: MetadataReading {
+    func read(_ url: URL) throws -> ImageMetadata { throw MetadataError.notAnImage }
 }

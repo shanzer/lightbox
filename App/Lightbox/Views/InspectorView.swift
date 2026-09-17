@@ -105,15 +105,13 @@ struct InspectorView: View {
                     row("Size", shared {
                         ByteCountFormatter.string(fromByteCount: $0.size, countStyle: .file)
                     })
-                    // **These two go stale after a capture-time edit, and that
-                    // is issue #42.** `IndexStore.recordMetadataWrite` rewrites
-                    // the row's size, mtime and hashes and leaves
-                    // `capture_time`/`capture_offset` alone — and since it does
-                    // rewrite size and mtime, `needsReindex` never asks for the
-                    // file to be read again either, so the stale value is
-                    // permanent rather than merely late. Nothing this view can
-                    // do short of a rescan is honest; the fix is one `Core`
-                    // change to that call.
+                    // Current after a capture-time edit because
+                    // `IndexStore.recordMetadataWrite` re-records these columns
+                    // from a read-back of the rewritten file (#42). It has to:
+                    // that call also refreshes size and mtime, so `needsReindex`
+                    // never re-reads the file to correct them later. A RAW
+                    // edited through its `.xmp` sidecar still shows the RAW's
+                    // embedded date — tier 0 does not read sidecars (#57).
                     row("Captured", shared { record in
                         record.captureDate.map { Self.dateFormatter.string(from: $0) }
                     })

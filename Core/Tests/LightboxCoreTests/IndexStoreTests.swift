@@ -187,8 +187,13 @@ struct IndexStoreTests {
                                     imageKind: "jpeg-scan-v1",
                                     phash: "0123456789abcdef", hashedAt: 500))
         let hashed = try #require(try store.record(atPath: "/a/b.jpg"))
+        let rewritten = ImageMetadata(width: 200, height: 200,
+                                      captureTime: Date(timeIntervalSince1970: 1_600_000_000),
+                                      captureOffset: "-05:00", cameraMake: "Canon",
+                                      cameraModel: "EOS R5", orientation: 6)
 
         #expect(try store.recordMetadataWrite(for: hashed, size: 140, mtime: 1_700_000_900,
+                                              metadata: rewritten,
                                               content: "dd", image: "ii",
                                               imageKind: "jpeg-scan-v1", hashedAt: 900))
 
@@ -201,6 +206,13 @@ struct IndexStoreTests {
         // No pixel moved, so the perceptual hash is still the right one and
         // must not be thrown away.
         #expect(row.phash == "0123456789abcdef")
+        // #42: the indexed metadata columns follow the file too. Refreshing
+        // only size/mtime is what made a stale capture time permanent.
+        #expect(row.captureTime == 1_600_000_000)
+        #expect(row.captureOffset == "-05:00")
+        #expect(row.cameraMake == "Canon")
+        #expect(row.cameraModel == "EOS R5")
+        #expect(row.orientation == 6)
         // And tier 0 now agrees the row describes the file, so it is not re-read.
         #expect(try store.needsReindex(path: "/a/b.jpg", size: 140,
                                        mtime: 1_700_000_900) == false)
@@ -219,6 +231,10 @@ struct IndexStoreTests {
         _ = try store.upsert(sampleRecord(path: "/a/b.jpg", size: 222, mtime: 1_700_000_050))
 
         #expect(try store.recordMetadataWrite(for: stale, size: 140, mtime: 1_700_000_900,
+                                              metadata: ImageMetadata(
+                                                width: 1, height: 1,
+                                                captureTime: Date(timeIntervalSince1970: 5),
+                                                captureOffset: "+01:00"),
                                               content: "dd", image: "ii",
                                               imageKind: "jpeg-scan-v1",
                                               hashedAt: 900) == false)
@@ -226,6 +242,11 @@ struct IndexStoreTests {
         #expect(row.size == 222)
         #expect(row.contentHash == nil)
         #expect(row.hashedAt == nil)
+        // One statement, one guard: a refused write moves no metadata column
+        // either, so a partial refresh cannot pair a new date with an old stat.
+        #expect(row.captureTime == nil)
+        #expect(row.captureOffset == nil)
+        #expect(row.width == 200)
     }
 
     /// A row id belonging to a different path is not this file's row, even
@@ -240,9 +261,15 @@ struct IndexStoreTests {
         // Same size and mtime, same id — but a different path.
         stale.id = other.id
         #expect(try store.recordMetadataWrite(for: stale, size: 140, mtime: 1_700_000_900,
+                                              metadata: ImageMetadata(
+                                                width: 1, height: 1,
+                                                captureTime: Date(timeIntervalSince1970: 5),
+                                                captureOffset: "+01:00"),
                                               content: "dd", image: nil, imageKind: nil,
                                               hashedAt: 900) == false)
-        #expect(try #require(try store.record(atPath: "/a/other.jpg")).contentHash == nil)
+        let untouched = try #require(try store.record(atPath: "/a/other.jpg"))
+        #expect(untouched.contentHash == nil)
+        #expect(untouched.captureTime == nil)
     }
 
     @Test func filesMissingHashesReturnsOnlyUnhashedRowsUnderThePrefix() throws {
